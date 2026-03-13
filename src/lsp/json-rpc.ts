@@ -79,7 +79,8 @@ export class JsonRpcTransport {
    */
   private handleIncoming(message: LSPMessage): void {
     // Response correlation: match responses to pending requests
-    if (message.id && this.pendingRequests.has(message.id)) {
+    // Use !== undefined to handle id: 0 (valid JSON-RPC id)
+    if (message.id !== undefined && this.pendingRequests.has(message.id)) {
       const request = this.pendingRequests.get(message.id);
       if (!request) return;
       const { resolve, reject } = request;

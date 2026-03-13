@@ -10,6 +10,7 @@ import {
   findReferences as opsFindReferences,
   findSymbolsByName as opsFindSymbolsByName,
   getDiagnostics as opsGetDiagnostics,
+  getDiagnosticsBatch as opsGetDiagnosticsBatch,
   hover as opsHover,
   incomingCalls as opsIncomingCalls,
   outgoingCalls as opsOutgoingCalls,
@@ -19,6 +20,7 @@ import {
   symbolKindToString,
 } from './lsp/operations.js';
 import { ServerManager } from './lsp/server-manager.js';
+import type { BatchDiagnosticResult } from './lsp/operations.js';
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -271,6 +273,35 @@ export class LSPClient {
   async getDiagnostics(filePath: string): Promise<Diagnostic[]> {
     const serverState = await this.getServer(filePath);
     return opsGetDiagnostics(serverState, filePath);
+  }
+
+  async getDiagnosticsBatch(filePaths: string[]): Promise<BatchDiagnosticResult[]> {
+    // Group files by their LSP server
+    const serverGroups = new Map<string, { serverConfig: LSPServerConfig; paths: string[] }>();
+
+    for (const filePath of filePaths) {
+      const serverConfig = this.getServerForFile(filePath);
+      if (!serverConfig) {
+        logger.debug(`[getDiagnosticsBatch] No server for file, skipping: ${filePath}\n`);
+        continue;
+      }
+      const key = JSON.stringify(serverConfig);
+      const group = serverGroups.get(key);
+      if (group) {
+        group.paths.push(filePath);
+      } else {
+        serverGroups.set(key, { serverConfig, paths: [filePath] });
+      }
+    }
+
+    // Process each server group in parallel
+    const groupPromises = Array.from(serverGroups.values()).map(async ({ serverConfig, paths }) => {
+      const serverState = await this.serverManager.getServer(serverConfig);
+      return opsGetDiagnosticsBatch(serverState, paths);
+    });
+
+    const groupResults = await Promise.all(groupPromises);
+    return groupResults.flat();
   }
 
   async hover(

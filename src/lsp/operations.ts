@@ -313,7 +313,14 @@ export async function renameSymbol(
   );
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
+
+  const wasJustOpened = await serverState.documentManager.ensureOpen(filePath);
+  if (wasJustOpened) {
+    logger.debug(
+      '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
 
   logger.debug('[DEBUG renameSymbol] Sending textDocument/rename request\n');
   const method = 'textDocument/rename';
@@ -568,9 +575,34 @@ export async function getDiagnostics(
   logger.debug(`[DEBUG getDiagnostics] Requesting diagnostics for ${filePath}\n`);
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
 
   const fileUri = pathToUri(filePath);
+
+  // Always re-sync from disk: the file may have been edited externally
+  // (e.g. by Claude Code's Edit tool) since we last opened it.
+  if (serverState.documentManager.isOpen(filePath)) {
+    logger.debug(`[DEBUG getDiagnostics] File already open, re-syncing from disk\n`);
+    const currentContent = readFileSync(filePath, 'utf-8');
+    serverState.documentManager.sendChange(filePath, currentContent);
+    serverState.diagnosticsCache.delete(fileUri);
+
+    // Wait for the LSP server to re-analyze the changed content
+    await serverState.diagnosticsCache.waitForIdle(fileUri, {
+      maxWaitTime: 10000,
+      idleTime: 500,
+    });
+
+    const freshDiagnostics = serverState.diagnosticsCache.get(fileUri);
+    if (freshDiagnostics !== undefined) {
+      logger.debug(
+        `[DEBUG getDiagnostics] Returning ${freshDiagnostics.length} fresh diagnostics after re-sync\n`
+      );
+      return freshDiagnostics;
+    }
+  } else {
+    await serverState.documentManager.ensureOpen(filePath);
+  }
+
   const cachedDiagnostics = serverState.diagnosticsCache.get(fileUri);
 
   if (cachedDiagnostics !== undefined) {
@@ -616,8 +648,8 @@ export async function getDiagnostics(
     );
 
     await serverState.diagnosticsCache.waitForIdle(fileUri, {
-      maxWaitTime: 5000,
-      idleTime: 300,
+      maxWaitTime: 10000,
+      idleTime: 500,
     });
 
     const diagnosticsAfterWait = serverState.diagnosticsCache.get(fileUri);
@@ -638,8 +670,8 @@ export async function getDiagnostics(
       serverState.documentManager.sendChange(filePath, fileContent);
 
       await serverState.diagnosticsCache.waitForIdle(fileUri, {
-        maxWaitTime: 3000,
-        idleTime: 300,
+        maxWaitTime: 10000,
+        idleTime: 500,
       });
 
       const diagnosticsAfterTrigger = serverState.diagnosticsCache.get(fileUri);
@@ -657,6 +689,62 @@ export async function getDiagnostics(
 
     return [];
   }
+}
+
+export interface BatchDiagnosticResult {
+  filePath: string;
+  diagnostics: Diagnostic[];
+}
+
+export async function getDiagnosticsBatch(
+  serverState: ServerState,
+  filePaths: string[]
+): Promise<BatchDiagnosticResult[]> {
+  logger.debug(
+    `[DEBUG getDiagnosticsBatch] Requesting diagnostics for ${filePaths.length} files\n`
+  );
+
+  await serverState.initializationPromise;
+
+  const fileUris: string[] = [];
+
+  // Phase 1: Open/re-sync all files in rapid succession (no per-file wait)
+  for (const filePath of filePaths) {
+    const fileUri = pathToUri(filePath);
+    fileUris.push(fileUri);
+
+    if (serverState.documentManager.isOpen(filePath)) {
+      // Re-sync from disk
+      const currentContent = readFileSync(filePath, 'utf-8');
+      serverState.documentManager.sendChange(filePath, currentContent);
+      serverState.diagnosticsCache.delete(fileUri);
+    } else {
+      await serverState.documentManager.ensureOpen(filePath);
+    }
+  }
+
+  // Phase 2: Single batch wait for all URIs to stabilize
+  await serverState.diagnosticsCache.waitForAllIdle(fileUris, {
+    maxWaitTime: 15000,
+    idleTime: 500,
+  });
+
+  // Phase 3: Collect results
+  const results: BatchDiagnosticResult[] = [];
+  for (let i = 0; i < filePaths.length; i++) {
+    const filePath = filePaths[i]!;
+    const fileUri = fileUris[i]!;
+    const diagnostics = serverState.diagnosticsCache.get(fileUri) ?? [];
+    results.push({ filePath, diagnostics });
+  }
+
+  const totalDiags = results.reduce((sum, r) => sum + r.diagnostics.length, 0);
+  const filesWithDiags = results.filter((r) => r.diagnostics.length > 0).length;
+  logger.debug(
+    `[DEBUG getDiagnosticsBatch] Found ${totalDiags} diagnostics across ${filesWithDiags}/${filePaths.length} files\n`
+  );
+
+  return results;
 }
 
 export async function hover(

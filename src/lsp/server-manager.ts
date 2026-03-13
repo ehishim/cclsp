@@ -216,6 +216,9 @@ export class ServerManager {
           },
           hover: {},
           signatureHelp: {},
+          publishDiagnostics: {
+            relatedInformation: true,
+          },
           diagnostic: {
             dynamicRegistration: false,
             relatedDocumentSupport: false,
@@ -226,6 +229,7 @@ export class ServerManager {
             documentChanges: true,
           },
           workspaceFolders: true,
+          configuration: true,
         },
       },
       rootUri: pathToUri(serverConfig.rootDir || process.cwd()),
@@ -307,7 +311,7 @@ export class ServerManager {
       const { adapter } = serverState;
 
       // Try adapter-specific handlers first for custom requests
-      if (message.id && adapter?.handleRequest) {
+      if (message.id !== undefined && adapter?.handleRequest) {
         adapter
           .handleRequest(message.method, message.params, serverState)
           .then((result) => {
@@ -328,9 +332,45 @@ export class ServerManager {
       }
 
       // Try adapter-specific notification handlers
-      if (!message.id && adapter?.handleNotification) {
+      if (message.id === undefined && adapter?.handleNotification) {
         const handled = adapter.handleNotification(message.method, message.params, serverState);
         if (handled) {
+          return;
+        }
+      }
+
+      // Handle server-initiated requests that require a response
+      if (message.id !== undefined) {
+        if (message.method === 'workspace/configuration') {
+          const params = message.params as { items?: unknown[] };
+          const itemCount = params?.items?.length || 1;
+          logger.debug(
+            `[DEBUG handleMessage] Responding to workspace/configuration with ${itemCount} empty config(s)\n`
+          );
+          serverState.transport.sendMessage({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: new Array(itemCount).fill({}),
+          });
+          return;
+        }
+        if (message.method === 'client/registerCapability') {
+          logger.debug(
+            `[DEBUG handleMessage] Acknowledging client/registerCapability\n`
+          );
+          serverState.transport.sendMessage({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: null,
+          });
+          return;
+        }
+        if (message.method === 'window/workDoneProgress/create') {
+          serverState.transport.sendMessage({
+            jsonrpc: '2.0',
+            id: message.id,
+            result: null,
+          });
           return;
         }
       }
