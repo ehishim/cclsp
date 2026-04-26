@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { join, normalize, relative } from 'node:path';
+import type { Stats } from 'node:fs';
+import { readdir, stat } from 'node:fs/promises';
+import { extname, isAbsolute, join, normalize, relative } from 'node:path';
 import { loadGitignore, scanDirectoryForExtensions } from './file-scanner.js';
 import { logger } from './logger.js';
 import { loadConfig } from './lsp/config.js';
@@ -11,6 +13,7 @@ import {
   findSymbolsByName as opsFindSymbolsByName,
   getDiagnostics as opsGetDiagnostics,
   getDiagnosticsBatch as opsGetDiagnosticsBatch,
+  getDocumentSymbols as opsGetDocumentSymbols,
   hover as opsHover,
   incomingCalls as opsIncomingCalls,
   outgoingCalls as opsOutgoingCalls,
@@ -19,8 +22,8 @@ import {
   workspaceSymbol as opsWorkspaceSymbol,
   symbolKindToString,
 } from './lsp/operations.js';
-import { ServerManager } from './lsp/server-manager.js';
 import type { BatchDiagnosticResult } from './lsp/operations.js';
+import { ServerManager } from './lsp/server-manager.js';
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -35,11 +38,12 @@ import type {
   SymbolMatch,
 } from './lsp/types.js';
 import type { SymbolKind } from './lsp/types.js';
-import { uriToPath } from './utils.js';
+import { pathToUri, uriToPath } from './utils.js';
 
 export class LSPClient {
   private config: Config;
   private serverManager = new ServerManager();
+  private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
 
   constructor(configPath?: string) {
     this.config = loadConfig(configPath);
@@ -316,16 +320,228 @@ export class LSPClient {
   }
 
   async workspaceSymbol(query: string): Promise<SymbolInformation[]> {
-    const servers = Array.from(this.serverManager.getRunningServers().values());
+    let servers = Array.from(this.serverManager.getRunningServers().values());
     if (servers.length === 0) {
-      logger.debug('[workspaceSymbol] No LSP servers running\n');
-      return [];
+      logger.debug('[workspaceSymbol] No LSP servers running; preloading now\n');
+      await this.preloadServers(false);
+      servers = Array.from(this.serverManager.getRunningServers().values());
+      if (servers.length === 0) {
+        logger.debug('[workspaceSymbol] No LSP servers available after preload\n');
+        return [];
+      }
     }
 
-    const serverState = servers[0];
-    if (!serverState) return [];
+    const results: SymbolInformation[] = [];
+    const errors: unknown[] = [];
 
-    return opsWorkspaceSymbol(serverState, query);
+    for (const serverState of servers) {
+      if (!serverState) continue;
+
+      try {
+        await this.primeWorkspaceSymbolProject(serverState);
+        results.push(...(await opsWorkspaceSymbol(serverState, query)));
+      } catch (error) {
+        errors.push(error);
+        logger.debug(`[workspaceSymbol] Server failed for query "${query}": ${error}\n`);
+      }
+    }
+
+    if (results.length > 0) {
+      return results;
+    }
+
+    if (errors.length > 0) {
+      throw errors[0];
+    }
+
+    return [];
+  }
+
+  private async primeWorkspaceSymbolProject(serverState: ServerState): Promise<void> {
+    if (this.workspaceSymbolPrimedServers.has(serverState)) {
+      return;
+    }
+
+    const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
+    if (seedFiles.length === 0) {
+      logger.debug('[workspaceSymbol] No seed file found for server; skipping project priming\n');
+      return;
+    }
+
+    await Promise.all(
+      seedFiles.map((seedFile) => serverState.documentManager.ensureOpen(seedFile))
+    );
+    await Promise.all(
+      seedFiles.map((seedFile) =>
+        serverState.diagnosticsCache.waitForIdle(pathToUri(seedFile), {
+          maxWaitTime: 5000,
+          idleTime: 250,
+          checkInterval: 50,
+        })
+      )
+    );
+    await Promise.all(seedFiles.map((seedFile) => opsGetDocumentSymbols(serverState, seedFile)));
+    this.workspaceSymbolPrimedServers.add(serverState);
+    logger.debug(`[workspaceSymbol] Primed workspace symbols with ${seedFiles.join(', ')}\n`);
+  }
+
+  private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {
+    const rootDir = this.resolveRootDir(serverConfig.rootDir);
+    const extensions = new Set(serverConfig.extensions.map((ext) => ext.toLowerCase()));
+    const ignoreFilter = await loadGitignore(rootDir);
+    const projectRoots = await this.findWorkspaceSymbolProjectRoots(rootDir, ignoreFilter);
+    const seedFiles: string[] = [];
+    const maxFiles = 500;
+
+    for (const projectRoot of projectRoots) {
+      const projectFiles = await this.findWorkspaceSymbolProjectFiles(
+        rootDir,
+        projectRoot,
+        extensions,
+        ignoreFilter
+      );
+      seedFiles.push(...projectFiles.slice(0, maxFiles - seedFiles.length));
+      if (seedFiles.length >= maxFiles) break;
+    }
+
+    if (seedFiles.length > 0) {
+      return seedFiles;
+    }
+
+    return (
+      await this.findWorkspaceSymbolProjectFiles(rootDir, rootDir, extensions, ignoreFilter)
+    ).slice(0, maxFiles);
+  }
+
+  private async findWorkspaceSymbolProjectRoots(
+    rootDir: string,
+    ignoreFilter: Awaited<ReturnType<typeof loadGitignore>>
+  ): Promise<string[]> {
+    const roots = new Set<string>();
+    const maxDepth = 5;
+
+    const scan = async (
+      currentPath: string,
+      currentDepth: number,
+      relativePath = ''
+    ): Promise<void> => {
+      if (currentDepth > maxDepth) return;
+
+      let entries: string[];
+      try {
+        entries = (await readdir(currentPath)).sort();
+      } catch (error) {
+        logger.debug(`[workspaceSymbol] Failed to read ${currentPath}: ${error}\n`);
+        return;
+      }
+
+      if (entries.includes('tsconfig.json')) {
+        roots.add(currentPath);
+      }
+
+      for (const entry of entries) {
+        const fullPath = join(currentPath, entry);
+        const entryRelativePath = relativePath ? join(relativePath, entry) : entry;
+        const normalizedRelativePath = entryRelativePath.replace(/\\/g, '/');
+
+        if (ignoreFilter.ignores(normalizedRelativePath)) {
+          continue;
+        }
+
+        let fileStat: Stats;
+        try {
+          fileStat = await stat(fullPath);
+        } catch (error) {
+          logger.debug(`[workspaceSymbol] Failed to stat ${fullPath}: ${error}\n`);
+          continue;
+        }
+
+        if (fileStat.isDirectory()) {
+          await scan(fullPath, currentDepth + 1, entryRelativePath);
+        }
+      }
+    };
+
+    await scan(rootDir, 0);
+    return Array.from(roots).sort();
+  }
+
+  private async findWorkspaceSymbolProjectFiles(
+    rootDir: string,
+    projectRoot: string,
+    extensions: Set<string>,
+    ignoreFilter: Awaited<ReturnType<typeof loadGitignore>>
+  ): Promise<string[]> {
+    const maxDepth = 10;
+    const extensionPriority = ['ts', 'tsx', 'js', 'jsx'];
+    const priority = (filePath: string): number => {
+      const ext = extname(filePath).toLowerCase().slice(1);
+      const index = extensionPriority.indexOf(ext);
+      return index === -1 ? extensionPriority.length : index;
+    };
+
+    const scan = async (
+      currentPath: string,
+      currentDepth: number,
+      relativePath = ''
+    ): Promise<string[]> => {
+      if (currentDepth > maxDepth) return [];
+
+      let entries: string[];
+      try {
+        entries = (await readdir(currentPath)).sort();
+      } catch (error) {
+        logger.debug(`[workspaceSymbol] Failed to read ${currentPath}: ${error}\n`);
+        return [];
+      }
+
+      const matches: string[] = [];
+
+      for (const entry of entries) {
+        const fullPath = join(currentPath, entry);
+        const projectRelativePath = relativePath ? join(relativePath, entry) : entry;
+        const rootRelativePath = relative(rootDir, fullPath);
+        const normalizedRelativePath = rootRelativePath.replace(/\\/g, '/');
+
+        if (ignoreFilter.ignores(normalizedRelativePath)) {
+          continue;
+        }
+
+        let fileStat: Stats;
+        try {
+          fileStat = await stat(fullPath);
+        } catch (error) {
+          logger.debug(`[workspaceSymbol] Failed to stat ${fullPath}: ${error}\n`);
+          continue;
+        }
+
+        if (fileStat.isFile()) {
+          const ext = extname(entry).toLowerCase().slice(1);
+          if (extensions.has(ext)) {
+            matches.push(fullPath);
+          }
+          continue;
+        }
+
+        if (fileStat.isDirectory()) {
+          matches.push(...(await scan(fullPath, currentDepth + 1, projectRelativePath)));
+        }
+      }
+
+      return matches.sort(
+        (left, right) => priority(left) - priority(right) || left.localeCompare(right)
+      );
+    };
+
+    return scan(projectRoot, 0);
+  }
+
+  private resolveRootDir(rootDir?: string): string {
+    if (!rootDir) {
+      return process.cwd();
+    }
+
+    return normalize(isAbsolute(rootDir) ? rootDir : join(process.cwd(), rootDir));
   }
 
   async findImplementation(filePath: string, position: Position): Promise<Location[]> {

@@ -32,8 +32,10 @@ function createMockDiagnosticsCache(initial?: Map<string, unknown[]>) {
   const diagnostics = initial ?? new Map();
   return {
     get: jest.fn((uri: string) => diagnostics.get(uri)),
+    delete: jest.fn(),
     update: jest.fn(),
     waitForIdle: jest.fn().mockResolvedValue(undefined),
+    waitForAllIdle: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -1157,6 +1159,9 @@ describe('LSPClient', () => {
       const mockTransport = createMockTransport({
         sendRequest: jest.fn().mockResolvedValue(mockSymbols),
       });
+      const mockDocumentManager = createMockDocumentManager();
+      const seedPath = join(TEST_DIR, 'seed.ts');
+      await writeFile(seedPath, 'export const seed = true;');
 
       const mockServerState = {
         initializationPromise: Promise.resolve(),
@@ -1164,6 +1169,13 @@ describe('LSPClient', () => {
         transport: mockTransport,
         initialized: true,
         adapter: undefined,
+        documentManager: mockDocumentManager,
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: {
+          extensions: ['ts'],
+          command: ['typescript-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
       };
 
       // Mock servers map
@@ -1172,6 +1184,7 @@ describe('LSPClient', () => {
       const result = await client.workspaceSymbol('test');
 
       expect(result).toEqual(mockSymbols);
+      expect(mockDocumentManager.ensureOpen).toHaveBeenCalledWith(seedPath);
       expect(mockTransport.sendRequest).toHaveBeenCalledWith(
         'workspace/symbol',
         { query: 'test' },
@@ -1181,11 +1194,15 @@ describe('LSPClient', () => {
 
     it('should return empty array when no servers running', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
+      const preloadSpy = spyOn(client, 'preloadServers').mockResolvedValue();
 
       // serverManager starts with an empty servers map by default
       const result = await client.workspaceSymbol('test');
 
       expect(result).toEqual([]);
+      expect(preloadSpy).toHaveBeenCalledWith(false);
+
+      preloadSpy.mockRestore();
     });
 
     it('should return empty array when result is not an array', async () => {
@@ -1194,6 +1211,9 @@ describe('LSPClient', () => {
       const mockTransport = createMockTransport({
         sendRequest: jest.fn().mockResolvedValue(null),
       });
+      const mockDocumentManager = createMockDocumentManager();
+      const seedPath = join(TEST_DIR, 'seed.ts');
+      await writeFile(seedPath, 'export const seed = true;');
 
       const mockServerState = {
         initializationPromise: Promise.resolve(),
@@ -1201,6 +1221,13 @@ describe('LSPClient', () => {
         transport: mockTransport,
         initialized: true,
         adapter: undefined,
+        documentManager: mockDocumentManager,
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: {
+          extensions: ['ts'],
+          command: ['typescript-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
       };
 
       (client as any).serverManager.getRunningServers().set('test-key', mockServerState);
@@ -1208,6 +1235,7 @@ describe('LSPClient', () => {
       const result = await client.workspaceSymbol('test');
 
       expect(result).toEqual([]);
+      expect(mockDocumentManager.ensureOpen).toHaveBeenCalledWith(seedPath);
     });
   });
 

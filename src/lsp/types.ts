@@ -75,8 +75,17 @@ export interface ServerState {
   diagnosticsCache: {
     update(uri: string, items: Diagnostic[], version?: number): void;
     get(uri: string): Diagnostic[] | undefined;
+    delete(uri: string): void;
     waitForIdle(
       uri: string,
+      options?: {
+        maxWaitTime?: number;
+        idleTime?: number;
+        checkInterval?: number;
+      }
+    ): Promise<void>;
+    waitForAllIdle(
+      uris: string[],
       options?: {
         maxWaitTime?: number;
         idleTime?: number;
