@@ -619,9 +619,25 @@ describe('LSPClient', () => {
       const serverManager = (client as any).serverManager;
 
       const mockTimer = setTimeout(() => {}, 1000);
+      let exitListener: (() => void) | undefined;
       const mockServerState = {
-        process: { kill: jest.fn() },
+        process: {
+          exitCode: null,
+          signalCode: null,
+          kill: jest.fn(),
+          once: jest.fn((event: string, listener: () => void) => {
+            if (event === 'exit') {
+              exitListener = listener;
+            }
+          }),
+        },
         restartTimer: mockTimer,
+        transport: {
+          sendRequest: jest.fn(() => Promise.resolve(null)),
+          sendNotification: jest.fn(() => {
+            exitListener?.();
+          }),
+        },
       };
 
       // Mock servers map to include our test server state
@@ -630,10 +646,12 @@ describe('LSPClient', () => {
 
       const clearTimeoutSpy = spyOn(global, 'clearTimeout');
 
-      client.dispose();
+      await client.dispose();
 
       expect(clearTimeoutSpy).toHaveBeenCalledWith(mockTimer);
-      expect(mockServerState.process.kill).toHaveBeenCalled();
+      expect(mockServerState.transport.sendRequest).toHaveBeenCalledWith('shutdown', null, 1000);
+      expect(mockServerState.transport.sendNotification).toHaveBeenCalledWith('exit', null);
+      expect(mockServerState.process.kill).not.toHaveBeenCalled();
 
       clearTimeoutSpy.mockRestore();
     });

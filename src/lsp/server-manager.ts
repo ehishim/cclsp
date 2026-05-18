@@ -28,6 +28,7 @@ import type {
 export class ServerManager {
   private readonly servers: Map<string, ServerState> = new Map();
   private readonly serversStarting: Map<string, Promise<ServerState>> = new Map();
+  private disposing = false;
 
   /**
    * Get or start a server for the given config.
@@ -63,6 +64,10 @@ export class ServerManager {
 
     try {
       const serverState = await startPromise;
+      if (this.disposing) {
+        await this.stopServer(serverState);
+        throw new Error('Server manager is disposed');
+      }
       this.servers.set(key, serverState);
       this.serversStarting.delete(key);
       logger.debug('[DEBUG getServer] Server started and cached\n');
@@ -83,14 +88,50 @@ export class ServerManager {
   /**
    * Terminate all running servers and clean up resources.
    */
-  dispose(): void {
-    for (const serverState of this.servers.values()) {
-      if (serverState.restartTimer) {
-        clearTimeout(serverState.restartTimer);
-      }
+  async dispose(): Promise<void> {
+    this.disposing = true;
+    const startingResults = await Promise.allSettled([...this.serversStarting.values()]);
+    const startedDuringDispose = startingResults
+      .filter(
+        (result): result is PromiseFulfilledResult<ServerState> => result.status === 'fulfilled'
+      )
+      .map((result) => result.value);
+    const serverStates = [...new Set([...this.servers.values(), ...startedDuringDispose])];
+    this.servers.clear();
+    this.serversStarting.clear();
+    await Promise.all(serverStates.map((serverState) => this.stopServer(serverState)));
+  }
+
+  private async stopServer(serverState: ServerState): Promise<void> {
+    if (serverState.restartTimer) {
+      clearTimeout(serverState.restartTimer);
+      serverState.restartTimer = undefined;
+    }
+
+    if (serverState.process.exitCode !== null || serverState.process.signalCode !== null) {
+      return;
+    }
+
+    const exited = new Promise<void>((resolve) => {
+      serverState.process.once('exit', () => resolve());
+    });
+
+    try {
+      await serverState.transport.sendRequest('shutdown', null, 1000);
+      serverState.transport.sendNotification('exit', null);
+    } catch {
       serverState.process.kill();
     }
-    this.servers.clear();
+
+    const exitedGracefully = await Promise.race([
+      exited.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 1500)),
+    ]);
+
+    if (!exitedGracefully) {
+      serverState.process.kill('SIGKILL');
+      await Promise.race([exited, new Promise<void>((resolve) => setTimeout(resolve, 500))]);
+    }
   }
 
   private isPylspServer(serverConfig: LSPServerConfig): boolean {
@@ -355,9 +396,7 @@ export class ServerManager {
           return;
         }
         if (message.method === 'client/registerCapability') {
-          logger.debug(
-            `[DEBUG handleMessage] Acknowledging client/registerCapability\n`
-          );
+          logger.debug('[DEBUG handleMessage] Acknowledging client/registerCapability\n');
           serverState.transport.sendMessage({
             jsonrpc: '2.0',
             id: message.id,

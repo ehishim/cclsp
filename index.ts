@@ -33,6 +33,7 @@ if (args.length > 0) {
 }
 
 const lspClient = new LSPClient();
+let shuttingDown = false;
 
 const server = new Server(
   {
@@ -57,14 +58,33 @@ const allTools = [
 
 registerTools(server, allTools, lspClient);
 
-process.on('SIGINT', () => {
-  lspClient.dispose();
-  process.exit(0);
-});
+async function shutdown(code = 0): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await lspClient.dispose();
+  } finally {
+    process.exit(code);
+  }
+}
 
+process.on('SIGINT', () => {
+  void shutdown(0);
+});
 process.on('SIGTERM', () => {
-  lspClient.dispose();
-  process.exit(0);
+  void shutdown(0);
+});
+process.on('disconnect', () => {
+  void shutdown(0);
+});
+process.stdin.on('end', () => {
+  void shutdown(0);
+});
+process.stdin.on('close', () => {
+  void shutdown(0);
+});
+process.stdin.on('error', () => {
+  void shutdown(1);
 });
 
 async function main() {
@@ -72,16 +92,19 @@ async function main() {
   await server.connect(transport);
   logger.info('CCLSP Server running on stdio\n');
 
-  // Preload LSP servers for file types found in the project
-  try {
-    await lspClient.preloadServers();
-  } catch (error) {
-    logger.error(`Failed to preload LSP servers: ${error}\n`);
+  if (process.env.CCLSP_PRELOAD === '1') {
+    // Preload LSP servers for file types found in the project when explicitly requested.
+    try {
+      await lspClient.preloadServers();
+    } catch (error) {
+      logger.error(`Failed to preload LSP servers: ${error}\n`);
+    }
+  } else {
+    logger.info('Skipping LSP preload; servers will start on first tool call\n');
   }
 }
 
 main().catch((error) => {
   logger.error(`Server error: ${error}\n`);
-  lspClient.dispose();
-  process.exit(1);
+  void shutdown(1);
 });

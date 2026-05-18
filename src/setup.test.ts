@@ -98,7 +98,7 @@ describe('generateConfig', () => {
     expect(server).toBeDefined();
     expect(server?.extensions).toContain('ts');
     expect(server?.extensions).toContain('js');
-    expect(server?.command).toEqual(['npx', '--', 'typescript-language-server', '--stdio']);
+    expect(server?.command).toEqual(['typescript-language-server', '--stdio']);
     expect(server?.rootDir).toBe('.');
   });
 

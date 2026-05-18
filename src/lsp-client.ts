@@ -634,7 +634,7 @@ export class LSPClient {
     }
   }
 
-  dispose(): void {
-    this.serverManager.dispose();
+  async dispose(): Promise<void> {
+    await this.serverManager.dispose();
   }
 }

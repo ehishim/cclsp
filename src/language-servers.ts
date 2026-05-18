@@ -16,7 +16,7 @@ export const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     name: 'typescript',
     displayName: 'TypeScript/JavaScript',
     extensions: ['js', 'ts', 'jsx', 'tsx'],
-    command: ['npx', '--', 'typescript-language-server', '--stdio'],
+    command: ['typescript-language-server', '--stdio'],
     installInstructions: 'npm install -g typescript-language-server',
     description: 'TypeScript and JavaScript language server',
     installRequired: false,
