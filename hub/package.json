@@ -9,6 +9,9 @@
   },
   "scripts": {
     "build": "bun build --target=node --outdir=dist src/index.ts",
+    "install-bin": "node scripts/install.mjs",
+    "uninstall-bin": "node scripts/install.mjs --uninstall",
+    "setup": "bun run build && node scripts/install.mjs",
     "dev": "bun run --watch src/index.ts"
   },
   "keywords": ["cclsp", "lsp", "mcp", "cli", "daemon"],

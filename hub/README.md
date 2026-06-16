@@ -53,18 +53,18 @@ cclsp), so build it once:
 
 ```bash
 cd /workspace/cclsp
-bun install                 # if you haven't already (installs the SDK)
-cd hub && bun run build     # → hub/dist/index.js
+bun install            # if you haven't already (installs the SDK)
+cd hub
+bun run setup          # build + install the `cclsp-hub` wrapper on PATH
 ```
 
-Install a wrapper on your `PATH`:
+`setup` builds `dist/` and installs a wrapper to `~/.local/bin/cclsp-hub` (override
+the dir with `CCLSP_HUB_BIN_DIR`). The pieces are also available separately:
 
 ```bash
-cat > ~/.local/bin/cclsp-hub <<'EOF'
-#!/bin/sh
-exec node /workspace/cclsp/hub/dist/index.js "$@"
-EOF
-chmod +x ~/.local/bin/cclsp-hub
+bun run build          # → hub/dist/index.js
+bun run install-bin    # install the PATH wrapper (needs dist/ built)
+bun run uninstall-bin  # remove the wrapper
 ```
 
 ## Quick start

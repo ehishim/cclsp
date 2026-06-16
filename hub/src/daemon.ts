@@ -11,7 +11,7 @@ import {
   RUNTIME_DIR,
   SOCKET_PATH,
 } from './config.js';
-import { RootPool, type ToolSchema } from './pool.js';
+import { type RootEntry, RootPool, type ToolSchema } from './pool.js';
 import { type HubRequest, createLineReader, writeMessage } from './protocol.js';
 
 // Coerce raw string/bool flag values into the types cclsp's JSON schema expects.
@@ -49,26 +49,29 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
 
   // Resolve the target root FIRST (needs only the raw path), so the explicit-only
   // contract is enforced without spawning anything.
-  let entry: ReturnType<RootPool['get']>;
+  let entry: RootEntry;
   if (explicitRoot) {
-    entry = pool.get(explicitRoot);
-    if (!entry) {
+    const e = pool.get(explicitRoot);
+    if (!e) {
       throw new Error(`root not registered: ${explicitRoot}\n  run: cclsp-hub ensure-root ${explicitRoot}`);
     }
+    entry = e;
   } else if (pathArg) {
-    entry = pool.resolveRootForFile(pathArg);
-    if (!entry) {
-      const active = pool.list().map((e) => e.root).join(', ') || 'none';
+    const e = pool.resolveRootForFile(pathArg);
+    if (!e) {
+      const active = pool.list().map((r) => r.root).join(', ') || 'none';
       throw new Error(
         `no registered root owns ${pathArg}\n  run: cclsp-hub ensure-root <project-root>\n  active roots: ${active}`,
       );
     }
+    entry = e;
   } else {
     const roots = pool.list();
-    if (roots.length === 1) {
-      entry = roots[0];
+    const first = roots[0];
+    if (roots.length === 1 && first) {
+      entry = first;
     } else {
-      const active = roots.map((e) => e.root).join(', ') || 'none';
+      const active = roots.map((r) => r.root).join(', ') || 'none';
       throw new Error(`tool '${name}' has no file to route by; pass --root <path>\n  active roots: ${active}`);
     }
   }

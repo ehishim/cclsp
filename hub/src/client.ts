@@ -29,6 +29,7 @@ async function getConnection(autoStart: boolean): Promise<Socket> {
   }
   // Re-exec this same script in daemon mode, fully detached.
   const entry = process.argv[1];
+  if (!entry) throw new Error('cannot resolve cclsp-hub entry to start the daemon');
   spawn(process.execPath, [entry, '--daemon'], {
     detached: true,
     stdio: 'ignore',

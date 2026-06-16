@@ -56,6 +56,7 @@ function parse(argv: string[]): Parsed {
   let command: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
+    if (a === undefined) continue;
     if (a === '-h' || a === '--help') {
       flags.set('help', true);
     } else if (a === '--version') {
