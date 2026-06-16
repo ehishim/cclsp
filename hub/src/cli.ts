@@ -157,6 +157,11 @@ OPTIONS
 
 LINE/CHARACTER are 1-indexed. Run 'cclsp-hub <command> --help' for parameters.
 
+TIP  Prefer a root at the PROJECT ROOT — the directory with tsconfig.json /
+     package.json (TS/JS) or composer.json (PHP). Pointing at a random subdir makes
+     the language server fall back to an inferred project (missed cross-file refs,
+     no path-alias resolution). Register the repo root; query files anywhere under it.
+
 ENV
   CCLSP_HUB_ENTRY            cclsp dist/index.js to spawn (default /workspace/cclsp/dist/index.js)
   CCLSP_HUB_CONFIG           cclsp server config (default ~/.config/claude/cclsp.json)
@@ -191,7 +196,13 @@ async function printToolHelp(command: string, toolName: string): Promise<void> {
 
 function printManagementHelp(command: string): void {
   const help: Record<string, string> = {
-    'ensure-root': 'cclsp-hub ensure-root <path>\n  Register a project root and warm its language servers (idempotent).',
+    'ensure-root':
+      'cclsp-hub ensure-root <path>\n' +
+      '  Register a project root and warm its language servers (idempotent).\n\n' +
+      '  Prefer the PROJECT ROOT — the directory containing tsconfig.json / package.json\n' +
+      '  (TS/JS) or composer.json (PHP). A random subdir makes the language server fall\n' +
+      '  back to an inferred project (missed cross-file refs, no path-alias resolution).\n' +
+      '  Register the repo root, then query files anywhere under it.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
     'restart-root': 'cclsp-hub restart-root <path>\n  Restart one root (recover a stale index).',
     'list-roots': 'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
