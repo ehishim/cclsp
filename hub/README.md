@@ -168,6 +168,28 @@ active.
 | `CCLSP_HUB_TOOL_TIMEOUT_SEC` | `180` | Per-call timeout (covers a cold first index). |
 | `CCLSP_HUB_SOCKET` | `$XDG_RUNTIME_DIR/cclsp-hub/daemon.sock` | Control socket path. |
 
+## Updating after a source change
+
+The CLI runs as a fresh process on every call, so CLI-only edits take effect on the
+next invocation. The **daemon is long-lived** and keeps the previously built bundle
+in memory, so daemon-side edits (`daemon.ts`, `pool.ts`, `protocol.ts`, `config.ts`)
+need a rebuild **and** a daemon restart:
+
+```bash
+cd /workspace/cclsp/hub
+bun run reload     # rebuild dist/, then shut the daemon down
+                   # (the next cclsp-hub call auto-starts the new build)
+```
+
+`reload` = `bun run build` + `cclsp-hub shutdown`. The wrapper path is unchanged, so
+you don't reinstall it; run `bun run setup` again only if you moved the dist path.
+Note that restarting the daemon drops the warm roots — they re-index on next use.
+
+Rebuilt **cclsp itself** (the parent `dist/index.js`)? The hub's warm children are
+still running the old cclsp; refresh them with `cclsp-hub restart-root <path>` (one
+root) or `cclsp-hub shutdown` (all). To bump the reported `--version`, edit
+`version` in `package.json` and `VERSION` in `src/config.ts`, then rebuild.
+
 ## Lifecycle
 
 - The daemon **auto-starts** on the first CLI call and runs detached.
