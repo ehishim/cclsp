@@ -1,0 +1,17 @@
+{
+  "name": "cclsp-hub",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-root daemon + CLI over the cclsp language-server MCP",
+  "type": "module",
+  "bin": {
+    "cclsp-hub": "dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build --target=node --outdir=dist src/index.ts",
+    "dev": "bun run --watch src/index.ts"
+  },
+  "keywords": ["cclsp", "lsp", "mcp", "cli", "daemon"],
+  "license": "MIT",
+  "comment": "Depends on @modelcontextprotocol/sdk resolved from the parent cclsp node_modules; bun bundles it into dist/index.js at build time."
+}
