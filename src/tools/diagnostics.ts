@@ -65,7 +65,8 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
       },
       max_files: {
         type: 'number',
-        description: 'Maximum number of files to scan. Default: 50. Max: 200.',
+        description:
+          'Maximum number of files to scan. Default: 50 (CCLSP_MAX_FILES_DEFAULT). Max: 200 (CCLSP_MAX_FILES_LIMIT).',
       },
     },
     required: ['path'],
@@ -79,7 +80,15 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
     };
 
     const absolutePath = resolve(inputPath);
-    const maxFiles = Math.min(max_files ?? 50, 200);
+    // The per-call default (when max_files is omitted) and the upper bound are both
+    // configurable for large repos. These live in cclsp core so the plain MCP server
+    // and any wrapper (e.g. cclsp-hub) honor the same limits.
+    const envInt = (v: string | undefined, def: number): number => {
+      const n = Number.parseInt(v ?? '', 10);
+      return Number.isFinite(n) && n > 0 ? n : def;
+    };
+    const ceiling = envInt(process.env.CCLSP_MAX_FILES_LIMIT, 200);
+    const maxFiles = Math.min(max_files ?? envInt(process.env.CCLSP_MAX_FILES_DEFAULT, 50), ceiling);
 
     try {
       // Check if path is a file or directory

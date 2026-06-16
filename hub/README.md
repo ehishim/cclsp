@@ -168,6 +168,17 @@ active.
 | `CCLSP_HUB_TOOL_TIMEOUT_SEC` | `180` | Per-call timeout (covers a cold first index). |
 | `CCLSP_HUB_SOCKET` | `$XDG_RUNTIME_DIR/cclsp-hub/daemon.sock` | Control socket path. |
 
+### Inherited cclsp-core vars
+
+`diagnostics-batch` file limits are **not** hub vars — they belong to cclsp core
+and reach the children through the inherited environment, so plain cclsp and the
+hub honor the same values:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `CCLSP_MAX_FILES_DEFAULT` | `50` | Files scanned by `diagnostics-batch` when `--max-files` is omitted. |
+| `CCLSP_MAX_FILES_LIMIT` | `200` | Upper bound for `diagnostics-batch` (raise to scan more at once). |
+
 ## Updating after a source change
 
 The CLI runs as a fresh process on every call, so CLI-only edits take effect on the

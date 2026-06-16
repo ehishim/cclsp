@@ -168,7 +168,11 @@ ENV
   CCLSP_HUB_MAX_ROOTS        max concurrent roots (default 30, LRU-evicted)
   CCLSP_HUB_IDLE_ROOT_SEC    evict a root after this idle time (default 1800)
   CCLSP_HUB_TOOL_TIMEOUT_SEC per-call timeout (default 180)
-  CCLSP_HUB_SOCKET           override the control socket path`;
+  CCLSP_HUB_SOCKET           override the control socket path
+
+Inherited by the cclsp children (set in the daemon's environment):
+  CCLSP_MAX_FILES_DEFAULT    files scanned by diagnostics-batch when --max-files omitted (50)
+  CCLSP_MAX_FILES_LIMIT      upper bound for diagnostics-batch (200)`;
 
 async function printToolHelp(command: string, toolName: string): Promise<void> {
   const { tools } = (await request('describe')) as { tools: ToolSchema[] };

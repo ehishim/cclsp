@@ -55,8 +55,8 @@ export class RootPool {
       command: process.execPath,
       args: [CCLSP_ENTRY],
       cwd: root,
-      // Pass the full env (so PATH resolves typescript-language-server /
-      // intelephense) plus the cclsp config and an eager preload.
+      // Full env (so PATH resolves the language servers, and cclsp-core vars like
+      // CCLSP_MAX_FILES_LIMIT are inherited) plus the cclsp config and eager preload.
       env: {
         ...(process.env as Record<string, string>),
         CCLSP_CONFIG_PATH,
