@@ -100,24 +100,29 @@ cclsp-hub status
 
 ### Code intelligence
 
-Routed to the registered root that owns `--file`. Line/character are **1-indexed**.
+Every cclsp tool is exposed **1:1 by its exact name**. Routed to the registered
+root that owns `--file`. Line/character are **1-indexed**.
 
-| Command | Required | Optional |
-|---|---|---|
-| `definition` | `--file --symbol-name` | `--symbol-kind` |
-| `references` | `--file --symbol-name` | `--symbol-kind --include-declaration` |
-| `implementation` | `--file --line --character` | |
-| `hover` | `--file --line --character` | |
-| `diagnostics` | `--file` | |
-| `diagnostics-batch` | `--path` | `--pattern --max-files` |
-| `rename` | `--file --symbol-name --new-name` | `--symbol-kind --dry-run` |
-| `rename-strict` | `--file --line --character --new-name` | `--dry-run` |
-| `symbols` | `--query --root` | |
-| `call-hierarchy` | `--file --line --character` | |
-| `incoming-calls` | `--file --line --character` | |
-| `outgoing-calls` | `--file --line --character` | |
-| `restart-server` | `--root` | `--extensions ts,tsx` |
-| `call <tool>` | — | `--params-json '{...}'` (raw passthrough) |
+| Tool (exact) | Alias | Required | Optional |
+|---|---|---|---|
+| `find_definition` | `definition` | `--file --symbol-name` | `--symbol-kind` |
+| `find_references` | `references` | `--file --symbol-name` | `--symbol-kind --include-declaration` |
+| `find_implementation` | `implementation` | `--file --line --character` | |
+| `get_hover` | `hover` | `--file --line --character` | |
+| `get_diagnostics` | `diagnostics` | `--file` | |
+| `get_diagnostics_batch` | `diagnostics-batch` | `--path` | `--pattern --max-files` |
+| `rename_symbol` | `rename` | `--file --symbol-name --new-name` | `--symbol-kind --dry-run` |
+| `rename_symbol_strict` | `rename-strict` | `--file --line --character --new-name` | `--dry-run` |
+| `find_workspace_symbols` | `symbols` | `--query --root` | |
+| `prepare_call_hierarchy` | `call-hierarchy` | `--file --line --character` | |
+| `get_incoming_calls` | `incoming-calls` | `--file --line --character` | |
+| `get_outgoing_calls` | `outgoing-calls` | `--file --line --character` | |
+| `restart_server` | `restart-server` | `--root` | `--extensions ts,tsx` |
+| `call <tool>` | — | — | `--params-json '{...}'` (raw passthrough) |
+
+Use the exact name, the short alias, or kebab-case (`find-definition`) — all three
+work. New cclsp tools are callable by their exact name immediately, no hub release.
+Run `cclsp-hub describe` to list whatever the connected cclsp exposes.
 
 Flag notes:
 - `--file` is sugar for `--file-path`; `--symbol` for `--symbol-name`.

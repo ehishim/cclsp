@@ -133,21 +133,25 @@ ROOTS & DAEMON
   shutdown                Stop all roots and the daemon
   describe                List the available cclsp tools
 
-CODE INTELLIGENCE  (routed by --file; symbols needs --root)
-  definition        --file F --symbol-name NAME [--symbol-kind K]
-  references        --file F --symbol-name NAME [--symbol-kind K]
-  implementation    --file F --line N --character C
-  hover             --file F --line N --character C
-  diagnostics       --file F
-  diagnostics-batch --path P [--pattern RE] [--max-files N]
-  rename            --file F --symbol-name NAME --new-name NEW [--dry-run]
-  rename-strict     --file F --line N --character C --new-name NEW [--dry-run]
-  symbols           --query Q --root R
-  call-hierarchy    --file F --line N --character C
-  incoming-calls    --file F --line N --character C
-  outgoing-calls    --file F --line N --character C
-  restart-server    --root R [--extensions ts,tsx]
-  call <tool>       Raw passthrough; combine with --params-json '{...}'
+CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need --root)
+  find_definition         --file F --symbol-name NAME [--symbol-kind K]
+  find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
+  find_implementation     --file F --line N --character C
+  get_hover               --file F --line N --character C
+  get_diagnostics         --file F
+  get_diagnostics_batch   --path P [--pattern RE] [--max-files N]
+  rename_symbol           --file F --symbol-name NAME --new-name NEW [--dry-run]
+  rename_symbol_strict    --file F --line N --character C --new-name NEW [--dry-run]
+  find_workspace_symbols  --query Q --root R
+  prepare_call_hierarchy  --file F --line N --character C
+  get_incoming_calls      --file F --line N --character C
+  get_outgoing_calls      --file F --line N --character C
+  restart_server          --root R [--extensions ts,tsx]
+  call <tool>             Raw passthrough; combine with --params-json '{...}'
+
+Short aliases (and kebab-case) also work: definition, references, implementation,
+hover, diagnostics, diagnostics-batch, rename, rename-strict, symbols,
+call-hierarchy, incoming-calls, outgoing-calls, restart-server.
 
 OPTIONS
   --root <path>     Force which registered root serves the call
@@ -317,8 +321,14 @@ export async function runCli(argv: string[]): Promise<void> {
   }
 
   // ---- tool commands ----
+  // Every cclsp tool is callable 1:1 by its exact name (find_definition, …). The
+  // short aliases (definition, …) are conveniences, and kebab is accepted too
+  // (find-definition → find_definition). `call <tool>` is the raw escape hatch.
+  const rawCmd = p.command;
   const toolName =
-    p.command === 'call' ? String(p.positionals[0] ?? '') : (ALIASES[p.command] ?? p.command);
+    rawCmd === 'call'
+      ? String(p.positionals[0] ?? '')
+      : (ALIASES[rawCmd] ?? rawCmd.replace(/-/g, '_'));
   if (!toolName) {
     err('usage: cclsp-hub call <tool> [--params-json \'{...}\']');
     process.exitCode = 1;
