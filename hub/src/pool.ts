@@ -50,17 +50,21 @@ export class RootPool {
     return this.roots.get(normalizeRoot(rootInput));
   }
 
-  private makeChild(root: string): { client: Client; transport: StdioClientTransport } {
+  private makeChild(
+    root: string,
+    opts: { preload?: boolean } = {},
+  ): { client: Client; transport: StdioClientTransport } {
     const transport = new StdioClientTransport({
       command: process.execPath,
       args: [CCLSP_ENTRY],
       cwd: root,
       // Full env (so PATH resolves the language servers, and cclsp-core vars like
-      // CCLSP_MAX_FILES_LIMIT are inherited) plus the cclsp config and eager preload.
+      // CCLSP_MAX_FILES_LIMIT are inherited) plus the cclsp config. Preload warms the
+      // language servers eagerly; skip it for throwaway probes (schema-only spawns).
       env: {
         ...(process.env as Record<string, string>),
         CCLSP_CONFIG_PATH,
-        CCLSP_PRELOAD: '1',
+        ...(opts.preload === false ? {} : { CCLSP_PRELOAD: '1' }),
       },
       stderr: 'ignore',
     });
@@ -157,7 +161,7 @@ export class RootPool {
   async describe(): Promise<ToolSchema[]> {
     if (this.toolSchemas) return this.toolSchemas;
     const probeRoot = normalizeRoot(process.env.CCLSP_HUB_PROBE_ROOT || process.cwd());
-    const { client, transport } = this.makeChild(probeRoot);
+    const { client, transport } = this.makeChild(probeRoot, { preload: false });
     try {
       await client.connect(transport);
       this.toolSchemas = (await client.listTools()).tools as ToolSchema[];
