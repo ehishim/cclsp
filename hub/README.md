@@ -90,7 +90,7 @@ cclsp-hub status
 
 | Command | Description |
 |---|---|
-| `ensure-root <path>` | Register a project root and warm its language servers (idempotent). |
+| `ensure-root <path>` | Register a project root and warm its language servers (idempotent). A subroot of an already-warm root is reused — pass `--isolate` to force a dedicated instance. |
 | `list-roots` / `roots` | Show active roots with pid, age, idle time. |
 | `stop-root <path>` | Tear down one root and its language servers. |
 | `restart-root <path>` | Restart one root (recover a stale index). |
@@ -147,13 +147,21 @@ message telling you which root to add — nothing is auto-spawned:
 ```
 $ cclsp-hub definition --file /workspace/other/x.ts --symbol-name foo
 no registered root owns /workspace/other/x.ts
-  run: cclsp-hub ensure-root <project-root>
+  run: cclsp-hub ensure-root /workspace/other   (detected project root)
   active roots: /workspace/app
 ```
+
+The hint walks up from the file to suggest the actual project root (nearest
+`tsconfig.json`/`package.json`/`composer.json`/`go.mod`, else the git repo).
 
 When several roots match (nested roots), the **longest prefix** wins. Root-less
 tools (`symbols`, `restart-server`) require `--root` unless exactly one root is
 active.
+
+**Subroot reuse:** registering a path that sits inside an already-warm root returns
+that root instead of spawning a second language server — one server covers the whole
+tree, which is both faster and usually what you want (the enclosing `tsconfig`
+governs the subdir). Use `--isolate` when a nested package needs its own instance.
 
 ## Output
 

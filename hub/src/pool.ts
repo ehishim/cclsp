@@ -68,12 +68,26 @@ export class RootPool {
     return { client, transport };
   }
 
-  async ensure(rootInput: string): Promise<RootEntry> {
+  // Returns the entry that ended up serving `rootInput` and whether it was reused
+  // (an exact match, or an already-warm enclosing root) rather than freshly spawned.
+  async ensure(rootInput: string, opts: { isolate?: boolean } = {}): Promise<{ entry: RootEntry; reused: boolean }> {
     const root = normalizeRoot(rootInput);
     const existing = this.roots.get(root);
     if (existing) {
       existing.lastUsed = Date.now();
-      return existing;
+      return { entry: existing, reused: true };
+    }
+    // Subroot reuse: if an already-warm root encloses this path, its language server
+    // already covers these files — reuse it instead of spawning a second one. Pass
+    // isolate to force a dedicated instance (e.g. a monorepo package with its own config).
+    if (!opts.isolate) {
+      const covering = this.list()
+        .filter((e) => isUnder(root, e.root))
+        .sort((a, b) => b.root.length - a.root.length)[0];
+      if (covering) {
+        covering.lastUsed = Date.now();
+        return { entry: covering, reused: true };
+      }
     }
     // LRU cap: make room before adding a new root.
     if (this.roots.size >= MAX_ROOTS) {
@@ -99,7 +113,7 @@ export class RootPool {
         // leave null; describe() can fetch it later
       }
     }
-    return entry;
+    return { entry, reused: false };
   }
 
   async stop(rootInput: string): Promise<boolean> {
@@ -116,8 +130,14 @@ export class RootPool {
   }
 
   async restart(rootInput: string): Promise<RootEntry> {
-    await this.stop(rootInput);
-    return this.ensure(rootInput);
+    const root = normalizeRoot(rootInput);
+    if (!this.roots.has(root)) {
+      throw new Error(`not a registered root: ${root} (see: cclsp-hub list-roots)`);
+    }
+    await this.stop(root);
+    // isolate: respawn this exact root, don't fold it into some enclosing root.
+    const { entry } = await this.ensure(root, { isolate: true });
+    return entry;
   }
 
   async stopAll(): Promise<void> {

@@ -42,7 +42,7 @@ const FLAG_ALIASES: Record<string, string> = {
 
 // Flags that are always boolean — they must never consume the following token
 // (e.g. `--json diagnostics` is the json flag + the diagnostics command).
-const KNOWN_BOOLEAN = new Set(['json', 'help', 'version', 'dry-run', 'include-declaration']);
+const KNOWN_BOOLEAN = new Set(['json', 'help', 'version', 'dry-run', 'include-declaration', 'isolate']);
 
 interface Parsed {
   command?: string;
@@ -126,6 +126,7 @@ USAGE
 
 ROOTS & DAEMON
   ensure-root <path>      Register a project root and warm its language servers
+                          (a subroot of a warm root is reused; --isolate to force new)
   list-roots | roots      Show active roots (pid, age, idle)
   stop-root <path>        Tear down one root
   restart-root <path>     Restart one root (recover a stale index)
@@ -205,12 +206,15 @@ async function printToolHelp(command: string, toolName: string): Promise<void> {
 function printManagementHelp(command: string): void {
   const help: Record<string, string> = {
     'ensure-root':
-      'cclsp-hub ensure-root <path>\n' +
+      'cclsp-hub ensure-root <path> [--isolate]\n' +
       '  Register a project root and warm its language servers (idempotent).\n\n' +
       '  Prefer the PROJECT ROOT — the directory containing tsconfig.json / package.json\n' +
       '  (TS/JS) or composer.json (PHP). A random subdir makes the language server fall\n' +
       '  back to an inferred project (missed cross-file refs, no path-alias resolution).\n' +
-      '  Register the repo root, then query files anywhere under it.',
+      '  Register the repo root, then query files anywhere under it.\n\n' +
+      '  If <path> sits inside an already-warm root, that root is reused (no second\n' +
+      "  server). Pass --isolate to force a dedicated instance — e.g. a monorepo\n" +
+      '  package with its own tsconfig that the outer root does not reference.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
     'restart-root': 'cclsp-hub restart-root <path>\n  Restart one root (recover a stale index).',
     'list-roots': 'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
@@ -260,12 +264,20 @@ export async function runCli(argv: string[]): Promise<void> {
       case 'ensure-root': {
         const root = rootArg(p);
         if (!root) {
-          err('usage: cclsp-hub ensure-root <path>');
+          err('usage: cclsp-hub ensure-root <path> [--isolate]');
           process.exitCode = 1;
           return;
         }
-        const res: any = await request('ensure-root', { root });
-        out(json ? asJson(res) : `warmed root: ${res.root} (pid ${res.pid ?? '?'}) — language servers indexing in background`);
+        const res: any = await request('ensure-root', { root, isolate: p.flags.get('isolate') === true });
+        if (json) {
+          out(asJson(res));
+        } else if (res.reused && res.root !== res.requested) {
+          out(`covered by existing root: ${res.root} (serves ${res.requested}) — no new server spawned`);
+        } else if (res.reused) {
+          out(`root already warm: ${res.root}`);
+        } else {
+          out(`warmed root: ${res.root} (pid ${res.pid ?? '?'}) — language servers indexing in background`);
+        }
         return;
       }
       case 'list-roots':

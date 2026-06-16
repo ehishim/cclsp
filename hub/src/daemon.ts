@@ -4,6 +4,7 @@
 
 import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { type Server, type Socket, createServer } from 'node:net';
+import { dirname, join, resolve } from 'node:path';
 import {
   IDLE_DAEMON_MS,
   IDLE_ROOT_MS,
@@ -11,7 +12,30 @@ import {
   RUNTIME_DIR,
   SOCKET_PATH,
 } from './config.js';
-import { type RootEntry, RootPool, type ToolSchema } from './pool.js';
+import { type RootEntry, RootPool, normalizeRoot, type ToolSchema } from './pool.js';
+
+// Strong language-project markers — a dir with one of these is a real project root.
+// Checked first so an outer tsconfig.json wins over a nested bare package.json.
+const STRONG_MARKERS = ['tsconfig.json', 'jsconfig.json', 'composer.json', 'go.mod', 'pyproject.toml'];
+
+// Walk up from a path to guess its project root: nearest dir with a strong marker,
+// else nearest package.json, else the enclosing git repo. Only used for the hint.
+function detectProjectRoot(target: string): string | undefined {
+  let dir = resolve(target);
+  let pkgRoot: string | undefined;
+  let gitRoot: string | undefined;
+  for (let i = 0; i < 40; i++) {
+    for (const m of STRONG_MARKERS) {
+      if (existsSync(join(dir, m))) return dir;
+    }
+    if (!pkgRoot && existsSync(join(dir, 'package.json'))) pkgRoot = dir;
+    if (!gitRoot && existsSync(join(dir, '.git'))) gitRoot = dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return pkgRoot ?? gitRoot;
+}
 import { type HubRequest, createLineReader, writeMessage } from './protocol.js';
 
 // Coerce raw string/bool flag values into the types cclsp's JSON schema expects.
@@ -60,8 +84,11 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
     const e = pool.resolveRootForFile(pathArg);
     if (!e) {
       const active = pool.list().map((r) => r.root).join(', ') || 'none';
+      const guess = detectProjectRoot(pathArg);
       throw new Error(
-        `no registered root owns ${pathArg}\n  run: cclsp-hub ensure-root <project-root>\n  active roots: ${active}`,
+        `no registered root owns ${pathArg}\n` +
+          `  run: cclsp-hub ensure-root ${guess ?? '<project-root>'}${guess ? '   (detected project root)' : ''}\n` +
+          `  active roots: ${active}`,
       );
     }
     entry = e;
@@ -133,8 +160,16 @@ export async function runDaemon(): Promise<void> {
           reply(true, { tools: await pool.describe() });
           break;
         case 'ensure-root': {
-          const e = await pool.ensure(String(args.root));
-          reply(true, { root: e.root, pid: e.pid, startedAt: e.startedAt });
+          const { entry: e, reused } = await pool.ensure(String(args.root), {
+            isolate: args.isolate === true,
+          });
+          reply(true, {
+            root: e.root,
+            requested: normalizeRoot(String(args.root)),
+            reused,
+            pid: e.pid,
+            startedAt: e.startedAt,
+          });
           break;
         }
         case 'list-roots':
