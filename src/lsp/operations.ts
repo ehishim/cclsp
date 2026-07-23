@@ -1,4 +1,5 @@
-import { readFileSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import { pathToUri, uriToPath } from '../utils.js';
 import type {
@@ -203,21 +204,22 @@ async function ensureFreshDocument(
   filePath: string
 ): Promise<{ justOpened: boolean }> {
   const dm = serverState.documentManager;
-  const sig = fileSignature(filePath);
+  const snap = readAndSign(filePath);
 
   if (dm.isOpen(filePath)) {
-    if (dm.getSyncSig(filePath) !== sig) {
+    // File gone/unreadable (snap === null): leave the server's buffer as-is rather
+    // than crash — best-effort against a file deleted mid-request.
+    if (snap && dm.getSyncSig(filePath) !== snap.sig) {
       logger.debug(`[DEBUG ensureFreshDocument] ${filePath} changed on disk, re-syncing\n`);
-      const content = readFileSync(filePath, 'utf-8');
-      dm.sendChange(filePath, content);
-      dm.setSyncSig(filePath, sig);
+      dm.sendChange(filePath, snap.content);
+      dm.setSyncSig(filePath, snap.sig);
       serverState.diagnosticsCache.delete(pathToUri(filePath));
     }
     return { justOpened: false };
   }
 
   const justOpened = await dm.ensureOpen(filePath);
-  dm.setSyncSig(filePath, sig);
+  if (snap) dm.setSyncSig(filePath, snap.sig);
   return { justOpened };
 }
 
@@ -602,14 +604,18 @@ export async function findSymbolsByName(
   return { matches, warning: combinedWarning || undefined };
 }
 
-// Cheap change-detection signature (mtime+size) so repeated diagnostics calls on
-// an unchanged file can skip a redundant re-open/re-sync + re-analysis.
-function fileSignature(filePath: string): string {
+// Read a file and compute a content signature (SHA-1) in one pass. Returns null if
+// the file can't be read (deleted/unreadable mid-flight). We hash the actual bytes
+// rather than trusting mtime/size: a stat-based signature would miss same-length
+// edits made within one filesystem-timestamp tick (coarse-resolution or overlay
+// filesystems), silently serving stale results. The read is cheap next to the LSP
+// round-trip it lets us skip, and the content is reused for didChange when it differs.
+function readAndSign(filePath: string): { content: string; sig: string } | null {
   try {
-    const s = statSync(filePath);
-    return `${s.mtimeMs}:${s.size}`;
+    const content = readFileSync(filePath, 'utf-8');
+    return { content, sig: createHash('sha1').update(content).digest('hex') };
   } catch {
-    return '';
+    return null;
   }
 }
 
@@ -669,13 +675,13 @@ export async function getDiagnostics(
   const fileUri = pathToUri(filePath);
   const dm = serverState.documentManager;
   const cache = serverState.diagnosticsCache;
-  const sig = fileSignature(filePath);
+  const snap = readAndSign(filePath);
   const method = 'textDocument/diagnostic';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
 
   if (dm.isOpen(filePath)) {
     const cached = cache.get(fileUri);
-    if (dm.getSyncSig(filePath) === sig && cached !== undefined) {
+    if (snap && dm.getSyncSig(filePath) === snap.sig && cached !== undefined) {
       // Fast path: file unchanged on disk since we last synced it and we already
       // have diagnostics for it. No re-sync, no round-trip.
       logger.debug(
@@ -683,18 +689,17 @@ export async function getDiagnostics(
       );
       return cached;
     }
-    if (dm.getSyncSig(filePath) !== sig) {
+    if (snap && dm.getSyncSig(filePath) !== snap.sig) {
       // File was edited externally (e.g. Claude Code's Edit tool): push the new
       // content and drop stale diagnostics.
       logger.debug('[DEBUG getDiagnostics] File changed on disk, re-syncing\n');
-      const currentContent = readFileSync(filePath, 'utf-8');
-      dm.sendChange(filePath, currentContent);
-      dm.setSyncSig(filePath, sig);
+      dm.sendChange(filePath, snap.content);
+      dm.setSyncSig(filePath, snap.sig);
       cache.delete(fileUri);
     }
   } else {
     await dm.ensureOpen(filePath);
-    dm.setSyncSig(filePath, sig);
+    if (snap) dm.setSyncSig(filePath, snap.sig);
   }
 
   // Prefer pull diagnostics.
@@ -765,12 +770,11 @@ export async function getDiagnosticsBatch(
   // last sync and already have diagnostics are reused straight from the cache.
   const toAnalyze: Array<{ filePath: string; fileUri: string }> = [];
   for (const e of entries) {
-    const sig = fileSignature(e.filePath);
+    const snap = readAndSign(e.filePath);
     if (dm.isOpen(e.filePath)) {
-      if (dm.getSyncSig(e.filePath) !== sig) {
-        const currentContent = readFileSync(e.filePath, 'utf-8');
-        dm.sendChange(e.filePath, currentContent);
-        dm.setSyncSig(e.filePath, sig);
+      if (snap && dm.getSyncSig(e.filePath) !== snap.sig) {
+        dm.sendChange(e.filePath, snap.content);
+        dm.setSyncSig(e.filePath, snap.sig);
         cache.delete(e.fileUri);
         toAnalyze.push(e);
       } else if (cache.get(e.fileUri) === undefined) {
@@ -779,34 +783,35 @@ export async function getDiagnosticsBatch(
       // else: unchanged and already cached -> reuse.
     } else {
       await dm.ensureOpen(e.filePath);
-      dm.setSyncSig(e.filePath, sig);
+      if (snap) dm.setSyncSig(e.filePath, snap.sig);
       toAnalyze.push(e);
     }
   }
 
-  // Phase 2: Pull diagnostics concurrently for the files that need (re)analysis.
-  // Pull returns as soon as each file is computed; fall back to the push model
-  // (batch idle wait) only if the server doesn't support pull.
+  // Phase 2: Get diagnostics for the files that need (re)analysis. Probe pull
+  // support on the first file (serial); if it's supported, fan the rest out
+  // concurrently (pull returns as soon as each file is computed). If the server
+  // doesn't support pull, skip the fan-out entirely and use the push model — a
+  // single batch idle wait — instead of firing N requests that would all fail.
   if (toAnalyze.length > 0) {
-    let pullUnsupported = false;
-    await Promise.all(
-      toAnalyze.map(async (e) => {
-        if (pullUnsupported) return;
-        const pulled = await pullDiagnostics(serverState, e.fileUri, timeout);
-        if (pulled === null) {
-          pullUnsupported = true;
-        } else {
-          cache.update(e.fileUri, pulled);
-        }
-      })
-    );
-    if (pullUnsupported) {
+    const [probe, ...rest] = toAnalyze;
+    const probed = probe ? await pullDiagnostics(serverState, probe.fileUri, timeout) : null;
+
+    if (probe && probed === null) {
       logger.debug(
         '[DEBUG getDiagnosticsBatch] Pull unsupported, waiting for publishDiagnostics\n'
       );
       await cache.waitForAllIdle(
         toAnalyze.map((e) => e.fileUri),
         { maxWaitTime: 15000, idleTime: 300 }
+      );
+    } else {
+      if (probe && probed) cache.update(probe.fileUri, probed);
+      await Promise.all(
+        rest.map(async (e) => {
+          const pulled = await pullDiagnostics(serverState, e.fileUri, timeout);
+          if (pulled !== null) cache.update(e.fileUri, pulled);
+        })
       );
     }
   }

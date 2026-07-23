@@ -44,6 +44,7 @@ export class LSPClient {
   private config: Config;
   private serverManager = new ServerManager();
   private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
+  private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<void>>();
 
   constructor(configPath?: string) {
     this.config = loadConfig(configPath);
@@ -365,66 +366,92 @@ export class LSPClient {
     if (this.workspaceSymbolPrimedServers.has(serverState)) {
       return;
     }
-
-    // One seed file per sub-project root is enough to make a lazy-loading server
-    // (tsserver, gopls) load that project; workspace/symbol then searches the whole
-    // program. This replaces the old "open up to 500 files" warm-up that caused the
-    // first workspace-symbol call to time out.
-    const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
-
-    if (seedFiles.length > 0) {
-      await Promise.all(
-        seedFiles.map((seedFile) =>
-          serverState.documentManager.ensureOpen(seedFile).catch((error) => {
-            logger.debug(`[workspaceSymbol] Failed to open seed ${seedFile}: ${error}\n`);
-            return false;
-          })
-        )
-      );
+    // Coalesce concurrent workspace/symbol calls: only one priming pass runs per
+    // server; overlapping callers await the same in-flight promise.
+    const inFlight = this.workspaceSymbolPrimingInFlight.get(serverState);
+    if (inFlight) {
+      await inFlight;
+      return;
     }
 
-    await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+    const run = (async () => {
+      // One seed file per sub-project root is enough to make a lazy-loading server
+      // (tsserver, gopls) load that project; workspace/symbol then searches the whole
+      // program. This replaces the old "open up to 500 files" warm-up that caused the
+      // first workspace-symbol call to time out.
+      const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
 
-    this.workspaceSymbolPrimedServers.add(serverState);
-    logger.debug(
-      `[workspaceSymbol] Primed workspace symbols with ${seedFiles.length} seed file(s)\n`
-    );
+      if (seedFiles.length > 0) {
+        await Promise.all(
+          seedFiles.map((seedFile) =>
+            serverState.documentManager.ensureOpen(seedFile).catch((error) => {
+              logger.debug(`[workspaceSymbol] Failed to open seed ${seedFile}: ${error}\n`);
+              return false;
+            })
+          )
+        );
+      }
+
+      const confirmed = await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+
+      // Only treat the server as permanently primed when readiness was confirmed.
+      // An indexing server whose index didn't finish in the budget is left unprimed
+      // so a later call re-checks (by then the index is usually complete) instead of
+      // sticking with an empty index for the rest of the process lifetime.
+      if (confirmed) {
+        this.workspaceSymbolPrimedServers.add(serverState);
+      }
+      logger.debug(
+        `[workspaceSymbol] Primed workspace symbols with ${seedFiles.length} seed file(s) (confirmed=${confirmed})\n`
+      );
+    })();
+
+    this.workspaceSymbolPrimingInFlight.set(serverState, run);
+    try {
+      await run;
+    } finally {
+      this.workspaceSymbolPrimingInFlight.delete(serverState);
+    }
   }
 
   /**
-   * Bounded wait until a server can answer workspace/symbol completely.
+   * Bounded wait until a server can answer workspace/symbol completely. Returns
+   * whether readiness was confirmed (vs. bailed on the budget mid-index).
    *
    * - Workspace-indexing servers (intelephense): wait for the async index to
    *   finish, signalled by the adapter via serverState.indexingComplete.
    * - Lazy-loading servers (tsserver, gopls): opening a seed triggers project
-   *   load; a documentSymbol round-trip per seed confirms the project is ready.
+   *   load; the seed's publishDiagnostics settling confirms the project is ready.
    *
    * Always capped so priming can never hang.
    */
   private async waitForWorkspaceSymbolReady(
     serverState: ServerState,
     seedFiles: string[]
-  ): Promise<void> {
+  ): Promise<boolean> {
     const BUDGET_MS = 30000;
     const deadline = Date.now() + BUDGET_MS;
 
     if (serverState.adapter?.isWorkspaceIndexingServer?.()) {
-      // Give the server a short grace to announce indexing. If it never does, the
-      // workspace is either already indexed or has nothing to index — proceed.
-      const graceDeadline = Date.now() + 3000;
+      // Grace window for the server to announce indexing has begun. Servers are
+      // usually warmed (at ensure-root) well before the first query, so indexing
+      // has typically started — often finished — by now. If nothing is signalled
+      // within the grace, assume there's nothing to index and treat it as ready.
+      const graceDeadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         if (serverState.indexingComplete) {
           logger.debug('[workspaceSymbol] Workspace index complete\n');
-          return;
+          return true;
         }
         if (!serverState.indexingStarted && Date.now() > graceDeadline) {
           logger.debug('[workspaceSymbol] No indexing signalled within grace; proceeding\n');
-          return;
+          return true;
         }
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
+      // Indexing started but didn't finish in the budget: not confirmed.
       logger.debug('[workspaceSymbol] Indexing did not finish within budget; proceeding\n');
-      return;
+      return false;
     }
 
     // Lazy-loading server (tsserver, gopls): opening a seed triggers the project/
@@ -458,6 +485,7 @@ export class LSPClient {
         )
       );
     }
+    return true;
   }
 
   private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {
