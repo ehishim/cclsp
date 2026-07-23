@@ -8,6 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import {
   CCLSP_CONFIG_PATH,
   CCLSP_ENTRY,
+  CHILD_RUNTIME,
   MAX_ROOTS,
   TOOL_TIMEOUT_MS,
   VERSION,
@@ -52,10 +53,10 @@ export class RootPool {
 
   private makeChild(
     root: string,
-    opts: { preload?: boolean } = {},
+    opts: { preload?: boolean } = {}
   ): { client: Client; transport: StdioClientTransport } {
     const transport = new StdioClientTransport({
-      command: process.execPath,
+      command: CHILD_RUNTIME,
       args: [CCLSP_ENTRY],
       cwd: root,
       // Full env (so PATH resolves the language servers, and cclsp-core vars like
@@ -74,7 +75,10 @@ export class RootPool {
 
   // Returns the entry that ended up serving `rootInput` and whether it was reused
   // (an exact match, or an already-warm enclosing root) rather than freshly spawned.
-  async ensure(rootInput: string, opts: { isolate?: boolean } = {}): Promise<{ entry: RootEntry; reused: boolean }> {
+  async ensure(
+    rootInput: string,
+    opts: { isolate?: boolean } = {}
+  ): Promise<{ entry: RootEntry; reused: boolean }> {
     const root = normalizeRoot(rootInput);
     const existing = this.roots.get(root);
     if (existing) {
@@ -100,8 +104,7 @@ export class RootPool {
     }
     const { client, transport } = this.makeChild(root);
     await client.connect(transport);
-    const pid =
-      (transport as any).pid ?? (transport as any)._process?.pid ?? undefined;
+    const pid = (transport as any).pid ?? (transport as any)._process?.pid ?? undefined;
     const entry: RootEntry = {
       root,
       client,

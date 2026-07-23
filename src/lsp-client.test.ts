@@ -46,6 +46,8 @@ function createMockDocumentManager() {
     sendChange: jest.fn(),
     isOpen: jest.fn().mockReturnValue(false),
     getVersion: jest.fn().mockReturnValue(0),
+    getSyncSig: jest.fn().mockReturnValue(undefined),
+    setSyncSig: jest.fn(),
   };
 }
 
@@ -905,9 +907,13 @@ describe('LSPClient', () => {
       const result = await client.getDiagnostics(MOCK_TEST_TS);
 
       expect(result).toEqual(mockDiagnostics);
-      expect(mockTransport.sendRequest).toHaveBeenCalledWith('textDocument/diagnostic', {
-        textDocument: { uri: pathToUri(MOCK_TEST_TS) },
-      });
+      expect(mockTransport.sendRequest).toHaveBeenCalledWith(
+        'textDocument/diagnostic',
+        {
+          textDocument: { uri: pathToUri(MOCK_TEST_TS) },
+        },
+        expect.any(Number)
+      );
 
       getServerSpy.mockRestore();
     });

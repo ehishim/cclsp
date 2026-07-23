@@ -65,6 +65,8 @@ export interface ServerState {
     sendChange(filePath: string, text: string): void;
     isOpen(filePath: string): boolean;
     getVersion(filePath: string): number;
+    getSyncSig(filePath: string): string | undefined;
+    setSyncSig(filePath: string, signature: string): void;
   };
   initialized: boolean;
   initializationPromise: Promise<void>;
@@ -72,6 +74,12 @@ export interface ServerState {
   config: LSPServerConfig;
   restartTimer?: NodeJS.Timeout;
   initializationResolve?: () => void;
+  // Workspace-indexing servers (e.g. intelephense) report progress via custom
+  // notifications. Adapters flip these flags so workspace/symbol can wait for a
+  // complete index instead of racing an in-progress one. Undefined for servers
+  // that load lazily per file (tsserver, gopls).
+  indexingStarted?: boolean;
+  indexingComplete?: boolean;
   diagnosticsCache: {
     update(uri: string, items: Diagnostic[], version?: number): void;
     get(uri: string): Diagnostic[] | undefined;
@@ -137,6 +145,14 @@ export interface ServerAdapter {
    * Return undefined to use the default timeout (30000ms).
    */
   getTimeout?(method: string): number | undefined;
+
+  /**
+   * True for servers that build a workspace-wide index asynchronously after
+   * initialization (e.g. intelephense) and signal completion via custom
+   * notifications. workspace/symbol priming waits for `state.indexingComplete`
+   * on these instead of opening seed files to force lazy project loading.
+   */
+  isWorkspaceIndexingServer?(): boolean;
 }
 
 /**

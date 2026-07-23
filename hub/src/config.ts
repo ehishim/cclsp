@@ -21,13 +21,18 @@ function intEnv(name: string, def: number): number {
   return Number.isFinite(n) ? n : def;
 }
 
-
 export const RUNTIME_DIR = runtimeDir();
 export const SOCKET_PATH = process.env.CCLSP_HUB_SOCKET || join(RUNTIME_DIR, 'daemon.sock');
 export const PID_PATH = join(RUNTIME_DIR, 'daemon.pid');
 
 // The built cclsp MCP server entry the daemon spawns (one child per root).
 export const CCLSP_ENTRY = process.env.CCLSP_HUB_ENTRY || '/workspace/cclsp/dist/index.js';
+
+// Runtime used to spawn the cclsp children. Defaults to whatever runtime the
+// daemon itself is running under (process.execPath) — so if the daemon runs
+// under Bun, the children do too. Override with CCLSP_HUB_CHILD_RUNTIME to pin a
+// specific binary (e.g. force `node` for the children while the daemon is Bun).
+export const CHILD_RUNTIME = process.env.CCLSP_HUB_CHILD_RUNTIME || process.execPath;
 
 // cclsp server-config (extensions -> language server). A `rootDir: "."` in this
 // file resolves to each child's cwd (= the registered root), so a single config

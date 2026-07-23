@@ -15,6 +15,10 @@ import type { JsonRpcTransport } from './json-rpc.js';
 export class DocumentManager {
   private readonly openFiles = new Set<string>();
   private readonly fileVersions = new Map<string, number>();
+  // Last on-disk signature (mtime+size) we synced to the server per file. Lets
+  // callers skip a redundant re-open/re-sync when the file is unchanged, which
+  // is the common case for repeated diagnostics/hover calls.
+  private readonly syncSignatures = new Map<string, string>();
 
   constructor(private readonly transport: JsonRpcTransport) {}
 
@@ -81,6 +85,20 @@ export class DocumentManager {
    */
   isOpen(filePath: string): boolean {
     return this.openFiles.has(filePath);
+  }
+
+  /**
+   * Get the last on-disk signature (mtime+size) synced for a file, if any.
+   */
+  getSyncSig(filePath: string): string | undefined {
+    return this.syncSignatures.get(filePath);
+  }
+
+  /**
+   * Record the on-disk signature currently synced to the server for a file.
+   */
+  setSyncSig(filePath: string, signature: string): void {
+    this.syncSignatures.set(filePath, signature);
   }
 
   /**

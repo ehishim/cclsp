@@ -1,5 +1,6 @@
 import type { LSPServerConfig } from '../../types.js';
 import type { ServerAdapter } from '../types.js';
+import { IntelephenseAdapter } from './intelephense.js';
 import { PyrightAdapter } from './pyright.js';
 import { VueLanguageServerAdapter } from './vue.js';
 
@@ -19,6 +20,7 @@ class AdapterRegistry {
     this.adapters = [
       new VueLanguageServerAdapter(),
       new PyrightAdapter(),
+      new IntelephenseAdapter(),
       // Add more built-in adapters here as needed
     ];
   }

@@ -362,27 +362,98 @@ export class LSPClient {
       return;
     }
 
+    // One seed file per sub-project root is enough to make a lazy-loading server
+    // (tsserver, gopls) load that project; workspace/symbol then searches the whole
+    // program. This replaces the old "open up to 500 files" warm-up that caused the
+    // first workspace-symbol call to time out.
     const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
-    if (seedFiles.length === 0) {
-      logger.debug('[workspaceSymbol] No seed file found for server; skipping project priming\n');
+
+    if (seedFiles.length > 0) {
+      await Promise.all(
+        seedFiles.map((seedFile) =>
+          serverState.documentManager.ensureOpen(seedFile).catch((error) => {
+            logger.debug(`[workspaceSymbol] Failed to open seed ${seedFile}: ${error}\n`);
+            return false;
+          })
+        )
+      );
+    }
+
+    await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+
+    this.workspaceSymbolPrimedServers.add(serverState);
+    logger.debug(
+      `[workspaceSymbol] Primed workspace symbols with ${seedFiles.length} seed file(s)\n`
+    );
+  }
+
+  /**
+   * Bounded wait until a server can answer workspace/symbol completely.
+   *
+   * - Workspace-indexing servers (intelephense): wait for the async index to
+   *   finish, signalled by the adapter via serverState.indexingComplete.
+   * - Lazy-loading servers (tsserver, gopls): opening a seed triggers project
+   *   load; a documentSymbol round-trip per seed confirms the project is ready.
+   *
+   * Always capped so priming can never hang.
+   */
+  private async waitForWorkspaceSymbolReady(
+    serverState: ServerState,
+    seedFiles: string[]
+  ): Promise<void> {
+    const BUDGET_MS = 30000;
+    const deadline = Date.now() + BUDGET_MS;
+
+    if (serverState.adapter?.isWorkspaceIndexingServer?.()) {
+      // Give the server a short grace to announce indexing. If it never does, the
+      // workspace is either already indexed or has nothing to index — proceed.
+      const graceDeadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        if (serverState.indexingComplete) {
+          logger.debug('[workspaceSymbol] Workspace index complete\n');
+          return;
+        }
+        if (!serverState.indexingStarted && Date.now() > graceDeadline) {
+          logger.debug('[workspaceSymbol] No indexing signalled within grace; proceeding\n');
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      logger.debug('[workspaceSymbol] Indexing did not finish within budget; proceeding\n');
       return;
     }
 
-    await Promise.all(
-      seedFiles.map((seedFile) => serverState.documentManager.ensureOpen(seedFile))
-    );
-    await Promise.all(
-      seedFiles.map((seedFile) =>
-        serverState.diagnosticsCache.waitForIdle(pathToUri(seedFile), {
-          maxWaitTime: 5000,
-          idleTime: 250,
-          checkInterval: 50,
-        })
-      )
-    );
-    await Promise.all(seedFiles.map((seedFile) => opsGetDocumentSymbols(serverState, seedFile)));
-    this.workspaceSymbolPrimedServers.add(serverState);
-    logger.debug(`[workspaceSymbol] Primed workspace symbols with ${seedFiles.join(', ')}\n`);
+    // Lazy-loading server (tsserver, gopls): opening a seed triggers the project/
+    // package load, but workspace/symbol (navto) only returns results once the whole
+    // project graph is built. The server publishes diagnostics for the seed at that
+    // point — a documentSymbol answer comes back earlier, from the syntactic parse,
+    // so it is NOT a reliable readiness signal. Wait for the seed's diagnostics to
+    // settle instead. A documentSymbol probe first nudges the parse along. All bounded
+    // by the remaining budget so priming can never hang.
+    if (seedFiles.length > 0) {
+      const remaining = () => Math.max(0, deadline - Date.now());
+      await Promise.all(
+        seedFiles.map((seedFile) =>
+          opsGetDocumentSymbols(serverState, seedFile).catch((error) => {
+            logger.debug(
+              `[workspaceSymbol] Seed documentSymbol failed for ${seedFile}: ${error}\n`
+            );
+            return [];
+          })
+        )
+      );
+      await Promise.all(
+        seedFiles.map((seedFile) =>
+          serverState.diagnosticsCache
+            .waitForIdle(pathToUri(seedFile), {
+              maxWaitTime: Math.min(15000, remaining()),
+              idleTime: 300,
+              checkInterval: 50,
+            })
+            .catch(() => undefined)
+        )
+      );
+    }
   }
 
   private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {
@@ -390,27 +461,27 @@ export class LSPClient {
     const extensions = new Set(serverConfig.extensions.map((ext) => ext.toLowerCase()));
     const ignoreFilter = await loadGitignore(rootDir);
     const projectRoots = await this.findWorkspaceSymbolProjectRoots(rootDir, ignoreFilter);
+    // One seed per project root is enough to trigger project loading. Cap the
+    // number of roots so a huge monorepo can't blow up priming.
+    const MAX_SEED_ROOTS = 25;
+    const roots = projectRoots.length > 0 ? projectRoots : [rootDir];
     const seedFiles: string[] = [];
-    const maxFiles = 500;
 
-    for (const projectRoot of projectRoots) {
+    for (const projectRoot of roots) {
+      if (seedFiles.length >= MAX_SEED_ROOTS) break;
       const projectFiles = await this.findWorkspaceSymbolProjectFiles(
         rootDir,
         projectRoot,
         extensions,
         ignoreFilter
       );
-      seedFiles.push(...projectFiles.slice(0, maxFiles - seedFiles.length));
-      if (seedFiles.length >= maxFiles) break;
+      const seed = projectFiles[0];
+      if (seed && !seedFiles.includes(seed)) {
+        seedFiles.push(seed);
+      }
     }
 
-    if (seedFiles.length > 0) {
-      return seedFiles;
-    }
-
-    return (
-      await this.findWorkspaceSymbolProjectFiles(rootDir, rootDir, extensions, ignoreFilter)
-    ).slice(0, maxFiles);
+    return seedFiles;
   }
 
   private async findWorkspaceSymbolProjectRoots(
@@ -419,6 +490,16 @@ export class LSPClient {
   ): Promise<string[]> {
     const roots = new Set<string>();
     const maxDepth = 5;
+    // Markers that identify a language-project root. Generalized beyond TS so
+    // PHP (composer.json), Go (go.mod), and Python (pyproject.toml) monorepos
+    // each get a seed per sub-project.
+    const PROJECT_MARKERS = [
+      'tsconfig.json',
+      'jsconfig.json',
+      'composer.json',
+      'go.mod',
+      'pyproject.toml',
+    ];
 
     const scan = async (
       currentPath: string,
@@ -435,7 +516,7 @@ export class LSPClient {
         return;
       }
 
-      if (entries.includes('tsconfig.json')) {
+      if (PROJECT_MARKERS.some((marker) => entries.includes(marker))) {
         roots.add(currentPath);
       }
 
