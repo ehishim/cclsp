@@ -187,6 +187,40 @@ export function findSymbolPositionInFile(filePath: string, symbol: SymbolInforma
 
 // --- LSP Operations ---
 
+/**
+ * Ensure the server's view of a file matches disk before a position-based request
+ * (definition, references, rename, hover, implementation, call hierarchy,
+ * documentSymbol). Opens the file if needed; if it is already open but changed on
+ * disk since we last synced it (mtime+size), pushes the new content and drops stale
+ * diagnostics. Cheap by design: unchanged files cost only a stat — no didChange, no
+ * re-analysis — so warm repeated calls stay fast while external edits are picked up.
+ *
+ * Returns whether the file was opened for the first time; callers may briefly wait
+ * for the server to index a freshly opened file.
+ */
+async function ensureFreshDocument(
+  serverState: ServerState,
+  filePath: string
+): Promise<{ justOpened: boolean }> {
+  const dm = serverState.documentManager;
+  const sig = fileSignature(filePath);
+
+  if (dm.isOpen(filePath)) {
+    if (dm.getSyncSig(filePath) !== sig) {
+      logger.debug(`[DEBUG ensureFreshDocument] ${filePath} changed on disk, re-syncing\n`);
+      const content = readFileSync(filePath, 'utf-8');
+      dm.sendChange(filePath, content);
+      dm.setSyncSig(filePath, sig);
+      serverState.diagnosticsCache.delete(pathToUri(filePath));
+    }
+    return { justOpened: false };
+  }
+
+  const justOpened = await dm.ensureOpen(filePath);
+  dm.setSyncSig(filePath, sig);
+  return { justOpened };
+}
+
 export async function findDefinition(
   serverState: ServerState,
   filePath: string,
@@ -198,8 +232,8 @@ export async function findDefinition(
 
   await serverState.initializationPromise;
 
-  const wasJustOpened = await serverState.documentManager.ensureOpen(filePath);
-  if (wasJustOpened) {
+  const { justOpened } = await ensureFreshDocument(serverState, filePath);
+  if (justOpened) {
     logger.debug(
       '[DEBUG findDefinition] File was just opened, waiting for server to index project...\n'
     );
@@ -258,8 +292,8 @@ export async function findReferences(
 
   await serverState.initializationPromise;
 
-  const wasJustOpened = await serverState.documentManager.ensureOpen(filePath);
-  if (wasJustOpened) {
+  const { justOpened } = await ensureFreshDocument(serverState, filePath);
+  if (justOpened) {
     logger.debug(
       '[DEBUG findReferences] File was just opened, waiting for server to index project...\n'
     );
@@ -314,8 +348,8 @@ export async function renameSymbol(
 
   await serverState.initializationPromise;
 
-  const wasJustOpened = await serverState.documentManager.ensureOpen(filePath);
-  if (wasJustOpened) {
+  const { justOpened } = await ensureFreshDocument(serverState, filePath);
+  if (justOpened) {
     logger.debug(
       '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
     );
@@ -400,7 +434,7 @@ export async function getDocumentSymbols(
   logger.debug(`[DEBUG] Requesting documentSymbol for: ${filePath}\n`);
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
+  await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/documentSymbol';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -805,7 +839,7 @@ export async function hover(
   );
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
+  await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/hover';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -857,7 +891,7 @@ export async function findImplementation(
   );
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
+  await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/implementation';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -894,7 +928,7 @@ export async function prepareCallHierarchy(
   );
 
   await serverState.initializationPromise;
-  await serverState.documentManager.ensureOpen(filePath);
+  await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/prepareCallHierarchy';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;

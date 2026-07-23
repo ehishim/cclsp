@@ -331,21 +331,25 @@ export class LSPClient {
       }
     }
 
-    const results: SymbolInformation[] = [];
+    // Query every language server concurrently: priming + the workspace/symbol call
+    // for each server run in parallel, so a multi-language workspace (e.g. TS + PHP)
+    // isn't gated by the slowest server one-at-a-time.
     const errors: unknown[] = [];
+    const perServer = await Promise.all(
+      servers.map(async (serverState) => {
+        if (!serverState) return [] as SymbolInformation[];
+        try {
+          await this.primeWorkspaceSymbolProject(serverState);
+          return await opsWorkspaceSymbol(serverState, query);
+        } catch (error) {
+          errors.push(error);
+          logger.debug(`[workspaceSymbol] Server failed for query "${query}": ${error}\n`);
+          return [] as SymbolInformation[];
+        }
+      })
+    );
 
-    for (const serverState of servers) {
-      if (!serverState) continue;
-
-      try {
-        await this.primeWorkspaceSymbolProject(serverState);
-        results.push(...(await opsWorkspaceSymbol(serverState, query)));
-      } catch (error) {
-        errors.push(error);
-        logger.debug(`[workspaceSymbol] Server failed for query "${query}": ${error}\n`);
-      }
-    }
-
+    const results = perServer.flat();
     if (results.length > 0) {
       return results;
     }
