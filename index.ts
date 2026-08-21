@@ -6,6 +6,7 @@ import { logger } from './src/logger.js';
 import { LSPClient } from './src/lsp-client.js';
 import { diagnosticsTools } from './src/tools/diagnostics.js';
 import { hoverTools } from './src/tools/hover.js';
+import { languageFeatureTools } from './src/tools/language-features.js';
 import { navigationTools } from './src/tools/navigation.js';
 import { refactoringTools } from './src/tools/refactoring.js';
 import { registerTools } from './src/tools/registry.js';
@@ -52,6 +53,7 @@ const allTools = [
   ...refactoringTools,
   ...diagnosticsTools,
   ...hoverTools,
+  ...languageFeatureTools,
   ...symbolTools,
   ...serverTools,
 ];

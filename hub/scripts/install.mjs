@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Install (or remove) a `cclsp-hub` wrapper on PATH that points at this package's
-// built entry. Target dir: $CCLSP_HUB_BIN_DIR, else ~/.local/bin.
+// Install (or remove) a `cclsp-hub` wrapper on PATH that pins the matching hub
+// and core builds. Target dir: $CCLSP_HUB_BIN_DIR, else ~/.local/bin.
 //   node scripts/install.mjs            # install
 //   node scripts/install.mjs --uninstall
 
@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const entry = resolve(here, '..', 'dist', 'index.js');
+const coreEntry = resolve(here, '..', '..', 'dist', 'index.js');
 const binDir = process.env.CCLSP_HUB_BIN_DIR || join(homedir(), '.local', 'bin');
 const target = join(binDir, 'cclsp-hub');
 
@@ -34,6 +35,10 @@ function resolveRuntime() {
 }
 const runtime = resolveRuntime();
 
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
 if (process.argv.includes('--uninstall')) {
   if (existsSync(target)) {
     rmSync(target);
@@ -44,16 +49,22 @@ if (process.argv.includes('--uninstall')) {
   process.exit(0);
 }
 
-if (!existsSync(entry)) {
-  console.error(`build output missing: ${entry}\n  run: bun run build`);
+if (!existsSync(entry) || !existsSync(coreEntry)) {
+  console.error(
+    `build output missing:\n  hub: ${entry}\n  core: ${coreEntry}\n  run: bun run setup`
+  );
   process.exit(1);
 }
 
 mkdirSync(binDir, { recursive: true });
 const wrapper = [
   '#!/bin/sh',
-  `RUNTIME="\${CCLSP_HUB_RUNTIME:-${runtime}}"`,
-  `exec "$RUNTIME" "${entry}" "$@"`,
+  'RUNTIME="${CCLSP_HUB_RUNTIME:-}"',
+  `[ -n "$RUNTIME" ] || RUNTIME=${shellQuote(runtime)}`,
+  'CCLSP_HUB_ENTRY="${CCLSP_HUB_ENTRY:-}"',
+  `[ -n "$CCLSP_HUB_ENTRY" ] || CCLSP_HUB_ENTRY=${shellQuote(coreEntry)}`,
+  'export CCLSP_HUB_ENTRY',
+  `exec "$RUNTIME" ${shellQuote(entry)} "$@"`,
   '',
 ].join('\n');
 writeFileSync(target, wrapper);

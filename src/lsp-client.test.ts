@@ -63,6 +63,21 @@ const MOCK_IMPL2_TS = join(tmpdir(), 'impl2.ts');
 const MOCK_CALLER1_TS = join(tmpdir(), 'caller1.ts');
 const MOCK_CALLEE1_TS = join(tmpdir(), 'callee1.ts');
 
+const MOCK_SERVER_CAPABILITIES = {
+  definitionProvider: true,
+  referencesProvider: true,
+  renameProvider: { prepareProvider: true },
+  documentSymbolProvider: true,
+  hoverProvider: true,
+  workspaceSymbolProvider: true,
+  implementationProvider: true,
+  callHierarchyProvider: true,
+  completionProvider: {},
+  signatureHelpProvider: {},
+  codeActionProvider: true,
+  diagnosticProvider: true,
+};
+
 describe('LSPClient', () => {
   beforeEach(async () => {
     // Ensure CCLSP_CONFIG_PATH is truly unset to avoid cross-test contamination.
@@ -236,6 +251,7 @@ describe('LSPClient', () => {
 
       // Mock getServer to return a server state with our controlled promise
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: initPromise,
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -283,6 +299,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: initPromise,
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -313,8 +330,8 @@ describe('LSPClient', () => {
       const results = await Promise.all(promises);
       expect(results).toHaveLength(3);
 
-      // Each method should have been called once
-      expect(mockTransport.sendRequest).toHaveBeenCalledTimes(3);
+      // Definition and references send one request each; rename prepares before mutating.
+      expect(mockTransport.sendRequest).toHaveBeenCalledTimes(4);
 
       getServerSpy.mockRestore();
     });
@@ -353,6 +370,7 @@ describe('LSPClient', () => {
       ];
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         transport: createMockTransport(),
         initialized: true,
@@ -425,6 +443,7 @@ describe('LSPClient', () => {
       ];
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         transport: createMockTransport(),
         initialized: true,
@@ -482,6 +501,7 @@ describe('LSPClient', () => {
       ];
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         transport: createMockTransport(),
         initialized: true,
@@ -525,6 +545,7 @@ describe('LSPClient', () => {
       ];
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         transport: createMockTransport(),
         initialized: true,
@@ -891,6 +912,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -929,6 +951,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -964,6 +987,7 @@ describe('LSPClient', () => {
       ];
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         initialized: true,
@@ -1007,6 +1031,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: {},
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1028,9 +1053,7 @@ describe('LSPClient', () => {
         const result = await client.getDiagnostics(MOCK_TEST_TS);
 
         expect(result).toEqual([]);
-        expect(stderrSpy).toHaveBeenCalledWith(
-          expect.stringContaining('textDocument/diagnostic not supported or failed')
-        );
+        expect(mockTransport.sendRequest).not.toHaveBeenCalled();
       } finally {
         if (savedLogLevel !== undefined) {
           process.env.CCLSP_LOG_LEVEL = savedLogLevel;
@@ -1050,6 +1073,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1088,6 +1112,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1127,6 +1152,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1188,6 +1214,7 @@ describe('LSPClient', () => {
       await writeFile(seedPath, 'export const seed = true;');
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1240,6 +1267,7 @@ describe('LSPClient', () => {
       await writeFile(seedPath, 'export const seed = true;');
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1289,6 +1317,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1336,6 +1365,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1367,6 +1397,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1416,6 +1447,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1455,6 +1487,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1526,6 +1559,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1573,6 +1607,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1641,6 +1676,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,
@@ -1688,6 +1724,7 @@ describe('LSPClient', () => {
       });
 
       const mockServerState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: mockTransport,

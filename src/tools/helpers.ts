@@ -1,4 +1,5 @@
 import { resolve } from 'node:path';
+import { LspToolOutcomeError } from '../lsp/capabilities.js';
 import type { Location } from '../lsp/types.js';
 import { uriToPath } from '../utils.js';
 import type { ToolResult } from './registry.js';
@@ -25,4 +26,8 @@ export function textResult(text: string): ToolResult {
 
 export function withWarning(warning: string | undefined, text: string): string {
   return warning ? `${warning}\n\n${text}` : text;
+}
+
+export function rethrowToolOutcome(error: unknown): void {
+  if (error instanceof LspToolOutcomeError) throw error;
 }

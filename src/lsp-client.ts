@@ -7,22 +7,34 @@ import { logger } from './logger.js';
 import { loadConfig } from './lsp/config.js';
 import {
   getValidSymbolKinds,
+  didRenameFiles as opsDidRenameFiles,
   findDefinition as opsFindDefinition,
   findImplementation as opsFindImplementation,
   findReferences as opsFindReferences,
   findSymbolsByName as opsFindSymbolsByName,
+  getCodeActions as opsGetCodeActions,
+  getCompletions as opsGetCompletions,
   getDiagnostics as opsGetDiagnostics,
   getDiagnosticsBatch as opsGetDiagnosticsBatch,
   getDocumentSymbols as opsGetDocumentSymbols,
+  getSignatureHelp as opsGetSignatureHelp,
   hover as opsHover,
   incomingCalls as opsIncomingCalls,
   outgoingCalls as opsOutgoingCalls,
   prepareCallHierarchy as opsPrepareCallHierarchy,
   renameSymbol as opsRenameSymbol,
+  resolveCodeAction as opsResolveCodeAction,
+  willRenameFiles as opsWillRenameFiles,
   workspaceSymbol as opsWorkspaceSymbol,
   symbolKindToString,
 } from './lsp/operations.js';
-import type { BatchDiagnosticResult } from './lsp/operations.js';
+import type {
+  BatchDiagnosticResult,
+  CodeActionResult,
+  CompletionResult,
+  SignatureHelpResult,
+  WorkspaceEditResult,
+} from './lsp/operations.js';
 import { ServerManager } from './lsp/server-manager.js';
 import type {
   CallHierarchyIncomingCall,
@@ -30,6 +42,7 @@ import type {
   CallHierarchyOutgoingCall,
   Config,
   Diagnostic,
+  DocumentSymbol,
   LSPServerConfig,
   Location,
   Position,
@@ -273,6 +286,52 @@ export class LSPClient {
   ): Promise<{ matches: SymbolMatch[]; warning?: string }> {
     const serverState = await this.getServer(filePath);
     return opsFindSymbolsByName(serverState, filePath, symbolName, symbolKind);
+  }
+
+  async getDocumentSymbols(filePath: string): Promise<DocumentSymbol[] | SymbolInformation[]> {
+    const serverState = await this.getServer(filePath);
+    return opsGetDocumentSymbols(serverState, filePath);
+  }
+
+  async getCompletions(
+    filePath: string,
+    position: Position,
+    triggerCharacter?: string
+  ): Promise<CompletionResult> {
+    const serverState = await this.getServer(filePath);
+    return opsGetCompletions(serverState, filePath, position, triggerCharacter);
+  }
+
+  async getSignatureHelp(
+    filePath: string,
+    position: Position,
+    triggerCharacter?: string
+  ): Promise<SignatureHelpResult | null> {
+    const serverState = await this.getServer(filePath);
+    return opsGetSignatureHelp(serverState, filePath, position, triggerCharacter);
+  }
+
+  async getCodeActions(
+    filePath: string,
+    range: { start: Position; end: Position }
+  ): Promise<CodeActionResult[]> {
+    const serverState = await this.getServer(filePath);
+    return opsGetCodeActions(serverState, filePath, range);
+  }
+
+  async resolveCodeAction(filePath: string, action: CodeActionResult): Promise<CodeActionResult> {
+    const serverState = await this.getServer(filePath);
+    return opsResolveCodeAction(serverState, action);
+  }
+
+  async willRenameFiles(oldPath: string, newPath: string): Promise<WorkspaceEditResult> {
+    const serverState = await this.getServer(oldPath);
+    return opsWillRenameFiles(serverState, oldPath, newPath);
+  }
+
+  async didRenameFiles(oldPath: string, newPath: string): Promise<void> {
+    const serverState = await this.getServer(oldPath);
+    return opsDidRenameFiles(serverState, oldPath, newPath);
   }
 
   async getDiagnostics(filePath: string): Promise<Diagnostic[]> {

@@ -2,6 +2,13 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import { pathToUri, uriToPath } from '../utils.js';
+import {
+  rejectRename,
+  requireFileRenameSupport,
+  requireMethodSupport,
+  requirePrepareRenameSupport,
+  supportsMethod,
+} from './capabilities.js';
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -233,6 +240,7 @@ export async function findDefinition(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/definition');
 
   const { justOpened } = await ensureFreshDocument(serverState, filePath);
   if (justOpened) {
@@ -293,6 +301,7 @@ export async function findReferences(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/references');
 
   const { justOpened } = await ensureFreshDocument(serverState, filePath);
   if (justOpened) {
@@ -349,6 +358,8 @@ export async function renameSymbol(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/rename');
+  requirePrepareRenameSupport(serverState);
 
   const { justOpened } = await ensureFreshDocument(serverState, filePath);
   if (justOpened) {
@@ -356,6 +367,25 @@ export async function renameSymbol(
       '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
     );
     await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  const prepareMethod = 'textDocument/prepareRename';
+  const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
+  let prepared: unknown;
+  try {
+    prepared = await serverState.transport.sendRequest(
+      prepareMethod,
+      {
+        textDocument: { uri: pathToUri(filePath) },
+        position,
+      },
+      prepareTimeout
+    );
+  } catch (error) {
+    rejectRename(serverState, error instanceof Error ? error.message : String(error));
+  }
+  if (!prepared) {
+    rejectRename(serverState, 'the language server declined this position');
   }
 
   logger.debug('[DEBUG renameSymbol] Sending textDocument/rename request\n');
@@ -429,6 +459,208 @@ export async function renameSymbol(
   return {};
 }
 
+export interface CompletionItemResult {
+  label: string;
+  kind?: number;
+  detail?: string;
+  documentation?: string | { kind?: string; value: string };
+  insertText?: string;
+}
+
+export interface CompletionResult {
+  items: CompletionItemResult[];
+  isIncomplete: boolean;
+}
+
+export async function getCompletions(
+  serverState: ServerState,
+  filePath: string,
+  position: Position,
+  triggerCharacter?: string
+): Promise<CompletionResult> {
+  await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/completion');
+  await ensureFreshDocument(serverState, filePath);
+  const method = 'textDocument/completion';
+  const result = await serverState.transport.sendRequest(
+    method,
+    {
+      textDocument: { uri: pathToUri(filePath) },
+      position,
+      ...(triggerCharacter
+        ? { context: { triggerKind: 2, triggerCharacter } }
+        : { context: { triggerKind: 1 } }),
+    },
+    serverState.adapter?.getTimeout?.(method) ?? 30000
+  );
+  if (Array.isArray(result)) {
+    return { items: result as CompletionItemResult[], isIncomplete: false };
+  }
+  if (
+    result &&
+    typeof result === 'object' &&
+    Array.isArray((result as { items?: unknown }).items)
+  ) {
+    const list = result as { items: CompletionItemResult[]; isIncomplete?: boolean };
+    return { items: list.items, isIncomplete: list.isIncomplete === true };
+  }
+  return { items: [], isIncomplete: false };
+}
+
+export interface SignatureHelpResult {
+  signatures: Array<{
+    label: string;
+    documentation?: string | { kind?: string; value: string };
+    parameters?: Array<{
+      label: string | [number, number];
+      documentation?: string | { value: string };
+    }>;
+    activeParameter?: number;
+  }>;
+  activeSignature?: number;
+  activeParameter?: number;
+}
+
+export async function getSignatureHelp(
+  serverState: ServerState,
+  filePath: string,
+  position: Position,
+  triggerCharacter?: string
+): Promise<SignatureHelpResult | null> {
+  await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/signatureHelp');
+  await ensureFreshDocument(serverState, filePath);
+  const method = 'textDocument/signatureHelp';
+  const result = await serverState.transport.sendRequest(
+    method,
+    {
+      textDocument: { uri: pathToUri(filePath) },
+      position,
+      ...(triggerCharacter
+        ? { context: { triggerKind: 2, triggerCharacter, isRetrigger: false } }
+        : {}),
+    },
+    serverState.adapter?.getTimeout?.(method) ?? 30000
+  );
+  if (
+    result &&
+    typeof result === 'object' &&
+    Array.isArray((result as SignatureHelpResult).signatures)
+  ) {
+    return result as SignatureHelpResult;
+  }
+  return null;
+}
+
+export interface TextDocumentEditResult {
+  textDocument: { uri: string; version?: number | null };
+  edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
+}
+
+export interface WorkspaceEditResult {
+  changes?: Record<string, Array<{ range: { start: Position; end: Position }; newText: string }>>;
+  documentChanges?: unknown[];
+}
+
+export interface CodeActionResult {
+  title: string;
+  kind?: string;
+  isPreferred?: boolean;
+  disabled?: { reason: string };
+  edit?: WorkspaceEditResult;
+  command?: { title: string; command: string; arguments?: unknown[] };
+  data?: unknown;
+}
+
+export async function getCodeActions(
+  serverState: ServerState,
+  filePath: string,
+  range: { start: Position; end: Position }
+): Promise<CodeActionResult[]> {
+  await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/codeAction');
+  await ensureFreshDocument(serverState, filePath);
+  const method = 'textDocument/codeAction';
+  const result = await serverState.transport.sendRequest(
+    method,
+    {
+      textDocument: { uri: pathToUri(filePath) },
+      range,
+      context: { diagnostics: [] },
+    },
+    serverState.adapter?.getTimeout?.(method) ?? 30000
+  );
+  return Array.isArray(result) ? (result as CodeActionResult[]) : [];
+}
+
+export async function resolveCodeAction(
+  serverState: ServerState,
+  action: CodeActionResult
+): Promise<CodeActionResult> {
+  if (action.edit || action.disabled) return action;
+  if (!supportsMethod(serverState, 'codeAction/resolve')) return action;
+  const method = 'codeAction/resolve';
+  const result = await serverState.transport.sendRequest(
+    method,
+    action,
+    serverState.adapter?.getTimeout?.(method) ?? 30000
+  );
+  return result && typeof result === 'object' ? (result as CodeActionResult) : action;
+}
+
+export async function willRenameFiles(
+  serverState: ServerState,
+  oldPath: string,
+  newPath: string
+): Promise<WorkspaceEditResult> {
+  await serverState.initializationPromise;
+  requireFileRenameSupport(serverState, 'workspace/willRenameFiles', oldPath);
+  requireFileRenameSupport(serverState, 'workspace/didRenameFiles', newPath);
+  const method = 'workspace/willRenameFiles';
+  const result = await serverState.transport.sendRequest(
+    method,
+    { files: [{ oldUri: pathToUri(oldPath), newUri: pathToUri(newPath) }] },
+    serverState.adapter?.getTimeout?.(method) ?? 30000
+  );
+  if (!result || typeof result !== 'object') return {};
+  if ('changes' in result) return result as WorkspaceEditResult;
+  if ('documentChanges' in result) {
+    const changes: NonNullable<WorkspaceEditResult['changes']> = {};
+    const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
+    for (const change of documentChanges ?? []) {
+      if (
+        !change ||
+        typeof change !== 'object' ||
+        !('textDocument' in change) ||
+        !('edits' in change)
+      ) {
+        continue;
+      }
+      const textChange = change as {
+        textDocument: { uri: string };
+        edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
+      };
+      changes[textChange.textDocument.uri] = [
+        ...(changes[textChange.textDocument.uri] ?? []),
+        ...textChange.edits,
+      ];
+    }
+    return { changes };
+  }
+  return {};
+}
+
+export async function didRenameFiles(
+  serverState: ServerState,
+  oldPath: string,
+  newPath: string
+): Promise<void> {
+  requireFileRenameSupport(serverState, 'workspace/didRenameFiles', newPath);
+  serverState.transport.sendNotification('workspace/didRenameFiles', {
+    files: [{ oldUri: pathToUri(oldPath), newUri: pathToUri(newPath) }],
+  });
+}
+
 export async function getDocumentSymbols(
   serverState: ServerState,
   filePath: string
@@ -436,6 +668,7 @@ export async function getDocumentSymbols(
   logger.debug(`[DEBUG] Requesting documentSymbol for: ${filePath}\n`);
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/documentSymbol');
   await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/documentSymbol';
@@ -632,6 +865,9 @@ async function pullDiagnostics(
   fileUri: string,
   timeout: number
 ): Promise<Diagnostic[] | null> {
+  if (!supportsMethod(serverState, 'textDocument/diagnostic')) {
+    return null;
+  }
   try {
     const result = await serverState.transport.sendRequest(
       'textDocument/diagnostic',
@@ -844,6 +1080,7 @@ export async function hover(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/hover');
   await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/hover';
@@ -874,6 +1111,7 @@ export async function workspaceSymbol(
   logger.debug(`[DEBUG workspaceSymbol] Searching for "${query}"\n`);
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'workspace/symbol');
 
   const method = 'workspace/symbol';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -896,6 +1134,7 @@ export async function findImplementation(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/implementation');
   await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/implementation';
@@ -933,6 +1172,7 @@ export async function prepareCallHierarchy(
   );
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/prepareCallHierarchy');
   await ensureFreshDocument(serverState, filePath);
 
   const method = 'textDocument/prepareCallHierarchy';
@@ -960,6 +1200,7 @@ export async function incomingCalls(
   logger.debug(`[DEBUG incomingCalls] Requesting incoming calls for ${item.name}\n`);
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'callHierarchy/incomingCalls');
 
   const method = 'callHierarchy/incomingCalls';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -979,6 +1220,7 @@ export async function outgoingCalls(
   logger.debug(`[DEBUG outgoingCalls] Requesting outgoing calls for ${item.name}\n`);
 
   await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'callHierarchy/outgoingCalls');
 
   const method = 'callHierarchy/outgoingCalls';
   const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;

@@ -58,8 +58,12 @@ cd hub
 bun run setup          # build + install the `cclsp-hub` wrapper on PATH
 ```
 
-`setup` builds `dist/` and installs a wrapper to `~/.local/bin/cclsp-hub` (override
-the dir with `CCLSP_HUB_BIN_DIR`). The pieces are also available separately:
+`setup` builds both core `../dist/index.js` and hub `dist/index.js`, then installs a
+wrapper to `~/.local/bin/cclsp-hub` (override the directory with
+`CCLSP_HUB_BIN_DIR`). The wrapper defaults `CCLSP_HUB_ENTRY` to the sibling core
+build from the same checkout, so a hub install cannot silently keep spawning an
+older core; an explicit runtime `CCLSP_HUB_ENTRY` still overrides it. The pieces
+are also available separately:
 
 ```bash
 bun run build          # → hub/dist/index.js
@@ -109,10 +113,15 @@ root that owns `--file`. Line/character are **1-indexed**.
 | `find_references` | `references` | `--file --symbol-name` | `--symbol-kind --include-declaration` |
 | `find_implementation` | `implementation` | `--file --line --character` | |
 | `get_hover` | `hover` | `--file --line --character` | |
+| `get_document_symbols` | `document-symbols` | `--file` | |
+| `get_completions` | `completions` | `--file --line --character` | `--trigger-character --limit` |
+| `get_signature_help` | `signatures` | `--file --line --character` | `--trigger-character` |
+| `get_code_actions` | `code-actions` | `--file --start-line --start-character --end-line --end-character` | `--title --apply` |
 | `get_diagnostics` | `diagnostics` | `--file` | |
 | `get_diagnostics_batch` | `diagnostics-batch` | `--path` | `--pattern --max-files` |
 | `rename_symbol` | `rename` | `--file --symbol-name --new-name` | `--symbol-kind --dry-run` |
 | `rename_symbol_strict` | `rename-strict` | `--file --line --character --new-name` | `--dry-run` |
+| `rename_file` | `rename-file` | `--old-path --new-path` | `--dry-run=false` to apply |
 | `find_workspace_symbols` | `symbols` | `--query --root` | |
 | `prepare_call_hierarchy` | `call-hierarchy` | `--file --line --character` | |
 | `get_incoming_calls` | `incoming-calls` | `--file --line --character` | |
@@ -141,7 +150,9 @@ Flag notes:
 ## Routing model (explicit-only)
 
 A code-intelligence call only runs against a root you have **already registered**
-with `ensure-root`. If a file isn't under any active root, the call fails with a
+with `ensure-root`. Registration starts language-server indexing in the background;
+confirm a known symbol resolves before treating an empty result as evidence of
+absence. If a file isn't under any active root, the call fails with a
 message telling you which root to add — nothing is auto-spawned:
 
 ```
@@ -166,8 +177,14 @@ governs the subdir). Use `--isolate` when a nested package needs its own instanc
 ## Output
 
 - Default: cclsp's human-readable text.
-- `--json`: the full MCP `CallToolResult` (`content`, `isError`, …). A tool error
-  prints to stderr and exits non-zero.
+- `--json`: the full MCP `CallToolResult` (`content`, `structuredContent`,
+  `isError`, …). A tool error prints to stderr and exits non-zero.
+- A capability-backed method the selected language server does not declare returns
+  `structuredContent.outcome = "unsupported"`, code
+  `LSP_METHOD_UNSUPPORTED`, plus `method` and `server`. This is different from a
+  supported empty result, which remains exit 0.
+- Rename validation failures return `outcome = "rejected"` and preserve the
+  language server's reason; no rename request or file edit follows a rejection.
 
 ## Configuration
 

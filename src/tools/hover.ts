@@ -1,4 +1,4 @@
-import { resolvePath, textResult } from './helpers.js';
+import { resolvePath, rethrowToolOutcome, textResult } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
 
 export const getHoverTool: ToolDefinition = {
@@ -52,6 +52,7 @@ export const getHoverTool: ToolDefinition = {
 
       return textResult(`Hover information at ${file_path}:${line}:${character}:\n\n${hoverText}`);
     } catch (error) {
+      rethrowToolOutcome(error);
       return textResult(
         `Error getting hover info: ${error instanceof Error ? error.message : String(error)}`
       );

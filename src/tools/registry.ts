@@ -1,6 +1,7 @@
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { LSPClient } from '../lsp-client.js';
+import { LspToolOutcomeError } from '../lsp/capabilities.js';
 
 export interface ToolDefinition {
   name: string;
@@ -12,6 +13,7 @@ export interface ToolDefinition {
 export type ToolResult = {
   content: Array<{ type: 'text'; text: string }>;
   isError?: boolean;
+  structuredContent?: Record<string, unknown>;
 };
 
 export function registerTools(server: Server, tools: ToolDefinition[], client: LSPClient): void {
@@ -37,6 +39,13 @@ export function registerTools(server: Server, tools: ToolDefinition[], client: L
       }
       return await tool.handler(args as Record<string, unknown>, client);
     } catch (error) {
+      if (error instanceof LspToolOutcomeError) {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${error.message}` }],
+          structuredContent: error.outcome,
+          isError: true,
+        };
+      }
       return {
         content: [
           {

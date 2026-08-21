@@ -1,6 +1,7 @@
+import { existsSync, renameSync } from 'node:fs';
 import { applyWorkspaceEdit } from '../file-editor.js';
-import { uriToPath } from '../utils.js';
-import { resolvePath, textResult, withWarning } from './helpers.js';
+import { pathToUri, uriToPath } from '../utils.js';
+import { resolvePath, rethrowToolOutcome, textResult, withWarning } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
 
 export const renameSymbolTool: ToolDefinition = {
@@ -128,6 +129,7 @@ export const renameSymbolTool: ToolDefinition = {
         )
       );
     } catch (error) {
+      rethrowToolOutcome(error);
       return textResult(
         `Error renaming symbol: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -222,6 +224,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
         `No rename edits available at line ${line}, character ${character}. Please verify the symbol location and ensure the language server is properly configured.`
       );
     } catch (error) {
+      rethrowToolOutcome(error);
       return textResult(
         `Error renaming symbol: ${error instanceof Error ? error.message : String(error)}`
       );
@@ -229,4 +232,108 @@ export const renameSymbolStrictTool: ToolDefinition = {
   },
 };
 
-export const refactoringTools: ToolDefinition[] = [renameSymbolTool, renameSymbolStrictTool];
+export const renameFileTool: ToolDefinition = {
+  name: 'rename_file',
+  description:
+    'Rename a file with language-server willRenameFiles import edits, then notify didRenameFiles. Defaults to dry-run.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      old_path: { type: 'string', description: 'Existing file path' },
+      new_path: { type: 'string', description: 'Destination file path' },
+      dry_run: { type: 'boolean', description: 'Preview only (default true)' },
+    },
+    required: ['old_path', 'new_path'],
+  },
+  handler: async (args, client) => {
+    const {
+      old_path,
+      new_path,
+      dry_run = true,
+    } = args as {
+      old_path: string;
+      new_path: string;
+      dry_run?: boolean;
+    };
+    const oldPath = resolvePath(old_path);
+    const newPath = resolvePath(new_path);
+    if (!existsSync(oldPath)) return textResult(`File does not exist: ${oldPath}`);
+    if (existsSync(newPath)) return textResult(`Destination already exists: ${newPath}`);
+    try {
+      const edit = await client.willRenameFiles(oldPath, newPath);
+      const oldUri = pathToUri(oldPath);
+      const newUri = pathToUri(newPath);
+      const normalizedChanges = { ...(edit.changes ?? {}) };
+      if (normalizedChanges[oldUri]) {
+        normalizedChanges[newUri] = [
+          ...(normalizedChanges[newUri] ?? []),
+          ...normalizedChanges[oldUri],
+        ];
+        delete normalizedChanges[oldUri];
+      }
+      const normalizedEdit = { changes: normalizedChanges };
+      if (dry_run) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `[DRY RUN] Would rename ${oldPath} to ${newPath} and apply:\n${JSON.stringify(normalizedChanges, null, 2)}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            applied: false,
+            oldPath,
+            newPath,
+            edit: normalizedEdit,
+          },
+        };
+      }
+      renameSync(oldPath, newPath);
+      const applied = await applyWorkspaceEdit(normalizedEdit, { lspClient: client });
+      if (!applied.success) {
+        renameSync(newPath, oldPath);
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Failed to update imports; file rename rolled back: ${applied.error}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'rejected',
+            code: 'LSP_ACTION_NOT_APPLICABLE',
+            method: 'workspace/willRenameFiles',
+            reason: applied.error ?? 'failed to apply import edits',
+          },
+          isError: true,
+        };
+      }
+      await client.didRenameFiles(oldPath, newPath);
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Renamed ${oldPath} to ${newPath}${applied.filesModified.length > 0 ? ` and updated:\n${applied.filesModified.join('\n')}` : ''}`,
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          applied: true,
+          oldPath,
+          newPath,
+          filesModified: applied.filesModified,
+        },
+      };
+    } catch (error) {
+      rethrowToolOutcome(error);
+      throw error;
+    }
+  },
+};
+
+export const refactoringTools: ToolDefinition[] = [
+  renameSymbolTool,
+  renameSymbolStrictTool,
+  renameFileTool,
+];

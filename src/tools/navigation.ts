@@ -1,6 +1,12 @@
 import { logger } from '../logger.js';
 import type { LSPClient } from '../lsp-client.js';
-import { formatLocations, resolvePath, textResult, withWarning } from './helpers.js';
+import {
+  formatLocations,
+  resolvePath,
+  rethrowToolOutcome,
+  textResult,
+  withWarning,
+} from './helpers.js';
 import type { ToolDefinition } from './registry.js';
 
 export const findDefinitionTool: ToolDefinition = {
@@ -66,6 +72,7 @@ export const findDefinitionTool: ToolDefinition = {
           );
         }
       } catch (error) {
+        rethrowToolOutcome(error);
         logger.error(`[find_definition] Error processing match: ${error}\n`);
       }
     }
@@ -151,7 +158,8 @@ export const findReferencesTool: ToolDefinition = {
             `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${file_path}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
           );
         }
-      } catch (_error) {
+      } catch (error) {
+        rethrowToolOutcome(error);
         // Continue trying other symbols if one fails
       }
     }
@@ -213,6 +221,7 @@ export const findImplementationTool: ToolDefinition = {
 
       return textResult(`Found ${locations.length} implementation(s):\n\n${locationList}`);
     } catch (error) {
+      rethrowToolOutcome(error);
       return textResult(
         `Error finding implementations: ${error instanceof Error ? error.message : String(error)}`
       );

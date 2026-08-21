@@ -69,6 +69,7 @@ export interface ServerState {
     setSyncSig(filePath: string, signature: string): void;
   };
   initialized: boolean;
+  serverCapabilities: Record<string, unknown>;
   initializationPromise: Promise<void>;
   startTime: number;
   config: LSPServerConfig;
@@ -159,6 +160,11 @@ export interface ServerAdapter {
  * LSP InitializeParams type
  * Subset of the full LSP specification
  */
+export interface InitializeResult {
+  capabilities: Record<string, unknown>;
+  serverInfo?: { name: string; version?: string };
+}
+
 export interface InitializeParams {
   processId: number | null;
   clientInfo: { name: string; version: string };

@@ -9,6 +9,7 @@ import { JsonRpcTransport } from './json-rpc.js';
 import type {
   Diagnostic,
   InitializeParams,
+  InitializeResult,
   LSPMessage,
   LSPServerConfig,
   ServerState,
@@ -174,6 +175,7 @@ export class ServerManager {
       transport,
       documentManager,
       initialized: false,
+      serverCapabilities: {},
       initializationPromise,
       startTime: Date.now(),
       config: serverConfig,
@@ -240,7 +242,7 @@ export class ServerManager {
             includeDeclaration: true,
             dynamicRegistration: false,
           },
-          rename: { prepareSupport: false },
+          rename: { prepareSupport: true },
           documentSymbol: {
             symbolKind: {
               valueSet: [
@@ -253,6 +255,13 @@ export class ServerManager {
           completion: {
             completionItem: {
               snippetSupport: true,
+            },
+          },
+          codeAction: {
+            dynamicRegistration: false,
+            dataSupport: true,
+            resolveSupport: {
+              properties: ['edit'],
             },
           },
           hover: {},
@@ -271,6 +280,11 @@ export class ServerManager {
           },
           workspaceFolders: true,
           configuration: true,
+          fileOperations: {
+            dynamicRegistration: false,
+            willRename: true,
+            didRename: true,
+          },
         },
       },
       rootUri: pathToUri(serverConfig.rootDir || process.cwd()),
@@ -313,7 +327,17 @@ export class ServerManager {
       ? adapter.customizeInitializeParams(initializeParams)
       : initializeParams;
 
-    const initResult = await transport.sendRequest('initialize', finalParams);
+    const rawInitResult = await transport.sendRequest('initialize', finalParams);
+    const initResult = rawInitResult as Partial<InitializeResult> | null;
+    serverState.serverCapabilities =
+      initResult?.capabilities &&
+      typeof initResult.capabilities === 'object' &&
+      !Array.isArray(initResult.capabilities)
+        ? initResult.capabilities
+        : {};
+    logger.debug(
+      `[DEBUG startServer] Recorded ${Object.keys(serverState.serverCapabilities).length} server capability field(s) from ${serverConfig.command.join(' ')}\n`
+    );
 
     // Send the initialized notification after receiving the initialize response
     transport.sendNotification('initialized', {});

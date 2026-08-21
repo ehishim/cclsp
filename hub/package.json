@@ -11,7 +11,7 @@
     "build": "bun build --target=node --outdir=dist src/index.ts",
     "install-bin": "node scripts/install.mjs",
     "uninstall-bin": "node scripts/install.mjs --uninstall",
-    "setup": "bun run build && node scripts/install.mjs",
+    "setup": "cd .. && bun run build && cd hub && bun run build && node scripts/install.mjs",
     "reload": "bun run build && node dist/index.js shutdown",
     "dev": "bun run --watch src/index.ts"
   },

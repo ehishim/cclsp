@@ -2,8 +2,8 @@
 // subcommands are friendly aliases over cclsp's MCP tools; flags map to tool
 // parameters (kebab-case accepted, --file is sugar for --file_path).
 
-import { VERSION } from './config.js';
 import { request, tryRequest } from './client.js';
+import { CCLSP_ENTRY, VERSION } from './config.js';
 import type { ToolSchema } from './pool.js';
 
 // Friendly subcommand -> cclsp tool name.
@@ -16,6 +16,11 @@ const ALIASES: Record<string, string> = {
   diagnostics: 'get_diagnostics',
   'diagnostics-batch': 'get_diagnostics_batch',
   hover: 'get_hover',
+  'document-symbols': 'get_document_symbols',
+  completions: 'get_completions',
+  signatures: 'get_signature_help',
+  'code-actions': 'get_code_actions',
+  'rename-file': 'rename_file',
   symbols: 'find_workspace_symbols',
   'call-hierarchy': 'prepare_call_hierarchy',
   'incoming-calls': 'get_incoming_calls',
@@ -42,7 +47,15 @@ const FLAG_ALIASES: Record<string, string> = {
 
 // Flags that are always boolean — they must never consume the following token
 // (e.g. `--json diagnostics` is the json flag + the diagnostics command).
-const KNOWN_BOOLEAN = new Set(['json', 'help', 'version', 'dry-run', 'include-declaration', 'isolate']);
+const KNOWN_BOOLEAN = new Set([
+  'json',
+  'help',
+  'version',
+  'dry-run',
+  'apply',
+  'include-declaration',
+  'isolate',
+]);
 
 interface Parsed {
   command?: string;
@@ -139,10 +152,15 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need -
   find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
   find_implementation     --file F --line N --character C
   get_hover               --file F --line N --character C
+  get_document_symbols    --file F
+  get_completions         --file F --line N --character C [--limit N]
+  get_signature_help      --file F --line N --character C
+  get_code_actions        --file F --start-line N --start-character N --end-line N --end-character N [--title T] [--apply]
   get_diagnostics         --file F
   get_diagnostics_batch   --path P [--pattern RE] [--max-files N]
   rename_symbol           --file F --symbol-name NAME --new-name NEW [--dry-run]
   rename_symbol_strict    --file F --line N --character C --new-name NEW [--dry-run]
+  rename_file             --old-path F --new-path F [--dry-run=false]
   find_workspace_symbols  --query Q --root R
   prepare_call_hierarchy  --file F --line N --character C
   get_incoming_calls      --file F --line N --character C
@@ -151,8 +169,9 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need -
   call <tool>             Raw passthrough; combine with --params-json '{...}'
 
 Short aliases (and kebab-case) also work: definition, references, implementation,
-hover, diagnostics, diagnostics-batch, rename, rename-strict, symbols,
-call-hierarchy, incoming-calls, outgoing-calls, restart-server.
+hover, document-symbols, completions, signatures, code-actions, rename-file,
+diagnostics, diagnostics-batch, rename, rename-strict, symbols, call-hierarchy,
+incoming-calls, outgoing-calls, restart-server.
 
 OPTIONS
   --root <path>     Force which registered root serves the call
@@ -168,7 +187,7 @@ TIP  Prefer a root at the PROJECT ROOT — the directory with tsconfig.json /
      no path-alias resolution). Register the repo root; query files anywhere under it.
 
 ENV
-  CCLSP_HUB_ENTRY            cclsp dist/index.js to spawn (default /workspace/cclsp/dist/index.js)
+  CCLSP_HUB_ENTRY            cclsp dist/index.js to spawn (effective: ${CCLSP_ENTRY})
   CCLSP_HUB_CONFIG           cclsp server config (default ~/.config/claude/cclsp.json)
   CCLSP_HUB_MAX_ROOTS        max concurrent roots (default 30, LRU-evicted)
   CCLSP_HUB_IDLE_ROOT_SEC    evict a root after this idle time (default 1800)
@@ -213,11 +232,12 @@ function printManagementHelp(command: string): void {
       '  back to an inferred project (missed cross-file refs, no path-alias resolution).\n' +
       '  Register the repo root, then query files anywhere under it.\n\n' +
       '  If <path> sits inside an already-warm root, that root is reused (no second\n' +
-      "  server). Pass --isolate to force a dedicated instance — e.g. a monorepo\n" +
+      '  server). Pass --isolate to force a dedicated instance — e.g. a monorepo\n' +
       '  package with its own tsconfig that the outer root does not reference.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
     'restart-root': 'cclsp-hub restart-root <path>\n  Restart one root (recover a stale index).',
-    'list-roots': 'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
+    'list-roots':
+      'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
     roots: 'cclsp-hub roots [--json]\n  Alias for list-roots.',
     status: 'cclsp-hub status [--json]\n  Show daemon status (does not start the daemon).',
     shutdown: 'cclsp-hub shutdown\n  Stop all roots and the daemon.',
@@ -268,15 +288,22 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res: any = await request('ensure-root', { root, isolate: p.flags.get('isolate') === true });
+        const res: any = await request('ensure-root', {
+          root,
+          isolate: p.flags.get('isolate') === true,
+        });
         if (json) {
           out(asJson(res));
         } else if (res.reused && res.root !== res.requested) {
-          out(`covered by existing root: ${res.root} (serves ${res.requested}) — no new server spawned`);
+          out(
+            `covered by existing root: ${res.root} (serves ${res.requested}) — no new server spawned`
+          );
         } else if (res.reused) {
           out(`root already warm: ${res.root}`);
         } else {
-          out(`warmed root: ${res.root} (pid ${res.pid ?? '?'}) — language servers indexing in background`);
+          out(
+            `warmed root: ${res.root} (pid ${res.pid ?? '?'}) — language servers indexing in background`
+          );
         }
         return;
       }
@@ -342,7 +369,7 @@ export async function runCli(argv: string[]): Promise<void> {
       ? String(p.positionals[0] ?? '')
       : (ALIASES[rawCmd] ?? rawCmd.replace(/-/g, '_'));
   if (!toolName) {
-    err('usage: cclsp-hub call <tool> [--params-json \'{...}\']');
+    err("usage: cclsp-hub call <tool> [--params-json '{...}']");
     process.exitCode = 1;
     return;
   }
@@ -356,7 +383,10 @@ export async function runCli(argv: string[]): Promise<void> {
   for (const [k, v] of p.flags) {
     if (['json', 'help', 'version', 'root', 'params-json'].includes(k)) continue;
     const key = FLAG_ALIASES[k] ?? k.replace(/-/g, '_');
-    params[key] = v;
+    params[key] =
+      KNOWN_BOOLEAN.has(k) && typeof v === 'string' && (v === 'true' || v === 'false')
+        ? v === 'true'
+        : v;
   }
   const pj = p.flags.get('params-json');
   if (typeof pj === 'string') Object.assign(params, JSON.parse(pj));

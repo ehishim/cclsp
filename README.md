@@ -399,9 +399,25 @@ Find all references to a symbol across the entire workspace. Returns references 
 - `symbol_kind`: The kind of symbol (function, class, variable, method, etc.) (optional)
 - `include_declaration`: Whether to include the declaration (optional, default: true)
 
+### `get_document_symbols`
+
+Enumerate declarations in one file, including each symbol's kind, full range, selection range, container, and nested children.
+
+### `get_completions` and `get_signature_help`
+
+Request bounded completion items or signature/parameter help at a 1-indexed file position. These tools return a typed `LSP_METHOD_UNSUPPORTED` error when the selected language server does not declare the capability; a supported empty result remains successful.
+
+### `get_code_actions`
+
+List language-server code actions for a range. Select one exact `title` to preview its `WorkspaceEdit`, and pass `apply: true` to apply it. Command-only actions are reported but never executed.
+
+### `rename_file`
+
+Preview or apply a file rename using the server's `workspace/willRenameFiles` import edits, followed by `workspace/didRenameFiles`. It defaults to `dry_run: true` and refuses when the server does not declare matching file-operation support.
+
 ### `rename_symbol`
 
-Rename a symbol by name and kind in a file. **This tool now applies the rename to all affected files by default.** If multiple symbols match, returns candidate positions and suggests using rename_symbol_strict.
+Rename a symbol by name and kind in a file. **This tool now applies the rename to all affected files by default.** If multiple symbols match, returns candidate positions and suggests using rename_symbol_strict. The server's `prepareRename` check must succeed before any rename request is sent.
 
 **Parameters:**
 
