@@ -62,8 +62,18 @@ export interface ServerState {
   };
   documentManager: {
     ensureOpen(filePath: string): Promise<boolean>;
+    acquire(
+      filePath: string,
+      exclusive?: boolean
+    ): Promise<{ justOpened: boolean; release(): void }>;
     sendChange(filePath: string, text: string): void;
+    withTemporaryContent<T>(
+      filePath: string,
+      temporaryText: string,
+      action: () => Promise<T>
+    ): Promise<T>;
     isOpen(filePath: string): boolean;
+    getText(filePath: string): string | undefined;
     getVersion(filePath: string): number;
     getSyncSig(filePath: string): string | undefined;
     setSyncSig(filePath: string, signature: string): void;

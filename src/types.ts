@@ -1,8 +1,11 @@
+export const DEFAULT_MAX_OPEN_DOCUMENTS = 100;
+
 export interface LSPServerConfig {
   extensions: string[];
   command: string[];
   rootDir?: string;
   restartInterval?: number; // in minutes, optional auto-restart interval
+  maxOpenDocuments?: number;
   initializationOptions?: unknown; // LSP initialization options
 }
 

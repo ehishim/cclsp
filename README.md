@@ -284,7 +284,8 @@ Alternatively, create an `cclsp.json` configuration file manually:
     {
       "extensions": ["js", "ts", "jsx", "tsx"],
       "command": ["npx", "--", "typescript-language-server", "--stdio"],
-      "rootDir": "."
+      "rootDir": ".",
+      "maxOpenDocuments": 100
     }
   ]
 }
@@ -296,6 +297,7 @@ Alternatively, create an `cclsp.json` configuration file manually:
 - `command`: Command array to spawn the LSP server
 - `rootDir`: Working directory for the LSP server (optional, defaults to ".")
 - `restartInterval`: Auto-restart interval in minutes (optional)
+- `maxOpenDocuments`: Maximum LSP documents kept open per server (optional, default: 100; integer >= 1). Least-recently-used inactive documents are closed with `textDocument/didClose`.
 - `initializationOptions`: LSP server initialization options (optional)
 
 The `initializationOptions` field allows you to customize how each LSP server initializes. This is particularly useful for servers like `pylsp` (Python) that have extensive plugin configurations, or servers like `devsense-php-ls` that require specific settings.
@@ -403,13 +405,24 @@ Find all references to a symbol across the entire workspace. Returns references 
 
 Enumerate declarations in one file, including each symbol's kind, full range, selection range, container, and nested children.
 
+### Symbol queries for position-based tools
+
+`get_hover`, `find_implementation`, `get_completions`, `get_signature_help`, `get_code_actions`, `rename_symbol_strict`, and the call-hierarchy tools accept exactly one selector:
+
+- `query`: a document symbol name or qualified name, or
+- a complete 1-indexed `line`/`character` pair (`start_line`/`start_character` for code actions).
+
+Resolution tries exact case, case-insensitive exact, then case-insensitive substring matching. A tier resolves only when it has one candidate. Ambiguous and unknown queries return typed `LSP_SYMBOL_AMBIGUOUS` or `LSP_SYMBOL_NOT_FOUND` outcomes with at most 20 candidates instead of guessing.
+
 ### `get_completions` and `get_signature_help`
 
-Request bounded completion items or signature/parameter help at a 1-indexed file position. These tools return a typed `LSP_METHOD_UNSUPPORTED` error when the selected language server does not declare the capability; a supported empty result remains successful.
+Request bounded completion items or signature/parameter help using either selector. Completion results are deterministically ordered and can resolve details for at most 20 displayed items when the server declares `completionProvider.resolveProvider`; set `resolve_limit: 0` to disable enrichment. `synthetic_trigger: true` may temporarily insert a dot in the in-memory LSP buffer to request member completions. It never writes the source file and restores the exact prior buffer in `finally`.
+
+These tools return a typed `LSP_METHOD_UNSUPPORTED` error when the selected language server does not declare the capability; a supported empty result remains successful.
 
 ### `get_code_actions`
 
-List language-server code actions for a range. Select one exact `title` to preview its `WorkspaceEdit`, and pass `apply: true` to apply it. Command-only actions are reported but never executed.
+List language-server code actions for a query or range. Actions are ordered preferred-first, then quickfix, refactor, source, and other, with stable ties. Each action includes at most five concrete text-edit previews. Select one exact `title` to preview its `WorkspaceEdit`, and pass `apply: true` to apply it. Command-only actions and resource operations are reported but never executed.
 
 ### `rename_file`
 
@@ -434,13 +447,14 @@ Rename a symbol by name and kind in a file. **This tool now applies the rename t
 
 ### `rename_symbol_strict`
 
-Rename a symbol at a specific position in a file. Use this when rename_symbol returns multiple candidates. **This tool now applies the rename to all affected files by default.**
+Rename a symbol selected by `query` or a specific position in a file. Use this when rename_symbol returns multiple candidates. **This tool now applies the rename to all affected files by default.**
 
 **Parameters:**
 
 - `file_path`: The path to the file
-- `line`: The line number (1-indexed)
-- `character`: The character position in the line (1-indexed)
+- `query`: A document symbol query (alternative to `line`/`character`)
+- `line`: The line number (1-indexed; alternative to `query`)
+- `character`: The character position in the line (1-indexed; alternative to `query`)
 - `new_name`: The new name for the symbol
 - `dry_run`: If true, only preview the changes without applying them (optional, default: false)
 

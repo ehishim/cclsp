@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import { logger } from '../logger.js';
+import { DEFAULT_MAX_OPEN_DOCUMENTS } from '../types.js';
 import { pathToUri } from '../utils.js';
 import { VERSION } from '../version.js';
 import { adapterRegistry } from './adapters/registry.js';
@@ -167,8 +168,12 @@ export class ServerManager {
       this.handleMessage(message, serverState);
     });
 
-    const documentManager = new DocumentManager(transport);
     const diagnosticsCache = new DiagnosticsCache();
+    const documentManager = new DocumentManager(
+      transport,
+      serverConfig.maxOpenDocuments ?? DEFAULT_MAX_OPEN_DOCUMENTS,
+      (filePath) => diagnosticsCache.delete(pathToUri(filePath))
+    );
 
     const serverState: ServerState = {
       process: childProcess,

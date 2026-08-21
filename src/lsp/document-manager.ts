@@ -1,117 +1,232 @@
 import { readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
+import { DEFAULT_MAX_OPEN_DOCUMENTS } from '../types.js';
 import { pathToUri } from '../utils.js';
 import type { JsonRpcTransport } from './json-rpc.js';
 
-/**
- * Manages document lifecycle for a single LSP server.
- *
- * Handles:
- * - Opening files (textDocument/didOpen) with version tracking
- * - Syncing file changes (textDocument/didChange) with version increment
- * - Language ID mapping from file extensions
- * - Tracking which files are open and their current versions
- */
+interface DocumentState {
+  version: number;
+  text: string;
+  syncSignature?: string;
+  activeUses: number;
+  exclusiveUse: boolean;
+}
+
+export interface DocumentLease {
+  justOpened: boolean;
+  release(): void;
+}
+
 export class DocumentManager {
-  private readonly openFiles = new Set<string>();
-  private readonly fileVersions = new Map<string, number>();
-  // Last on-disk signature (mtime+size) we synced to the server per file. Lets
-  // callers skip a redundant re-open/re-sync when the file is unchanged, which
-  // is the common case for repeated diagnostics/hover calls.
-  private readonly syncSignatures = new Map<string, string>();
+  private readonly documents = new Map<string, DocumentState>();
+  private readonly temporaryDocuments = new Set<string>();
+  private readonly leaseWaiters = new Map<string, Array<() => void>>();
+  private readonly pendingExclusiveUses = new Map<string, number>();
+  private readonly maxOpenDocuments: number;
 
-  constructor(private readonly transport: JsonRpcTransport) {}
+  constructor(
+    private readonly transport: JsonRpcTransport,
+    maxOpenDocuments = DEFAULT_MAX_OPEN_DOCUMENTS,
+    private readonly onClose?: (filePath: string) => void
+  ) {
+    if (!Number.isInteger(maxOpenDocuments) || maxOpenDocuments < 1) {
+      throw new Error('maxOpenDocuments must be an integer greater than or equal to 1');
+    }
+    this.maxOpenDocuments = maxOpenDocuments;
+  }
 
-  /**
-   * Ensure a file is open in the LSP server. If already open, returns false.
-   * If not open, reads the file, sends textDocument/didOpen, and returns true.
-   */
   async ensureOpen(filePath: string): Promise<boolean> {
-    if (this.openFiles.has(filePath)) {
-      logger.debug(`[DEBUG ensureOpen] File already open: ${filePath}\n`);
+    const existing = this.documents.get(filePath);
+    if (existing) {
+      this.touch(filePath, existing);
       return false;
     }
 
-    logger.debug(`[DEBUG ensureOpen] Opening file: ${filePath}\n`);
+    this.open(filePath, 0);
+    this.evictInactiveDocuments();
+    return true;
+  }
 
+  async acquire(filePath: string, exclusive = false): Promise<DocumentLease> {
+    if (exclusive) {
+      this.pendingExclusiveUses.set(filePath, (this.pendingExclusiveUses.get(filePath) ?? 0) + 1);
+    }
     try {
-      const fileContent = readFileSync(filePath, 'utf-8');
-      const uri = pathToUri(filePath);
-      const languageId = getLanguageId(filePath);
+      await this.waitForLease(filePath, exclusive);
+    } finally {
+      if (exclusive) {
+        const remaining = (this.pendingExclusiveUses.get(filePath) ?? 1) - 1;
+        if (remaining > 0) this.pendingExclusiveUses.set(filePath, remaining);
+        else this.pendingExclusiveUses.delete(filePath);
+      }
+    }
+    let state = this.documents.get(filePath);
+    const justOpened = !state;
+    if (!state) {
+      state = this.open(filePath, 1, exclusive);
+    } else {
+      state.activeUses++;
+      state.exclusiveUse = exclusive;
+      this.touch(filePath, state);
+    }
+    this.evictInactiveDocuments();
 
-      logger.debug(
-        `[DEBUG ensureOpen] File content length: ${fileContent.length}, languageId: ${languageId}\n`
-      );
+    let released = false;
+    return {
+      justOpened,
+      release: () => {
+        if (released) return;
+        released = true;
+        const current = this.documents.get(filePath);
+        if (current) {
+          current.activeUses = Math.max(0, current.activeUses - 1);
+          if (exclusive) current.exclusiveUse = false;
+          this.touch(filePath, current);
+        }
+        for (const resolve of this.leaseWaiters.get(filePath) ?? []) resolve();
+        this.leaseWaiters.delete(filePath);
+        this.evictInactiveDocuments();
+      },
+    };
+  }
 
-      this.transport.sendNotification('textDocument/didOpen', {
-        textDocument: {
-          uri,
-          languageId,
-          version: 1,
-          text: fileContent,
-        },
-      });
+  sendChange(filePath: string, text: string): void {
+    if (this.temporaryDocuments.has(filePath)) {
+      throw new Error(`Cannot change a document while temporary content is active: ${filePath}`);
+    }
+    this.sendChangeInternal(filePath, text);
+  }
 
-      this.openFiles.add(filePath);
-      this.fileVersions.set(filePath, 1);
-      logger.debug(`[DEBUG ensureOpen] File opened successfully: ${filePath}\n`);
-      return true;
-    } catch (error) {
-      logger.debug(`[DEBUG ensureOpen] Failed to open file ${filePath}: ${error}\n`);
-      throw error;
+  async withTemporaryContent<T>(
+    filePath: string,
+    temporaryText: string,
+    action: () => Promise<T>
+  ): Promise<T> {
+    const state = this.documents.get(filePath);
+    if (!state) {
+      throw new Error(`Cannot temporarily change unopened document: ${filePath}`);
+    }
+    if (this.temporaryDocuments.has(filePath)) {
+      throw new Error(`A temporary document change is already active: ${filePath}`);
+    }
+
+    const originalText = state.text;
+    this.temporaryDocuments.add(filePath);
+    try {
+      this.sendChangeInternal(filePath, temporaryText);
+      return await action();
+    } finally {
+      try {
+        this.sendChangeInternal(filePath, originalText);
+      } finally {
+        this.temporaryDocuments.delete(filePath);
+        for (const resolve of this.leaseWaiters.get(filePath) ?? []) resolve();
+        this.leaseWaiters.delete(filePath);
+      }
     }
   }
 
-  /**
-   * Send a textDocument/didChange notification with version increment.
-   * The file must already be open (call ensureOpen first).
-   */
-  sendChange(filePath: string, text: string): void {
-    const uri = pathToUri(filePath);
-    const version = (this.fileVersions.get(filePath) || 1) + 1;
-    this.fileVersions.set(filePath, version);
+  isOpen(filePath: string): boolean {
+    return this.documents.has(filePath);
+  }
 
+  getText(filePath: string): string | undefined {
+    return this.documents.get(filePath)?.text;
+  }
+
+  getSyncSig(filePath: string): string | undefined {
+    return this.documents.get(filePath)?.syncSignature;
+  }
+
+  setSyncSig(filePath: string, signature: string): void {
+    const state = this.documents.get(filePath);
+    if (state) state.syncSignature = signature;
+  }
+
+  getVersion(filePath: string): number {
+    return this.documents.get(filePath)?.version ?? 0;
+  }
+
+  getOpenCount(): number {
+    return this.documents.size;
+  }
+
+  private sendChangeInternal(filePath: string, text: string): void {
+    const state = this.documents.get(filePath);
+    if (!state) {
+      throw new Error(`Cannot change unopened document: ${filePath}`);
+    }
+    state.version++;
+    state.text = text;
+    this.touch(filePath, state);
     this.transport.sendNotification('textDocument/didChange', {
-      textDocument: {
-        uri,
-        version,
-      },
+      textDocument: { uri: pathToUri(filePath), version: state.version },
       contentChanges: [{ text }],
     });
   }
 
-  /**
-   * Check if a file is currently open in the LSP server.
-   */
-  isOpen(filePath: string): boolean {
-    return this.openFiles.has(filePath);
+  private async waitForLease(filePath: string, exclusive: boolean): Promise<void> {
+    while (true) {
+      const state = this.documents.get(filePath);
+      if (
+        !this.temporaryDocuments.has(filePath) &&
+        (!state ||
+          (!state.exclusiveUse &&
+            (exclusive
+              ? state.activeUses === 0
+              : (this.pendingExclusiveUses.get(filePath) ?? 0) === 0)))
+      ) {
+        return;
+      }
+      await new Promise<void>((resolve) => {
+        const waiters = this.leaseWaiters.get(filePath) ?? [];
+        waiters.push(resolve);
+        this.leaseWaiters.set(filePath, waiters);
+      });
+    }
   }
 
-  /**
-   * Get the last on-disk signature (mtime+size) synced for a file, if any.
-   */
-  getSyncSig(filePath: string): string | undefined {
-    return this.syncSignatures.get(filePath);
+  private open(filePath: string, activeUses: number, exclusiveUse = false): DocumentState {
+    logger.debug(`[DEBUG ensureOpen] Opening file: ${filePath}\n`);
+    const text = readFileSync(filePath, 'utf-8');
+    const state: DocumentState = { version: 1, text, activeUses, exclusiveUse };
+    this.documents.set(filePath, state);
+    this.transport.sendNotification('textDocument/didOpen', {
+      textDocument: {
+        uri: pathToUri(filePath),
+        languageId: getLanguageId(filePath),
+        version: state.version,
+        text,
+      },
+    });
+    return state;
   }
 
-  /**
-   * Record the on-disk signature currently synced to the server for a file.
-   */
-  setSyncSig(filePath: string, signature: string): void {
-    this.syncSignatures.set(filePath, signature);
+  private touch(filePath: string, state: DocumentState): void {
+    this.documents.delete(filePath);
+    this.documents.set(filePath, state);
   }
 
-  /**
-   * Get the current version number for a file.
-   */
-  getVersion(filePath: string): number {
-    return this.fileVersions.get(filePath) || 0;
+  private evictInactiveDocuments(): void {
+    while (this.documents.size > this.maxOpenDocuments) {
+      let candidate: [string, DocumentState] | undefined;
+      for (const entry of this.documents) {
+        if (entry[1].activeUses === 0) {
+          candidate = entry;
+          break;
+        }
+      }
+      if (!candidate) return;
+      const [filePath] = candidate;
+      this.documents.delete(filePath);
+      this.transport.sendNotification('textDocument/didClose', {
+        textDocument: { uri: pathToUri(filePath) },
+      });
+      this.onClose?.(filePath);
+    }
   }
 }
 
-/**
- * Map file extension to LSP language identifier.
- */
 export function getLanguageId(filePath: string): string {
   const extension = filePath.split('.').pop()?.toLowerCase();
   const languageMap: Record<string, string> = {

@@ -34,6 +34,7 @@ const METHOD_CAPABILITY_PATHS: Record<string, string[]> = {
   'callHierarchy/incomingCalls': ['callHierarchyProvider'],
   'callHierarchy/outgoingCalls': ['callHierarchyProvider'],
   'textDocument/completion': ['completionProvider'],
+  'completionItem/resolve': ['completionProvider', 'resolveProvider'],
   'textDocument/signatureHelp': ['signatureHelpProvider'],
   'textDocument/codeAction': ['codeActionProvider'],
   'codeAction/resolve': ['codeActionProvider', 'resolveProvider'],

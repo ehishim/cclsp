@@ -54,6 +54,7 @@ const KNOWN_BOOLEAN = new Set([
   'dry-run',
   'apply',
   'include-declaration',
+  'synthetic-trigger',
   'isolate',
 ]);
 
@@ -63,7 +64,19 @@ interface Parsed {
   flags: Map<string, string | boolean>;
 }
 
-function parse(argv: string[]): Parsed {
+interface ToolResultEnvelope {
+  content?: unknown;
+  isError?: boolean;
+}
+
+interface RootSummary {
+  root: string;
+  pid?: number;
+  ageSec: number;
+  idleSec: number;
+}
+
+export function parse(argv: string[]): Parsed {
   const positionals: string[] = [];
   const flags = new Map<string, string | boolean>();
   let command: string | undefined;
@@ -109,17 +122,31 @@ function asJson(v: unknown): string {
   return JSON.stringify(v, null, 2);
 }
 
-function printToolResult(result: any, json: boolean): void {
+function printToolResult(result: unknown, json: boolean): void {
+  const envelope =
+    result && typeof result === 'object' ? (result as ToolResultEnvelope) : undefined;
   if (json) {
     out(asJson(result));
   } else {
-    const text = Array.isArray(result?.content)
-      ? result.content.map((c: any) => (c?.type === 'text' ? c.text : asJson(c))).join('\n')
+    const text = Array.isArray(envelope?.content)
+      ? envelope.content
+          .map((content) => {
+            if (
+              content &&
+              typeof content === 'object' &&
+              (content as { type?: unknown }).type === 'text' &&
+              typeof (content as { text?: unknown }).text === 'string'
+            ) {
+              return (content as { text: string }).text;
+            }
+            return asJson(content);
+          })
+          .join('\n')
       : asJson(result);
-    if (result?.isError) err(text);
+    if (envelope?.isError) err(text);
     else out(text);
   }
-  if (result?.isError) process.exitCode = 1;
+  if (envelope?.isError) process.exitCode = 1;
 }
 
 function rootArg(p: Parsed): string | undefined {
@@ -150,21 +177,23 @@ ROOTS & DAEMON
 CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need --root)
   find_definition         --file F --symbol-name NAME [--symbol-kind K]
   find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
-  find_implementation     --file F --line N --character C
-  get_hover               --file F --line N --character C
+  find_implementation     --file F (--query Q | --line N --character C)
+  get_hover               --file F (--query Q | --line N --character C)
   get_document_symbols    --file F
-  get_completions         --file F --line N --character C [--limit N]
-  get_signature_help      --file F --line N --character C
-  get_code_actions        --file F --start-line N --start-character N --end-line N --end-character N [--title T] [--apply]
+  get_completions         --file F (--query Q | --line N --character C) [--limit N]
+                          [--resolve-limit N] [--synthetic-trigger]
+  get_signature_help      --file F (--query Q | --line N --character C)
+  get_code_actions        --file F (--query Q | --start-line N --start-character N
+                          --end-line N --end-character N) [--limit N] [--title T] [--apply]
   get_diagnostics         --file F
   get_diagnostics_batch   --path P [--pattern RE] [--max-files N]
   rename_symbol           --file F --symbol-name NAME --new-name NEW [--dry-run]
-  rename_symbol_strict    --file F --line N --character C --new-name NEW [--dry-run]
+  rename_symbol_strict    --file F (--query Q | --line N --character C) --new-name NEW [--dry-run]
   rename_file             --old-path F --new-path F [--dry-run=false]
   find_workspace_symbols  --query Q --root R
-  prepare_call_hierarchy  --file F --line N --character C
-  get_incoming_calls      --file F --line N --character C
-  get_outgoing_calls      --file F --line N --character C
+  prepare_call_hierarchy  --file F (--query Q | --line N --character C)
+  get_incoming_calls      --file F (--query Q | --line N --character C)
+  get_outgoing_calls      --file F (--query Q | --line N --character C)
   restart_server          --root R [--extensions ts,tsx]
   call <tool>             Raw passthrough; combine with --params-json '{...}'
 
@@ -179,7 +208,9 @@ OPTIONS
   -h, --help        This help (or '<command> --help' for a command's parameters)
   --version         Print version
 
-LINE/CHARACTER are 1-indexed. Run 'cclsp-hub <command> --help' for parameters.
+POSITION TOOLS accept exactly one selector: --query Q or a complete 1-indexed
+line/character pair. Ambiguous and unknown queries return bounded candidates.
+Run 'cclsp-hub <command> --help' for parameters.
 
 TIP  Prefer a root at the PROJECT ROOT — the directory with tsconfig.json /
      package.json (TS/JS) or composer.json (PHP). Pointing at a random subdir makes
@@ -206,7 +237,10 @@ async function printToolHelp(command: string, toolName: string): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const props: Record<string, any> = schema.inputSchema?.properties ?? {};
+  const props = (schema.inputSchema?.properties ?? {}) as Record<
+    string,
+    { type?: string; description?: string }
+  >;
   const required: string[] = schema.inputSchema?.required ?? [];
   out(`cclsp-hub ${command} — ${schema.description ?? toolName}`);
   out('');
@@ -268,7 +302,12 @@ export async function runCli(argv: string[]): Promise<void> {
     }
     switch (p.command) {
       case 'status': {
-        const res: any = await tryRequest('status');
+        const res = (await tryRequest('status')) as {
+          pid: number;
+          socket: string;
+          uptimeSec: number;
+          roots: string[];
+        } | null;
         if (!res) {
           out(json ? asJson({ running: false }) : 'daemon: not running');
           return;
@@ -288,10 +327,10 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res: any = await request('ensure-root', {
+        const res = (await request('ensure-root', {
           root,
           isolate: p.flags.get('isolate') === true,
-        });
+        })) as { reused: boolean; root: string; requested: string; pid?: number };
         if (json) {
           out(asJson(res));
         } else if (res.reused && res.root !== res.requested) {
@@ -309,7 +348,7 @@ export async function runCli(argv: string[]): Promise<void> {
       }
       case 'list-roots':
       case 'roots': {
-        const res: any = await tryRequest('list-roots');
+        const res = (await tryRequest('list-roots')) as { roots: RootSummary[] } | null;
         if (!res) {
           out(json ? asJson({ roots: [] }) : 'no active roots (daemon not running)');
           return;
@@ -329,7 +368,7 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res: any = await tryRequest('stop-root', { root });
+        const res = (await tryRequest('stop-root', { root })) as { stopped: boolean } | null;
         if (!res) return out('daemon not running; nothing to stop');
         out(json ? asJson(res) : res.stopped ? `stopped: ${root}` : `not registered: ${root}`);
         return;
@@ -341,17 +380,17 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res: any = await request('restart-root', { root });
+        const res = (await request('restart-root', { root })) as { root: string; pid?: number };
         out(json ? asJson(res) : `restarted: ${res.root} (pid ${res.pid ?? '?'})`);
         return;
       }
       case 'shutdown': {
-        const res: any = await tryRequest('shutdown');
+        const res = await tryRequest('shutdown');
         out(res ? 'daemon stopped' : 'daemon not running');
         return;
       }
       case 'describe': {
-        const res: any = await request('describe');
+        const res = (await request('describe')) as { tools: ToolSchema[] };
         if (json) return out(asJson(res));
         for (const t of res.tools as ToolSchema[]) out(`${t.name}  —  ${t.description ?? ''}`);
         return;

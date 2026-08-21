@@ -2,6 +2,12 @@ import { existsSync, renameSync } from 'node:fs';
 import { applyWorkspaceEdit } from '../file-editor.js';
 import { pathToUri, uriToPath } from '../utils.js';
 import { resolvePath, rethrowToolOutcome, textResult, withWarning } from './helpers.js';
+import {
+  positionResolutionResult,
+  resolveToolPosition,
+  resolvedFromMetadata,
+  resolvedFromText,
+} from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
 
 export const renameSymbolTool: ToolDefinition = {
@@ -140,89 +146,110 @@ export const renameSymbolTool: ToolDefinition = {
 export const renameSymbolStrictTool: ToolDefinition = {
   name: 'rename_symbol_strict',
   description:
-    'Rename a symbol at a specific position in a file. Use this when rename_symbol returns multiple candidates. By default, this will apply the rename to the files. Use dry_run to preview changes without applying them.',
+    'Rename a symbol by query or 1-indexed position after prepareRename. Applies by default; use dry_run to preview.',
   inputSchema: {
     type: 'object',
     properties: {
-      file_path: {
-        type: 'string',
-        description: 'The path to the file',
-      },
-      line: {
-        type: 'number',
-        description: 'The line number (1-indexed)',
-      },
-      character: {
-        type: 'number',
-        description: 'The character position in the line (1-indexed)',
-      },
-      new_name: {
-        type: 'string',
-        description: 'The new name for the symbol',
-      },
+      file_path: { type: 'string', description: 'The path to the file' },
+      query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+      line: { type: 'number', description: 'The line number (1-indexed)' },
+      character: { type: 'number', description: 'The character position (1-indexed)' },
+      new_name: { type: 'string', description: 'The new name for the symbol' },
       dry_run: {
         type: 'boolean',
         description: 'If true, only preview the changes without applying them (default: false)',
       },
     },
-    required: ['file_path', 'line', 'character', 'new_name'],
+    required: ['file_path', 'new_name'],
   },
   handler: async (args, client) => {
     const {
       file_path,
+      query,
       line,
       character,
       new_name,
       dry_run = false,
     } = args as {
       file_path: string;
-      line: number;
-      character: number;
+      query?: string;
+      line?: number;
+      character?: number;
       new_name: string;
       dry_run?: boolean;
     };
     const absolutePath = resolvePath(file_path);
-
     try {
-      const workspaceEdit = await client.renameSymbol(
+      const resolution = await resolveToolPosition(
         absolutePath,
-        { line: line - 1, character: character - 1 },
-        new_name
+        { query, line, character },
+        client
       );
-
-      if (workspaceEdit?.changes && Object.keys(workspaceEdit.changes).length > 0) {
-        const changes = [];
-        for (const [uri, edits] of Object.entries(workspaceEdit.changes)) {
-          const filePath = uriToPath(uri);
-          changes.push(`File: ${filePath}`);
-          for (const edit of edits) {
-            const { start, end } = edit.range;
-            changes.push(
-              `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
-            );
-          }
-        }
-
-        // Apply changes if not in dry run mode
-        if (!dry_run) {
-          const editResult = await applyWorkspaceEdit(workspaceEdit, { lspClient: client });
-
-          if (!editResult.success) {
-            return textResult(`Failed to apply rename: ${editResult.error}`);
-          }
-
-          return textResult(
-            `Successfully renamed symbol at line ${line}, character ${character} to "${new_name}".\n\nModified files:\n${editResult.filesModified.map((f) => `- ${f}`).join('\n')}`
+      if (resolution.outcome !== 'resolved') {
+        return positionResolutionResult(resolution, file_path);
+      }
+      const workspaceEdit = await client.renameSymbol(absolutePath, resolution.position, new_name);
+      const changes = workspaceEdit?.changes ?? {};
+      const resolved = resolvedFromText(resolution);
+      const resolvedFrom = resolvedFromMetadata(resolution);
+      if (Object.keys(changes).length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${resolved ? `${resolved}\n\n` : ''}No rename edits available at line ${resolution.position.line + 1}, character ${resolution.position.character + 1}. Please verify the symbol location and ensure the language server is properly configured.`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            ...(resolvedFrom ? { resolvedFrom } : {}),
+            applied: false,
+            editCount: 0,
+          },
+        };
+      }
+      const preview: string[] = [];
+      for (const [uri, edits] of Object.entries(changes)) {
+        preview.push(`File: ${uriToPath(uri)}`);
+        for (const edit of edits) {
+          const { start, end } = edit.range;
+          preview.push(
+            `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
           );
         }
-        // Dry run mode - show preview
-        return textResult(
-          `[DRY RUN] Would rename symbol at line ${line}, character ${character} to "${new_name}":\n${changes.join('\n')}`
-        );
       }
-      return textResult(
-        `No rename edits available at line ${line}, character ${character}. Please verify the symbol location and ensure the language server is properly configured.`
-      );
+      if (dry_run) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${resolved ? `${resolved}\n\n` : ''}[DRY RUN] Would rename symbol at line ${resolution.position.line + 1}, character ${resolution.position.character + 1} to "${new_name}":\n${preview.join('\n')}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            ...(resolvedFrom ? { resolvedFrom } : {}),
+            applied: false,
+            edit: workspaceEdit,
+          },
+        };
+      }
+      const editResult = await applyWorkspaceEdit(workspaceEdit, { lspClient: client });
+      if (!editResult.success) return textResult(`Failed to apply rename: ${editResult.error}`);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${resolved ? `${resolved}\n\n` : ''}Successfully renamed symbol at line ${resolution.position.line + 1}, character ${resolution.position.character + 1} to "${new_name}".\n\nModified files:\n${editResult.filesModified.map((file) => `- ${file}`).join('\n')}`,
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          ...(resolvedFrom ? { resolvedFrom } : {}),
+          applied: true,
+          filesModified: editResult.filesModified,
+        },
+      };
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(

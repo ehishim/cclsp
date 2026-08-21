@@ -7,6 +7,12 @@ import {
   textResult,
   withWarning,
 } from './helpers.js';
+import {
+  positionResolutionResult,
+  resolveToolPosition,
+  resolvedFromMetadata,
+  resolvedFromText,
+} from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
 
 export const findDefinitionTool: ToolDefinition = {
@@ -179,47 +185,65 @@ export const findReferencesTool: ToolDefinition = {
 
 export const findImplementationTool: ToolDefinition = {
   name: 'find_implementation',
-  description:
-    'Find implementations of an interface or abstract method. Returns locations of all implementations.',
+  description: 'Find implementations by symbol query or 1-indexed position.',
   inputSchema: {
     type: 'object',
     properties: {
-      file_path: {
-        type: 'string',
-        description: 'The path to the file',
-      },
-      line: {
-        type: 'number',
-        description: 'The line number (1-indexed)',
-      },
-      character: {
-        type: 'number',
-        description: 'The character position in the line (1-indexed)',
-      },
+      file_path: { type: 'string', description: 'The path to the file' },
+      query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+      line: { type: 'number', description: 'The line number (1-indexed)' },
+      character: { type: 'number', description: 'The character position (1-indexed)' },
     },
-    required: ['file_path', 'line', 'character'],
+    required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, line, character } = args as {
+    const { file_path, query, line, character } = args as {
       file_path: string;
-      line: number;
-      character: number;
+      query?: string;
+      line?: number;
+      character?: number;
     };
     const absolutePath = resolvePath(file_path);
-
     try {
-      const locations = await client.findImplementation(absolutePath, {
-        line: line - 1,
-        character: character - 1,
-      });
-
-      if (locations.length === 0) {
-        return textResult(`No implementations found at ${file_path}:${line}:${character}`);
+      const resolution = await resolveToolPosition(
+        absolutePath,
+        { query, line, character },
+        client
+      );
+      if (resolution.outcome !== 'resolved') {
+        return positionResolutionResult(resolution, file_path);
       }
-
-      const locationList = formatLocations(locations);
-
-      return textResult(`Found ${locations.length} implementation(s):\n\n${locationList}`);
+      const locations = await client.findImplementation(absolutePath, resolution.position);
+      const resolved = resolvedFromText(resolution);
+      const resolvedFrom = resolvedFromMetadata(resolution);
+      if (locations.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${resolved ? `${resolved}\n\n` : ''}No implementations found at ${file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            ...(resolvedFrom ? { resolvedFrom } : {}),
+            locations: [],
+          },
+        };
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${resolved ? `${resolved}\n\n` : ''}Found ${locations.length} implementation(s):\n\n${formatLocations(locations)}`,
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          ...(resolvedFrom ? { resolvedFrom } : {}),
+          locations,
+        },
+      };
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(

@@ -1,5 +1,4 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
-import { writeFileSync } from 'node:fs';
 import { LANGUAGE_SERVERS, generateConfig } from './language-servers.js';
 import { buildMCPArgs, generateMCPCommand } from './setup.js';
 
@@ -10,13 +9,9 @@ interface GeneratedConfig {
     command: string[];
     rootDir: string;
     restartInterval?: number;
+    maxOpenDocuments: number;
   }>;
 }
-
-// Mock fs module
-mock.module('node:fs', () => ({
-  writeFileSync: mock(() => {}),
-}));
 
 // Mock inquirer module
 const mockPrompt = mock(() => Promise.resolve({}));
@@ -100,6 +95,7 @@ describe('generateConfig', () => {
     expect(server?.extensions).toContain('js');
     expect(server?.command).toEqual(['typescript-language-server', '--stdio']);
     expect(server?.rootDir).toBe('.');
+    expect(server?.maxOpenDocuments).toBe(100);
   });
 
   test('should generate config for multiple languages', () => {
@@ -198,7 +194,6 @@ describe('generateConfig', () => {
 describe('setup CLI integration', () => {
   beforeEach(() => {
     mockPrompt.mockClear();
-    (writeFileSync as unknown as ReturnType<typeof mock>).mockClear();
   });
 
   test('should handle language selection workflow', async () => {
@@ -238,6 +233,7 @@ describe('setup CLI integration', () => {
       expect(server).toHaveProperty('command');
       expect(server).toHaveProperty('rootDir');
       expect(server.rootDir).toBe('.');
+      expect(server.maxOpenDocuments).toBe(100);
     }
   });
 });

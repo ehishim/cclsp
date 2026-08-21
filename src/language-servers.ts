@@ -1,3 +1,5 @@
+import { DEFAULT_MAX_OPEN_DOCUMENTS } from './types.js';
+
 export interface LanguageServerConfig {
   name: string;
   displayName: string;
@@ -8,6 +10,7 @@ export interface LanguageServerConfig {
   description?: string;
   installRequired?: boolean;
   restartInterval?: number; // Default restart interval in minutes
+  maxOpenDocuments?: number;
   initializationOptions?: unknown; // Default LSP initialization options
 }
 
@@ -199,11 +202,13 @@ export function generateConfig(selectedLanguages: string[]): object {
         command: string[];
         rootDir: string;
         restartInterval?: number;
+        maxOpenDocuments: number;
         initializationOptions?: unknown;
       } = {
         extensions: server.extensions,
         command: server.command,
         rootDir: server.rootDir || '.',
+        maxOpenDocuments: server.maxOpenDocuments ?? DEFAULT_MAX_OPEN_DOCUMENTS,
       };
 
       // Add restartInterval if specified for the server

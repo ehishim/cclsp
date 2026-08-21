@@ -1,6 +1,12 @@
 import type { DocumentSymbol, SymbolInformation } from '../lsp/types.js';
 import { uriToPath } from '../utils.js';
 import { resolvePath, rethrowToolOutcome, textResult } from './helpers.js';
+import {
+  positionResolutionResult,
+  resolveToolPosition,
+  resolvedFromMetadata,
+  resolvedFromText,
+} from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
 
 interface DocumentSymbolOutput {
@@ -51,9 +57,7 @@ export const getDocumentSymbolsTool: ToolDefinition = {
     'Enumerate declarations in one file. Returns each symbol name, kind, full range, selection range, container, and children.',
   inputSchema: {
     type: 'object',
-    properties: {
-      file_path: { type: 'string', description: 'The path to the file to enumerate' },
-    },
+    properties: { file_path: { type: 'string', description: 'The path to the file to enumerate' } },
     required: ['file_path'],
   },
   handler: async (args, client) => {
@@ -68,22 +72,17 @@ export const getDocumentSymbolsTool: ToolDefinition = {
       const output = hierarchical
         ? (symbols as DocumentSymbol[]).map((symbol) => mapHierarchicalSymbol(symbol, client))
         : (symbols as SymbolInformation[]).map((symbol) => mapFlatSymbol(symbol, client));
-      const structuredContent = {
-        outcome: 'ok',
-        file: absolutePath,
-        symbols: output,
-      };
       return {
         content: [
           {
-            type: 'text' as const,
+            type: 'text',
             text:
               output.length === 0
                 ? `No document symbols found in ${file_path}`
                 : `Document symbols in ${file_path}:\n${JSON.stringify(output, null, 2)}`,
           },
         ],
-        structuredContent,
+        structuredContent: { outcome: 'ok', file: absolutePath, symbols: output },
       };
     } catch (error) {
       rethrowToolOutcome(error);
@@ -94,36 +93,24 @@ export const getDocumentSymbolsTool: ToolDefinition = {
 
 export const findWorkspaceSymbolsTool: ToolDefinition = {
   name: 'find_workspace_symbols',
-  description:
-    'Search for symbols across the entire workspace by name. Returns matching symbols from all files.',
+  description: 'Search for symbols across the entire workspace by name.',
   inputSchema: {
     type: 'object',
-    properties: {
-      query: {
-        type: 'string',
-        description: 'The symbol name or pattern to search for',
-      },
-    },
+    properties: { query: { type: 'string', description: 'The symbol name or pattern' } },
     required: ['query'],
   },
   handler: async (args, client) => {
     const { query } = args as { query: string };
-
     try {
       const symbols = await client.workspaceSymbol(query);
-
-      if (symbols.length === 0) {
-        return textResult(`No symbols found matching "${query}"`);
-      }
-
-      const symbolList = symbols.map((sym) => {
-        const filePath = uriToPath(sym.location.uri);
-        const { start } = sym.location.range;
-        return `• ${sym.name} (${client.symbolKindToString(sym.kind)}) at ${filePath}:${start.line + 1}:${start.character + 1}`;
-      });
-
+      if (symbols.length === 0) return textResult(`No symbols found matching "${query}"`);
       return textResult(
-        `Found ${symbols.length} symbol(s) matching "${query}":\n\n${symbolList.join('\n')}`
+        `Found ${symbols.length} symbol(s) matching "${query}":\n\n${symbols
+          .map((symbol) => {
+            const start = symbol.location.range.start;
+            return `• ${symbol.name} (${client.symbolKindToString(symbol.kind)}) at ${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1}`;
+          })
+          .join('\n')}`
       );
     } catch (error) {
       rethrowToolOutcome(error);
@@ -134,55 +121,76 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
   },
 };
 
+const positionSchema = {
+  type: 'object',
+  properties: {
+    file_path: { type: 'string', description: 'The path to the file' },
+    query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+    line: { type: 'number', description: 'The line number (1-indexed)' },
+    character: { type: 'number', description: 'The character position (1-indexed)' },
+  },
+  required: ['file_path'],
+};
+
+type PositionArgs = {
+  file_path: string;
+  query?: string;
+  line?: number;
+  character?: number;
+};
+
 export const prepareCallHierarchyTool: ToolDefinition = {
   name: 'prepare_call_hierarchy',
-  description:
-    'Get call hierarchy item at a position. Use this to prepare for incoming_calls or outgoing_calls.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file_path: {
-        type: 'string',
-        description: 'The path to the file',
-      },
-      line: {
-        type: 'number',
-        description: 'The line number (1-indexed)',
-      },
-      character: {
-        type: 'number',
-        description: 'The character position in the line (1-indexed)',
-      },
-    },
-    required: ['file_path', 'line', 'character'],
-  },
+  description: 'Get call hierarchy items by symbol query or 1-indexed position.',
+  inputSchema: positionSchema,
   handler: async (args, client) => {
-    const { file_path, line, character } = args as {
-      file_path: string;
-      line: number;
-      character: number;
-    };
+    const { file_path, query, line, character } = args as PositionArgs;
     const absolutePath = resolvePath(file_path);
-
     try {
-      const items = await client.prepareCallHierarchy(absolutePath, {
-        line: line - 1,
-        character: character - 1,
-      });
-
-      if (items.length === 0) {
-        return textResult(`No call hierarchy item found at ${file_path}:${line}:${character}`);
-      }
-
-      const itemList = items.map((item) => {
-        const filePath = uriToPath(item.uri);
-        const { start } = item.selectionRange;
-        return `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${filePath}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`;
-      });
-
-      return textResult(
-        `Call hierarchy item(s) at ${file_path}:${line}:${character}:\n\n${itemList.join('\n')}`
+      const resolution = await resolveToolPosition(
+        absolutePath,
+        { query, line, character },
+        client
       );
+      if (resolution.outcome !== 'resolved') {
+        return positionResolutionResult(resolution, file_path);
+      }
+      const items = await client.prepareCallHierarchy(absolutePath, resolution.position);
+      const resolved = resolvedFromText(resolution);
+      const resolvedFrom = resolvedFromMetadata(resolution);
+      if (items.length === 0) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${resolved ? `${resolved}\n\n` : ''}No call hierarchy item found at ${file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            ...(resolvedFrom ? { resolvedFrom } : {}),
+            items: [],
+          },
+        };
+      }
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `${resolved ? `${resolved}\n\n` : ''}Call hierarchy item(s):\n\n${items
+              .map((item) => {
+                const start = item.selectionRange.start;
+                return `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${uriToPath(item.uri)}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`;
+              })
+              .join('\n')}`,
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          ...(resolvedFrom ? { resolvedFrom } : {}),
+          items,
+        },
+      };
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(
@@ -192,65 +200,81 @@ export const prepareCallHierarchyTool: ToolDefinition = {
   },
 };
 
-export const getIncomingCallsTool: ToolDefinition = {
-  name: 'get_incoming_calls',
-  description:
-    'Find all functions/methods that call the function at a position. Requires prepare_call_hierarchy first.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file_path: {
-        type: 'string',
-        description: 'The path to the file',
+async function callHierarchyResult(
+  direction: 'incoming' | 'outgoing',
+  args: PositionArgs,
+  client: Parameters<ToolDefinition['handler']>[1]
+) {
+  const absolutePath = resolvePath(args.file_path);
+  const resolution = await resolveToolPosition(
+    absolutePath,
+    { query: args.query, line: args.line, character: args.character },
+    client
+  );
+  if (resolution.outcome !== 'resolved') {
+    return positionResolutionResult(resolution, args.file_path);
+  }
+  const items = await client.prepareCallHierarchy(absolutePath, resolution.position);
+  const resolved = resolvedFromText(resolution);
+  const resolvedFrom = resolvedFromMetadata(resolution);
+  if (items.length === 0) {
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `${resolved ? `${resolved}\n\n` : ''}No call hierarchy item found at ${args.file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}`,
+        },
+      ],
+      structuredContent: {
+        outcome: 'ok',
+        ...(resolvedFrom ? { resolvedFrom } : {}),
+        calls: [],
       },
-      line: {
-        type: 'number',
-        description: 'The line number (1-indexed)',
-      },
-      character: {
-        type: 'number',
-        description: 'The character position in the line (1-indexed)',
-      },
-    },
-    required: ['file_path', 'line', 'character'],
-  },
-  handler: async (args, client) => {
-    const { file_path, line, character } = args as {
-      file_path: string;
-      line: number;
-      character: number;
     };
-    const absolutePath = resolvePath(file_path);
-
-    try {
-      const items = await client.prepareCallHierarchy(absolutePath, {
-        line: line - 1,
-        character: character - 1,
-      });
-
-      if (items.length === 0) {
-        return textResult(`No call hierarchy item found at ${file_path}:${line}:${character}`);
-      }
-
-      const allCalls = [];
-      for (const item of items) {
-        const calls = await client.incomingCalls(item);
-        for (const call of calls) {
-          const filePath = uriToPath(call.from.uri);
-          const { start } = call.from.selectionRange;
-          allCalls.push(
-            `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${filePath}:${start.line + 1}:${start.character + 1}`
-          );
-        }
-      }
-
-      if (allCalls.length === 0) {
-        return textResult(
-          `No incoming calls found for the function at ${file_path}:${line}:${character}`
+  }
+  const lines: string[] = [];
+  for (const item of items) {
+    if (direction === 'incoming') {
+      for (const call of await client.incomingCalls(item)) {
+        const start = call.from.selectionRange.start;
+        lines.push(
+          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`
         );
       }
+    } else {
+      for (const call of await client.outgoingCalls(item)) {
+        const start = call.to.selectionRange.start;
+        lines.push(
+          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`
+        );
+      }
+    }
+  }
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text:
+          lines.length === 0
+            ? `${resolved ? `${resolved}\n\n` : ''}No ${direction} calls found`
+            : `${resolved ? `${resolved}\n\n` : ''}Found ${lines.length} ${direction} call(s):\n\n${lines.join('\n')}`,
+      },
+    ],
+    structuredContent: {
+      outcome: 'ok',
+      ...(resolvedFrom ? { resolvedFrom } : {}),
+      calls: lines,
+    },
+  };
+}
 
-      return textResult(`Found ${allCalls.length} incoming call(s):\n\n${allCalls.join('\n')}`);
+export const getIncomingCallsTool: ToolDefinition = {
+  name: 'get_incoming_calls',
+  description: 'Find incoming calls by symbol query or 1-indexed position.',
+  inputSchema: positionSchema,
+  handler: async (args, client) => {
+    try {
+      return await callHierarchyResult('incoming', args as PositionArgs, client);
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(
@@ -262,63 +286,11 @@ export const getIncomingCallsTool: ToolDefinition = {
 
 export const getOutgoingCallsTool: ToolDefinition = {
   name: 'get_outgoing_calls',
-  description:
-    'Find all functions/methods called by the function at a position. Requires prepare_call_hierarchy first.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file_path: {
-        type: 'string',
-        description: 'The path to the file',
-      },
-      line: {
-        type: 'number',
-        description: 'The line number (1-indexed)',
-      },
-      character: {
-        type: 'number',
-        description: 'The character position in the line (1-indexed)',
-      },
-    },
-    required: ['file_path', 'line', 'character'],
-  },
+  description: 'Find outgoing calls by symbol query or 1-indexed position.',
+  inputSchema: positionSchema,
   handler: async (args, client) => {
-    const { file_path, line, character } = args as {
-      file_path: string;
-      line: number;
-      character: number;
-    };
-    const absolutePath = resolvePath(file_path);
-
     try {
-      const items = await client.prepareCallHierarchy(absolutePath, {
-        line: line - 1,
-        character: character - 1,
-      });
-
-      if (items.length === 0) {
-        return textResult(`No call hierarchy item found at ${file_path}:${line}:${character}`);
-      }
-
-      const allCalls = [];
-      for (const item of items) {
-        const calls = await client.outgoingCalls(item);
-        for (const call of calls) {
-          const filePath = uriToPath(call.to.uri);
-          const { start } = call.to.selectionRange;
-          allCalls.push(
-            `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${filePath}:${start.line + 1}:${start.character + 1}`
-          );
-        }
-      }
-
-      if (allCalls.length === 0) {
-        return textResult(
-          `No outgoing calls found for the function at ${file_path}:${line}:${character}`
-        );
-      }
-
-      return textResult(`Found ${allCalls.length} outgoing call(s):\n\n${allCalls.join('\n')}`);
+      return await callHierarchyResult('outgoing', args as PositionArgs, client);
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(

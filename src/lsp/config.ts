@@ -2,6 +2,21 @@ import { existsSync, readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import type { Config } from './types.js';
 
+function validateConfig(config: Config): Config {
+  if (!config || !Array.isArray(config.servers)) {
+    throw new Error('Configuration must contain a servers array');
+  }
+  for (const [index, server] of config.servers.entries()) {
+    if (
+      server.maxOpenDocuments !== undefined &&
+      (!Number.isInteger(server.maxOpenDocuments) || server.maxOpenDocuments < 1)
+    ) {
+      throw new Error(`servers[${index}].maxOpenDocuments must be an integer >= 1`);
+    }
+  }
+  return config;
+}
+
 /**
  * Load configuration from CCLSP_CONFIG_PATH env var or the given configPath.
  * Throws on all error conditions instead of calling process.exit.
@@ -19,7 +34,7 @@ export function loadConfig(configPath?: string): Config {
 
     try {
       const configData = readFileSync(process.env.CCLSP_CONFIG_PATH, 'utf-8');
-      const config: Config = JSON.parse(configData);
+      const config = validateConfig(JSON.parse(configData) as Config);
       logger.info(`Loaded ${config.servers.length} server configurations from env\n`);
       return config;
     } catch (error) {
@@ -38,7 +53,7 @@ export function loadConfig(configPath?: string): Config {
   try {
     logger.info(`Loading config from file: ${configPath}\n`);
     const configData = readFileSync(configPath, 'utf-8');
-    const config: Config = JSON.parse(configData);
+    const config = validateConfig(JSON.parse(configData) as Config);
     logger.info(`Loaded ${config.servers.length} server configurations\n`);
     return config;
   } catch (error) {

@@ -43,6 +43,7 @@ function createMockDiagnosticsCache(initial?: Map<string, unknown[]>) {
 function createMockDocumentManager() {
   return {
     ensureOpen: jest.fn().mockResolvedValue(false),
+    acquire: jest.fn().mockResolvedValue({ justOpened: true, release: jest.fn() }),
     sendChange: jest.fn(),
     isOpen: jest.fn().mockReturnValue(false),
     getVersion: jest.fn().mockReturnValue(0),
@@ -1235,7 +1236,11 @@ describe('LSPClient', () => {
       const result = await client.workspaceSymbol('test');
 
       expect(result).toEqual(mockSymbols);
-      expect(mockDocumentManager.ensureOpen).toHaveBeenCalledWith(seedPath);
+      expect(mockDocumentManager.acquire).toHaveBeenCalledWith(seedPath);
+      const seedLease = await mockDocumentManager.acquire.mock.results[0]?.value;
+      expect(seedLease?.release).toHaveBeenCalledTimes(
+        mockDocumentManager.acquire.mock.calls.length
+      );
       expect(mockTransport.sendRequest).toHaveBeenCalledWith(
         'workspace/symbol',
         { query: 'test' },
@@ -1287,7 +1292,11 @@ describe('LSPClient', () => {
       const result = await client.workspaceSymbol('test');
 
       expect(result).toEqual([]);
-      expect(mockDocumentManager.ensureOpen).toHaveBeenCalledWith(seedPath);
+      expect(mockDocumentManager.acquire).toHaveBeenCalledWith(seedPath);
+      const seedLease = await mockDocumentManager.acquire.mock.results[0]?.value;
+      expect(seedLease?.release).toHaveBeenCalledTimes(
+        mockDocumentManager.acquire.mock.calls.length
+      );
     });
   });
 

@@ -132,6 +132,164 @@ describe('DocumentManager', () => {
   });
 });
 
+describe('DocumentManager bounded lifecycle', () => {
+  it('evicts and cleans up under Node 18 without Iterator Helpers', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-docmgr-lru-'));
+    const first = join(root, 'first.ts');
+    const second = join(root, 'second.ts');
+    const third = join(root, 'third.ts');
+    await Promise.all([
+      writeFile(first, 'first'),
+      writeFile(second, 'second'),
+      writeFile(third, 'third'),
+    ]);
+    const transport = createMockTransport();
+    const closed: string[] = [];
+    const manager = new DocumentManager(transport, 2, (filePath) => closed.push(filePath));
+    class Node18Map<K, V> extends Map<K, V> {
+      override entries(): MapIterator<[K, V]> {
+        const iterator = super.entries();
+        Object.defineProperty(iterator, 'find', { value: undefined });
+        return iterator;
+      }
+    }
+    const internals = manager as unknown as { documents: Map<string, unknown> };
+    internals.documents = new Node18Map(internals.documents);
+    try {
+      await manager.ensureOpen(first);
+      await manager.ensureOpen(second);
+      await manager.ensureOpen(first);
+      await manager.ensureOpen(third);
+      expect(manager.isOpen(first)).toBe(true);
+      expect(manager.isOpen(second)).toBe(false);
+      expect(manager.getVersion(second)).toBe(0);
+      expect(manager.getSyncSig(second)).toBeUndefined();
+      expect(closed).toEqual([second]);
+      expect(transport.sendNotification).toHaveBeenCalledWith('textDocument/didClose', {
+        textDocument: expect.objectContaining({ uri: expect.stringContaining('second.ts') }),
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves active documents and evicts after leases release', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-docmgr-active-'));
+    const first = join(root, 'first.ts');
+    const second = join(root, 'second.ts');
+    await Promise.all([writeFile(first, 'first'), writeFile(second, 'second')]);
+    const manager = new DocumentManager(createMockTransport(), 1);
+    try {
+      const firstLease = await manager.acquire(first);
+      const secondLease = await manager.acquire(second);
+      expect(manager.getOpenCount()).toBe(2);
+      expect(manager.isOpen(first)).toBe(true);
+      firstLease.release();
+      expect(manager.getOpenCount()).toBe(1);
+      expect(manager.isOpen(first)).toBe(false);
+      expect(manager.isOpen(second)).toBe(true);
+      secondLease.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes an exclusive lease against earlier and later document users', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-docmgr-exclusive-'));
+    const file = join(root, 'example.ts');
+    await writeFile(file, 'const value = target;\n');
+    const manager = new DocumentManager(createMockTransport());
+    try {
+      const shared = await manager.acquire(file);
+      let exclusiveAcquired = false;
+      const pendingExclusive = manager.acquire(file, true).then((lease) => {
+        exclusiveAcquired = true;
+        return lease;
+      });
+      await Promise.resolve();
+      expect(exclusiveAcquired).toBe(false);
+      shared.release();
+      const exclusive = await pendingExclusive;
+
+      let laterAcquired = false;
+      const pendingLater = manager.acquire(file).then((lease) => {
+        laterAcquired = true;
+        return lease;
+      });
+      await Promise.resolve();
+      expect(laterAcquired).toBe(false);
+      exclusive.release();
+      const later = await pendingLater;
+      expect(laterAcquired).toBe(true);
+      later.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes leases behind temporary content and rejects competing changes', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-docmgr-serialize-'));
+    const file = join(root, 'example.ts');
+    await writeFile(file, 'const value = target;\n');
+    const manager = new DocumentManager(createMockTransport());
+    try {
+      await manager.ensureOpen(file);
+      let finishTemporary: (() => void) | undefined;
+      const temporaryAction = manager.withTemporaryContent(
+        file,
+        'const value = target.;\n',
+        () =>
+          new Promise<void>((resolve) => {
+            finishTemporary = resolve;
+          })
+      );
+      await Promise.resolve();
+      expect(() => manager.sendChange(file, 'competing')).toThrow(
+        'Cannot change a document while temporary content is active'
+      );
+      let acquired = false;
+      const pendingLease = manager.acquire(file).then((lease) => {
+        acquired = true;
+        return lease;
+      });
+      await Promise.resolve();
+      expect(acquired).toBe(false);
+      finishTemporary?.();
+      await temporaryAction;
+      const lease = await pendingLease;
+      expect(acquired).toBe(true);
+      expect(manager.getText(file)).toBe('const value = target;\n');
+      lease.release();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('restores exact in-memory text and increments versions after success and failure', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-docmgr-temp-'));
+    const file = join(root, 'example.ts');
+    await writeFile(file, 'const value = target;\n');
+    const manager = new DocumentManager(createMockTransport());
+    try {
+      await manager.ensureOpen(file);
+      await manager.withTemporaryContent(file, 'const value = target.;\n', async () => {
+        expect(manager.getText(file)).toBe('const value = target.;\n');
+      });
+      expect(manager.getText(file)).toBe('const value = target;\n');
+      expect(manager.getVersion(file)).toBe(3);
+      await expect(
+        manager.withTemporaryContent(file, 'temporary', async () => {
+          throw new Error('request failed');
+        })
+      ).rejects.toThrow('request failed');
+      expect(manager.getText(file)).toBe('const value = target;\n');
+      expect(manager.getVersion(file)).toBe(5);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('getLanguageId', () => {
   it('maps TypeScript extensions', () => {
     expect(getLanguageId('file.ts')).toBe('typescript');

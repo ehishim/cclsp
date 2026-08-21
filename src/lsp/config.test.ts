@@ -63,6 +63,32 @@ describe('loadConfig', () => {
       expect(() => loadConfig(configFile)).toThrow('Failed to load config from');
     });
 
+    it('accepts a positive integer maxOpenDocuments', async () => {
+      process.env.CCLSP_CONFIG_PATH = '';
+      const configFile = join(testDir, 'bounded.json');
+      await writeFile(
+        configFile,
+        JSON.stringify({
+          servers: [{ ...validConfig.servers[0], maxOpenDocuments: 7 }],
+        })
+      );
+      expect(loadConfig(configFile).servers[0]?.maxOpenDocuments).toBe(7);
+    });
+
+    for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      it(`rejects invalid maxOpenDocuments ${String(invalid)}`, async () => {
+        process.env.CCLSP_CONFIG_PATH = '';
+        const configFile = join(testDir, `invalid-bound-${String(invalid)}.json`);
+        await writeFile(
+          configFile,
+          JSON.stringify({
+            servers: [{ ...validConfig.servers[0], maxOpenDocuments: invalid }],
+          })
+        );
+        expect(() => loadConfig(configFile)).toThrow('maxOpenDocuments must be an integer >= 1');
+      });
+    }
+
     it('throws when configPath is not provided and no env var', () => {
       process.env.CCLSP_CONFIG_PATH = '';
       expect(() => loadConfig()).toThrow(

@@ -206,28 +206,31 @@ export function findSymbolPositionInFile(filePath: string, symbol: SymbolInforma
  * Returns whether the file was opened for the first time; callers may briefly wait
  * for the server to index a freshly opened file.
  */
-async function ensureFreshDocument(
+async function withFreshDocument<T>(
   serverState: ServerState,
-  filePath: string
-): Promise<{ justOpened: boolean }> {
+  filePath: string,
+  action: (justOpened: boolean) => Promise<T>,
+  exclusive = false
+): Promise<T> {
   const dm = serverState.documentManager;
-  const snap = readAndSign(filePath);
-
-  if (dm.isOpen(filePath)) {
-    // File gone/unreadable (snap === null): leave the server's buffer as-is rather
-    // than crash — best-effort against a file deleted mid-request.
+  const lease =
+    typeof dm.acquire === 'function'
+      ? await dm.acquire(filePath, exclusive)
+      : { justOpened: await dm.ensureOpen(filePath), release: () => undefined };
+  try {
+    const snap = readAndSign(filePath);
     if (snap && dm.getSyncSig(filePath) !== snap.sig) {
-      logger.debug(`[DEBUG ensureFreshDocument] ${filePath} changed on disk, re-syncing\n`);
-      dm.sendChange(filePath, snap.content);
+      if (!lease.justOpened) {
+        logger.debug(`[DEBUG withFreshDocument] ${filePath} changed on disk, re-syncing\n`);
+        dm.sendChange(filePath, snap.content);
+        serverState.diagnosticsCache.delete(pathToUri(filePath));
+      }
       dm.setSyncSig(filePath, snap.sig);
-      serverState.diagnosticsCache.delete(pathToUri(filePath));
     }
-    return { justOpened: false };
+    return await action(lease.justOpened);
+  } finally {
+    lease.release();
   }
-
-  const justOpened = await dm.ensureOpen(filePath);
-  if (snap) dm.setSyncSig(filePath, snap.sig);
-  return { justOpened };
 }
 
 export async function findDefinition(
@@ -242,25 +245,26 @@ export async function findDefinition(
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/definition');
 
-  const { justOpened } = await ensureFreshDocument(serverState, filePath);
-  if (justOpened) {
-    logger.debug(
-      '[DEBUG findDefinition] File was just opened, waiting for server to index project...\n'
-    );
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
+  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
+    if (justOpened) {
+      logger.debug(
+        '[DEBUG findDefinition] File was just opened, waiting for server to index project...\n'
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
 
-  logger.debug('[DEBUG findDefinition] Sending textDocument/definition request\n');
-  const method = 'textDocument/definition';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-    },
-    timeout
-  );
+    logger.debug('[DEBUG findDefinition] Sending textDocument/definition request\n');
+    const method = 'textDocument/definition';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      {
+        textDocument: { uri: pathToUri(filePath) },
+        position,
+      },
+      timeout
+    );
+  });
 
   logger.debug(
     `[DEBUG findDefinition] Result type: ${typeof result}, isArray: ${Array.isArray(result)}\n`
@@ -303,25 +307,26 @@ export async function findReferences(
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/references');
 
-  const { justOpened } = await ensureFreshDocument(serverState, filePath);
-  if (justOpened) {
-    logger.debug(
-      '[DEBUG findReferences] File was just opened, waiting for server to index project...\n'
-    );
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
+  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
+    if (justOpened) {
+      logger.debug(
+        '[DEBUG findReferences] File was just opened, waiting for server to index project...\n'
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
 
-  const method = 'textDocument/references';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-      context: { includeDeclaration },
-    },
-    timeout
-  );
+    const method = 'textDocument/references';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      {
+        textDocument: { uri: pathToUri(filePath) },
+        position,
+        context: { includeDeclaration },
+      },
+      timeout
+    );
+  });
 
   logger.debug(
     `[DEBUG] findReferences result type: ${typeof result}, isArray: ${Array.isArray(result)}, length: ${Array.isArray(result) ? result.length : 'N/A'}\n`
@@ -361,45 +366,46 @@ export async function renameSymbol(
   requireMethodSupport(serverState, 'textDocument/rename');
   requirePrepareRenameSupport(serverState);
 
-  const { justOpened } = await ensureFreshDocument(serverState, filePath);
-  if (justOpened) {
-    logger.debug(
-      '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
-    );
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
+  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
+    if (justOpened) {
+      logger.debug(
+        '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
+      );
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
 
-  const prepareMethod = 'textDocument/prepareRename';
-  const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
-  let prepared: unknown;
-  try {
-    prepared = await serverState.transport.sendRequest(
-      prepareMethod,
+    const prepareMethod = 'textDocument/prepareRename';
+    const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
+    let prepared: unknown;
+    try {
+      prepared = await serverState.transport.sendRequest(
+        prepareMethod,
+        {
+          textDocument: { uri: pathToUri(filePath) },
+          position,
+        },
+        prepareTimeout
+      );
+    } catch (error) {
+      rejectRename(serverState, error instanceof Error ? error.message : String(error));
+    }
+    if (!prepared) {
+      rejectRename(serverState, 'the language server declined this position');
+    }
+
+    logger.debug('[DEBUG renameSymbol] Sending textDocument/rename request\n');
+    const method = 'textDocument/rename';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
       {
         textDocument: { uri: pathToUri(filePath) },
         position,
+        newName,
       },
-      prepareTimeout
+      timeout
     );
-  } catch (error) {
-    rejectRename(serverState, error instanceof Error ? error.message : String(error));
-  }
-  if (!prepared) {
-    rejectRename(serverState, 'the language server declined this position');
-  }
-
-  logger.debug('[DEBUG renameSymbol] Sending textDocument/rename request\n');
-  const method = 'textDocument/rename';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-      newName,
-    },
-    timeout
-  );
+  });
 
   logger.debug(
     `[DEBUG renameSymbol] Result type: ${typeof result}, hasChanges: ${result && typeof result === 'object' && 'changes' in result}, hasDocumentChanges: ${result && typeof result === 'object' && 'documentChanges' in result}\n`
@@ -465,6 +471,8 @@ export interface CompletionItemResult {
   detail?: string;
   documentation?: string | { kind?: string; value: string };
   insertText?: string;
+  sortText?: string;
+  data?: unknown;
 }
 
 export interface CompletionResult {
@@ -476,25 +484,80 @@ export async function getCompletions(
   serverState: ServerState,
   filePath: string,
   position: Position,
-  triggerCharacter?: string
-): Promise<CompletionResult> {
+  triggerCharacter?: string,
+  syntheticTrigger = false
+): Promise<CompletionResult & { syntheticTrigger: boolean }> {
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/completion');
-  await ensureFreshDocument(serverState, filePath);
-  const method = 'textDocument/completion';
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-      ...(triggerCharacter
-        ? { context: { triggerKind: 2, triggerCharacter } }
-        : { context: { triggerKind: 1 } }),
+  return withFreshDocument(
+    serverState,
+    filePath,
+    async () => {
+      const method = 'textDocument/completion';
+      const request = async (requestPosition: Position, synthetic: boolean) => {
+        const result = await serverState.transport.sendRequest(
+          method,
+          {
+            textDocument: { uri: pathToUri(filePath) },
+            position: requestPosition,
+            ...(synthetic || triggerCharacter
+              ? {
+                  context: {
+                    triggerKind: 2,
+                    triggerCharacter: synthetic ? '.' : triggerCharacter,
+                  },
+                }
+              : { context: { triggerKind: 1 } }),
+          },
+          serverState.adapter?.getTimeout?.(method) ?? 30000
+        );
+        return normalizeCompletionResult(result, synthetic);
+      };
+
+      if (!syntheticTrigger) return request(position, false);
+      const originalText = serverState.documentManager.getText(filePath);
+      const insertion = originalText ? syntheticDotInsertion(originalText, position) : null;
+      if (!originalText || !insertion) return request(position, false);
+      const temporaryText = insertTextAt(originalText, insertion, '.');
+      return serverState.documentManager.withTemporaryContent(filePath, temporaryText, () =>
+        request({ line: insertion.line, character: insertion.character + 1 }, true)
+      );
     },
-    serverState.adapter?.getTimeout?.(method) ?? 30000
+    syntheticTrigger
   );
+}
+
+export async function resolveCompletionItem(
+  serverState: ServerState,
+  item: CompletionItemResult,
+  timeout = 2000
+): Promise<CompletionItemResult> {
+  if (!supportsMethod(serverState, 'completionItem/resolve')) return item;
+  const method = 'completionItem/resolve';
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const resolved = await Promise.race([
+      serverState.transport.sendRequest(method, item, timeout),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('completion item resolve timeout')), timeout);
+      }),
+    ]);
+    return resolved && typeof resolved === 'object'
+      ? { ...item, ...(resolved as CompletionItemResult) }
+      : item;
+  } catch {
+    return item;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function normalizeCompletionResult(
+  result: unknown,
+  syntheticTrigger: boolean
+): CompletionResult & { syntheticTrigger: boolean } {
   if (Array.isArray(result)) {
-    return { items: result as CompletionItemResult[], isIncomplete: false };
+    return { items: result as CompletionItemResult[], isIncomplete: false, syntheticTrigger };
   }
   if (
     result &&
@@ -502,9 +565,34 @@ export async function getCompletions(
     Array.isArray((result as { items?: unknown }).items)
   ) {
     const list = result as { items: CompletionItemResult[]; isIncomplete?: boolean };
-    return { items: list.items, isIncomplete: list.isIncomplete === true };
+    return {
+      items: list.items,
+      isIncomplete: list.isIncomplete === true,
+      syntheticTrigger,
+    };
   }
-  return { items: [], isIncomplete: false };
+  return { items: [], isIncomplete: false, syntheticTrigger };
+}
+
+function syntheticDotInsertion(content: string, position: Position): Position | null {
+  const lines = content.split('\n');
+  const line = lines[position.line];
+  if (line === undefined || position.character < 0 || position.character > line.length) return null;
+  let character = position.character;
+  if (character < line.length && /[\w$]/.test(line[character] ?? '')) {
+    while (character < line.length && /[\w$]/.test(line[character] ?? '')) character++;
+  }
+  if (line[character] === '.') return null;
+  const previous = character > 0 ? line[character - 1] : '';
+  return /[\w$)\]]/.test(previous ?? '') ? { line: position.line, character } : null;
+}
+
+function insertTextAt(content: string, position: Position, inserted: string): string {
+  const lines = content.split('\n');
+  const line = lines[position.line] ?? '';
+  lines[position.line] =
+    `${line.slice(0, position.character)}${inserted}${line.slice(position.character)}`;
+  return lines.join('\n');
 }
 
 export interface SignatureHelpResult {
@@ -529,19 +617,20 @@ export async function getSignatureHelp(
 ): Promise<SignatureHelpResult | null> {
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/signatureHelp');
-  await ensureFreshDocument(serverState, filePath);
-  const method = 'textDocument/signatureHelp';
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-      ...(triggerCharacter
-        ? { context: { triggerKind: 2, triggerCharacter, isRetrigger: false } }
-        : {}),
-    },
-    serverState.adapter?.getTimeout?.(method) ?? 30000
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/signatureHelp';
+    return serverState.transport.sendRequest(
+      method,
+      {
+        textDocument: { uri: pathToUri(filePath) },
+        position,
+        ...(triggerCharacter
+          ? { context: { triggerKind: 2, triggerCharacter, isRetrigger: false } }
+          : {}),
+      },
+      serverState.adapter?.getTimeout?.(method) ?? 30000
+    );
+  });
   if (
     result &&
     typeof result === 'object' &&
@@ -579,17 +668,18 @@ export async function getCodeActions(
 ): Promise<CodeActionResult[]> {
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/codeAction');
-  await ensureFreshDocument(serverState, filePath);
-  const method = 'textDocument/codeAction';
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      range,
-      context: { diagnostics: [] },
-    },
-    serverState.adapter?.getTimeout?.(method) ?? 30000
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/codeAction';
+    return serverState.transport.sendRequest(
+      method,
+      {
+        textDocument: { uri: pathToUri(filePath) },
+        range,
+        context: { diagnostics: [] },
+      },
+      serverState.adapter?.getTimeout?.(method) ?? 30000
+    );
+  });
   return Array.isArray(result) ? (result as CodeActionResult[]) : [];
 }
 
@@ -669,18 +759,15 @@ export async function getDocumentSymbols(
 
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/documentSymbol');
-  await ensureFreshDocument(serverState, filePath);
-
-  const method = 'textDocument/documentSymbol';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-    },
-    timeout
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/documentSymbol';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      { textDocument: { uri: pathToUri(filePath) } },
+      timeout
+    );
+  });
 
   logger.debug(
     `[DEBUG] documentSymbol result type: ${typeof result}, isArray: ${Array.isArray(result)}, length: ${Array.isArray(result) ? result.length : 'N/A'}\n`
@@ -910,74 +997,80 @@ export async function getDiagnostics(
 
   const fileUri = pathToUri(filePath);
   const dm = serverState.documentManager;
-  const cache = serverState.diagnosticsCache;
-  const snap = readAndSign(filePath);
-  const method = 'textDocument/diagnostic';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+  const lease = await dm.acquire(filePath);
+  try {
+    const cache = serverState.diagnosticsCache;
+    const snap = readAndSign(filePath);
+    const method = 'textDocument/diagnostic';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
 
-  if (dm.isOpen(filePath)) {
+    if (!lease.justOpened) {
+      const cached = cache.get(fileUri);
+      if (snap && dm.getSyncSig(filePath) === snap.sig && cached !== undefined) {
+        // Fast path: file unchanged on disk since we last synced it and we already
+        // have diagnostics for it. No re-sync, no round-trip.
+        logger.debug(
+          `[DEBUG getDiagnostics] Fast path: ${cached.length} cached diagnostics (file unchanged)\n`
+        );
+        return cached;
+      }
+      if (snap && dm.getSyncSig(filePath) !== snap.sig) {
+        // File was edited externally (e.g. Claude Code's Edit tool): push the new
+        // content and drop stale diagnostics.
+        logger.debug('[DEBUG getDiagnostics] File changed on disk, re-syncing\n');
+        dm.sendChange(filePath, snap.content);
+        dm.setSyncSig(filePath, snap.sig);
+        cache.delete(fileUri);
+      }
+    } else if (snap) {
+      dm.setSyncSig(filePath, snap.sig);
+    }
+
+    // Prefer pull diagnostics.
+    const pulled = await pullDiagnostics(serverState, fileUri, timeout);
+    if (pulled !== null) {
+      cache.update(fileUri, pulled);
+      logger.debug(`[DEBUG getDiagnostics] Pull returned ${pulled.length} diagnostics\n`);
+      return pulled;
+    }
+
+    // Push-model fallback: the server doesn't support pull diagnostics.
     const cached = cache.get(fileUri);
-    if (snap && dm.getSyncSig(filePath) === snap.sig && cached !== undefined) {
-      // Fast path: file unchanged on disk since we last synced it and we already
-      // have diagnostics for it. No re-sync, no round-trip.
+    if (cached !== undefined) {
       logger.debug(
-        `[DEBUG getDiagnostics] Fast path: ${cached.length} cached diagnostics (file unchanged)\n`
+        `[DEBUG getDiagnostics] Returning ${cached.length} cached diagnostics from publishDiagnostics\n`
       );
       return cached;
     }
-    if (snap && dm.getSyncSig(filePath) !== snap.sig) {
-      // File was edited externally (e.g. Claude Code's Edit tool): push the new
-      // content and drop stale diagnostics.
-      logger.debug('[DEBUG getDiagnostics] File changed on disk, re-syncing\n');
-      dm.sendChange(filePath, snap.content);
-      dm.setSyncSig(filePath, snap.sig);
-      cache.delete(fileUri);
-    }
-  } else {
-    await dm.ensureOpen(filePath);
-    if (snap) dm.setSyncSig(filePath, snap.sig);
-  }
-
-  // Prefer pull diagnostics.
-  const pulled = await pullDiagnostics(serverState, fileUri, timeout);
-  if (pulled !== null) {
-    cache.update(fileUri, pulled);
-    logger.debug(`[DEBUG getDiagnostics] Pull returned ${pulled.length} diagnostics\n`);
-    return pulled;
-  }
-
-  // Push-model fallback: the server doesn't support pull diagnostics.
-  const cached = cache.get(fileUri);
-  if (cached !== undefined) {
-    logger.debug(
-      `[DEBUG getDiagnostics] Returning ${cached.length} cached diagnostics from publishDiagnostics\n`
-    );
-    return cached;
-  }
-
-  await cache.waitForIdle(fileUri, { maxWaitTime: 8000, idleTime: 200 });
-  const afterWait = cache.get(fileUri);
-  if (afterWait !== undefined) {
-    return afterWait;
-  }
-
-  // Last resort: nudge the server with a no-op change to trigger publishDiagnostics.
-  logger.debug('[DEBUG getDiagnostics] No diagnostics yet, triggering with no-op change\n');
-  try {
-    const fileContent = readFileSync(filePath, 'utf-8');
-    dm.sendChange(filePath, `${fileContent} `);
-    dm.sendChange(filePath, fileContent);
 
     await cache.waitForIdle(fileUri, { maxWaitTime: 8000, idleTime: 200 });
-    const afterTrigger = cache.get(fileUri);
-    if (afterTrigger !== undefined) {
-      return afterTrigger;
+    const afterWait = cache.get(fileUri);
+    if (afterWait !== undefined) {
+      return afterWait;
     }
-  } catch (triggerError) {
-    logger.debug(`[DEBUG getDiagnostics] Failed to trigger publishDiagnostics: ${triggerError}\n`);
-  }
 
-  return [];
+    // Last resort: nudge the server with a no-op change to trigger publishDiagnostics.
+    logger.debug('[DEBUG getDiagnostics] No diagnostics yet, triggering with no-op change\n');
+    try {
+      const fileContent = readFileSync(filePath, 'utf-8');
+      dm.sendChange(filePath, `${fileContent} `);
+      dm.sendChange(filePath, fileContent);
+
+      await cache.waitForIdle(fileUri, { maxWaitTime: 8000, idleTime: 200 });
+      const afterTrigger = cache.get(fileUri);
+      if (afterTrigger !== undefined) {
+        return afterTrigger;
+      }
+    } catch (triggerError) {
+      logger.debug(
+        `[DEBUG getDiagnostics] Failed to trigger publishDiagnostics: ${triggerError}\n`
+      );
+    }
+
+    return [];
+  } finally {
+    lease.release();
+  }
 }
 
 export interface BatchDiagnosticResult {
@@ -996,75 +1089,85 @@ export async function getDiagnosticsBatch(
   await serverState.initializationPromise;
 
   const dm = serverState.documentManager;
-  const cache = serverState.diagnosticsCache;
-  const method = 'textDocument/diagnostic';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+  const leases: Array<{ release(): void }> = [];
+  const justOpenedFiles = new Set<string>();
+  try {
+    for (const filePath of filePaths) {
+      const lease = await dm.acquire(filePath);
+      leases.push(lease);
+      if (lease.justOpened) justOpenedFiles.add(filePath);
+    }
+    const cache = serverState.diagnosticsCache;
+    const method = 'textDocument/diagnostic';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
 
-  const entries = filePaths.map((filePath) => ({ filePath, fileUri: pathToUri(filePath) }));
+    const entries = filePaths.map((filePath) => ({ filePath, fileUri: pathToUri(filePath) }));
 
-  // Phase 1: Open/re-sync only what changed. Files that are unchanged since the
-  // last sync and already have diagnostics are reused straight from the cache.
-  const toAnalyze: Array<{ filePath: string; fileUri: string }> = [];
-  for (const e of entries) {
-    const snap = readAndSign(e.filePath);
-    if (dm.isOpen(e.filePath)) {
-      if (snap && dm.getSyncSig(e.filePath) !== snap.sig) {
-        dm.sendChange(e.filePath, snap.content);
-        dm.setSyncSig(e.filePath, snap.sig);
-        cache.delete(e.fileUri);
-        toAnalyze.push(e);
-      } else if (cache.get(e.fileUri) === undefined) {
+    // Phase 1: Open/re-sync only what changed. Files that are unchanged since the
+    // last sync and already have diagnostics are reused straight from the cache.
+    const toAnalyze: Array<{ filePath: string; fileUri: string }> = [];
+    for (const e of entries) {
+      const snap = readAndSign(e.filePath);
+      if (!justOpenedFiles.has(e.filePath)) {
+        if (snap && dm.getSyncSig(e.filePath) !== snap.sig) {
+          dm.sendChange(e.filePath, snap.content);
+          dm.setSyncSig(e.filePath, snap.sig);
+          cache.delete(e.fileUri);
+          toAnalyze.push(e);
+        } else if (cache.get(e.fileUri) === undefined) {
+          toAnalyze.push(e);
+        }
+        // else: unchanged and already cached -> reuse.
+      } else {
+        if (snap) dm.setSyncSig(e.filePath, snap.sig);
         toAnalyze.push(e);
       }
-      // else: unchanged and already cached -> reuse.
-    } else {
-      await dm.ensureOpen(e.filePath);
-      if (snap) dm.setSyncSig(e.filePath, snap.sig);
-      toAnalyze.push(e);
     }
-  }
 
-  // Phase 2: Get diagnostics for the files that need (re)analysis. Probe pull
-  // support on the first file (serial); if it's supported, fan the rest out
-  // concurrently (pull returns as soon as each file is computed). If the server
-  // doesn't support pull, skip the fan-out entirely and use the push model — a
-  // single batch idle wait — instead of firing N requests that would all fail.
-  if (toAnalyze.length > 0) {
-    const [probe, ...rest] = toAnalyze;
-    const probed = probe ? await pullDiagnostics(serverState, probe.fileUri, timeout) : null;
+    // Phase 2: Get diagnostics for the files that need (re)analysis. Probe pull
+    // support on the first file (serial); if it's supported, fan the rest out
+    // concurrently (pull returns as soon as each file is computed). If the server
+    // doesn't support pull, skip the fan-out entirely and use the push model — a
+    // single batch idle wait — instead of firing N requests that would all fail.
+    if (toAnalyze.length > 0) {
+      const [probe, ...rest] = toAnalyze;
+      const probed = probe ? await pullDiagnostics(serverState, probe.fileUri, timeout) : null;
 
-    if (probe && probed === null) {
-      logger.debug(
-        '[DEBUG getDiagnosticsBatch] Pull unsupported, waiting for publishDiagnostics\n'
-      );
-      await cache.waitForAllIdle(
-        toAnalyze.map((e) => e.fileUri),
-        { maxWaitTime: 15000, idleTime: 300 }
-      );
-    } else {
-      if (probe && probed) cache.update(probe.fileUri, probed);
-      await Promise.all(
-        rest.map(async (e) => {
-          const pulled = await pullDiagnostics(serverState, e.fileUri, timeout);
-          if (pulled !== null) cache.update(e.fileUri, pulled);
-        })
-      );
+      if (probe && probed === null) {
+        logger.debug(
+          '[DEBUG getDiagnosticsBatch] Pull unsupported, waiting for publishDiagnostics\n'
+        );
+        await cache.waitForAllIdle(
+          toAnalyze.map((e) => e.fileUri),
+          { maxWaitTime: 15000, idleTime: 300 }
+        );
+      } else {
+        if (probe && probed) cache.update(probe.fileUri, probed);
+        await Promise.all(
+          rest.map(async (e) => {
+            const pulled = await pullDiagnostics(serverState, e.fileUri, timeout);
+            if (pulled !== null) cache.update(e.fileUri, pulled);
+          })
+        );
+      }
     }
+
+    // Phase 3: Collect results
+    const results: BatchDiagnosticResult[] = entries.map((e) => ({
+      filePath: e.filePath,
+      diagnostics: cache.get(e.fileUri) ?? [],
+    }));
+
+    const totalDiags = results.reduce((sum, r) => sum + r.diagnostics.length, 0);
+    const filesWithDiags = results.filter((r) => r.diagnostics.length > 0).length;
+    logger.debug(
+      `[DEBUG getDiagnosticsBatch] Found ${totalDiags} diagnostics across ${filesWithDiags}/${filePaths.length} files\n`
+    );
+
+    return results;
+  } finally {
+    for (const lease of leases) lease.release();
   }
-
-  // Phase 3: Collect results
-  const results: BatchDiagnosticResult[] = entries.map((e) => ({
-    filePath: e.filePath,
-    diagnostics: cache.get(e.fileUri) ?? [],
-  }));
-
-  const totalDiags = results.reduce((sum, r) => sum + r.diagnostics.length, 0);
-  const filesWithDiags = results.filter((r) => r.diagnostics.length > 0).length;
-  logger.debug(
-    `[DEBUG getDiagnosticsBatch] Found ${totalDiags} diagnostics across ${filesWithDiags}/${filePaths.length} files\n`
-  );
-
-  return results;
 }
 
 export async function hover(
@@ -1081,18 +1184,15 @@ export async function hover(
 
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/hover');
-  await ensureFreshDocument(serverState, filePath);
-
-  const method = 'textDocument/hover';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-    },
-    timeout
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/hover';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      { textDocument: { uri: pathToUri(filePath) }, position },
+      timeout
+    );
+  });
 
   if (result && typeof result === 'object' && 'contents' in result) {
     return result as {
@@ -1135,18 +1235,15 @@ export async function findImplementation(
 
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/implementation');
-  await ensureFreshDocument(serverState, filePath);
-
-  const method = 'textDocument/implementation';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-    },
-    timeout
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/implementation';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      { textDocument: { uri: pathToUri(filePath) }, position },
+      timeout
+    );
+  });
 
   if (Array.isArray(result)) {
     return result.map((loc: LSPLocation) => ({
@@ -1173,18 +1270,15 @@ export async function prepareCallHierarchy(
 
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/prepareCallHierarchy');
-  await ensureFreshDocument(serverState, filePath);
-
-  const method = 'textDocument/prepareCallHierarchy';
-  const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      textDocument: { uri: pathToUri(filePath) },
-      position,
-    },
-    timeout
-  );
+  const result = await withFreshDocument(serverState, filePath, async () => {
+    const method = 'textDocument/prepareCallHierarchy';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      { textDocument: { uri: pathToUri(filePath) }, position },
+      timeout
+    );
+  });
 
   if (Array.isArray(result)) {
     return result as CallHierarchyItem[];

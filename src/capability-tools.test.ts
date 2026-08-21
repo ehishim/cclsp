@@ -72,7 +72,137 @@ describe('capability tool contracts', () => {
       items: [{ label: 'alpha' }],
       isIncomplete: true,
       truncated: true,
+      resolvedCount: 0,
     });
+  });
+
+  it('orders completions deterministically and resolves only the bounded displayed head', async () => {
+    const resolveCompletionItem = jest.fn((_: string, item: { label: string }) =>
+      Promise.resolve({ ...item, documentation: `Docs for ${item.label}` })
+    );
+    const client = asClient({
+      getCompletions: jest.fn().mockResolvedValue({
+        items: [
+          { label: 'zeta', sortText: '2' },
+          { label: 'beta', sortText: '1' },
+          { label: 'alpha', sortText: '1' },
+        ],
+        isIncomplete: false,
+        syntheticTrigger: false,
+      }),
+      supportsCompletionResolve: jest.fn().mockResolvedValue(true),
+      resolveCompletionItem,
+    });
+    const result = await getCompletionsTool.handler(
+      {
+        file_path: 'example.ts',
+        line: 1,
+        character: 1,
+        limit: 2,
+        resolve_limit: 20,
+      },
+      client
+    );
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'ok',
+      items: [
+        { label: 'alpha', documentation: 'Docs for alpha' },
+        { label: 'beta', documentation: 'Docs for beta' },
+      ],
+      resolvedCount: 2,
+      truncated: true,
+    });
+    expect(resolveCompletionItem.mock.calls.map((call) => call[1].label)).toEqual([
+      'alpha',
+      'beta',
+    ]);
+  });
+
+  it('caps completion resolve fan-out at twenty items', async () => {
+    const resolveCompletionItem = jest.fn((_: string, item: unknown) => Promise.resolve(item));
+    const client = asClient({
+      getCompletions: jest.fn().mockResolvedValue({
+        items: Array.from({ length: 25 }, (_, index) => ({
+          label: `item-${String(index).padStart(2, '0')}`,
+        })),
+        isIncomplete: false,
+        syntheticTrigger: false,
+      }),
+      supportsCompletionResolve: jest.fn().mockResolvedValue(true),
+      resolveCompletionItem,
+    });
+    const result = await getCompletionsTool.handler(
+      {
+        file_path: 'example.ts',
+        line: 1,
+        character: 1,
+        limit: 25,
+        resolve_limit: 100,
+      },
+      client
+    );
+    expect(result.structuredContent).toMatchObject({ resolvedCount: 20 });
+    expect(resolveCompletionItem).toHaveBeenCalledTimes(20);
+  });
+
+  it('ranks actions and bounds concrete edit previews', async () => {
+    const edits = Array.from({ length: 7 }, (_, index) => ({
+      range: {
+        start: { line: index, character: 0 },
+        end: { line: index, character: 1 },
+      },
+      newText: `replacement-${index}`,
+    }));
+    const client = asClient({
+      getCodeActions: jest.fn().mockResolvedValue([
+        { title: 'Source', kind: 'source.organizeImports' },
+        { title: 'Refactor', kind: 'refactor.extract' },
+        { title: 'Quick fix', kind: 'quickfix', edit: { changes: { 'file:///a.ts': edits } } },
+        { title: 'Preferred other', kind: 'custom', isPreferred: true },
+      ]),
+    });
+    const result = await getCodeActionsTool.handler(
+      {
+        file_path: 'example.ts',
+        start_line: 1,
+        start_character: 1,
+        end_line: 1,
+        end_character: 1,
+      },
+      client
+    );
+    const actions = (result.structuredContent as { actions: Array<Record<string, unknown>> })
+      .actions;
+    expect(actions.map((action) => action.title)).toEqual([
+      'Preferred other',
+      'Quick fix',
+      'Refactor',
+      'Source',
+    ]);
+    expect(actions[1]?.preview).toHaveLength(6);
+    expect(actions[1]?.preview).toEqual([
+      ...edits.slice(0, 5).map((edit) => ({
+        uri: 'file:///a.ts',
+        range: edit.range,
+        newText: edit.newText,
+      })),
+      { omittedEdits: 2 },
+    ]);
+  });
+
+  it('rejects a partial code-action end range before document-symbol or action requests', async () => {
+    const getDocumentSymbols = jest.fn();
+    const getCodeActions = jest.fn();
+    const result = await getCodeActionsTool.handler(
+      { file_path: 'example.ts', query: 'run', end_line: 2 },
+      asClient({ getDocumentSymbols, getCodeActions })
+    );
+    expect(result).toMatchObject({
+      isError: true,
+      structuredContent: { code: 'LSP_POSITION_INVALID' },
+    });
+    expect(getDocumentSymbols).not.toHaveBeenCalled();
+    expect(getCodeActions).not.toHaveBeenCalled();
   });
 
   it('previews and applies only a selected code action WorkspaceEdit', async () => {

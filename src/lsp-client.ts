@@ -4,6 +4,7 @@ import { readdir, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, normalize, relative } from 'node:path';
 import { loadGitignore, scanDirectoryForExtensions } from './file-scanner.js';
 import { logger } from './logger.js';
+import { supportsMethod } from './lsp/capabilities.js';
 import { loadConfig } from './lsp/config.js';
 import {
   getValidSymbolKinds,
@@ -24,6 +25,7 @@ import {
   prepareCallHierarchy as opsPrepareCallHierarchy,
   renameSymbol as opsRenameSymbol,
   resolveCodeAction as opsResolveCodeAction,
+  resolveCompletionItem as opsResolveCompletionItem,
   willRenameFiles as opsWillRenameFiles,
   workspaceSymbol as opsWorkspaceSymbol,
   symbolKindToString,
@@ -31,6 +33,7 @@ import {
 import type {
   BatchDiagnosticResult,
   CodeActionResult,
+  CompletionItemResult,
   CompletionResult,
   SignatureHelpResult,
   WorkspaceEditResult,
@@ -215,18 +218,15 @@ export class LSPClient {
     try {
       const serverState = await this.getServer(filePath);
 
-      // If file is not already open in the LSP server, open it first
-      if (!serverState.documentManager.isOpen(filePath)) {
-        logger.debug(`[syncFileContent] File not open, opening it first: ${filePath}\n`);
-        await serverState.documentManager.ensureOpen(filePath);
+      const lease = await serverState.documentManager.acquire(filePath);
+      try {
+        logger.debug(`[syncFileContent] Syncing file: ${filePath}\n`);
+        const fileContent = readFileSync(filePath, 'utf-8');
+        serverState.documentManager.sendChange(filePath, fileContent);
+        logger.debug(`[syncFileContent] File synced: ${filePath}\n`);
+      } finally {
+        lease.release();
       }
-
-      logger.debug(`[syncFileContent] Syncing file: ${filePath}\n`);
-
-      const fileContent = readFileSync(filePath, 'utf-8');
-      serverState.documentManager.sendChange(filePath, fileContent);
-
-      logger.debug(`[syncFileContent] File synced: ${filePath}\n`);
     } catch (error) {
       logger.error(`[syncFileContent] Failed to sync file ${filePath}: ${error}\n`);
       // Don't throw - syncing is best effort
@@ -296,10 +296,26 @@ export class LSPClient {
   async getCompletions(
     filePath: string,
     position: Position,
-    triggerCharacter?: string
-  ): Promise<CompletionResult> {
+    triggerCharacter?: string,
+    syntheticTrigger = false
+  ): Promise<CompletionResult & { syntheticTrigger: boolean }> {
     const serverState = await this.getServer(filePath);
-    return opsGetCompletions(serverState, filePath, position, triggerCharacter);
+    return opsGetCompletions(serverState, filePath, position, triggerCharacter, syntheticTrigger);
+  }
+
+  async supportsCompletionResolve(filePath: string): Promise<boolean> {
+    const serverState = await this.getServer(filePath);
+    await serverState.initializationPromise;
+    return supportsMethod(serverState, 'completionItem/resolve');
+  }
+
+  async resolveCompletionItem(
+    filePath: string,
+    item: CompletionItemResult,
+    timeout = 2000
+  ): Promise<CompletionItemResult> {
+    const serverState = await this.getServer(filePath);
+    return opsResolveCompletionItem(serverState, item, timeout);
   }
 
   async getSignatureHelp(
@@ -440,18 +456,23 @@ export class LSPClient {
       // first workspace-symbol call to time out.
       const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
 
-      if (seedFiles.length > 0) {
+      const seedLeases = (
         await Promise.all(
           seedFiles.map((seedFile) =>
-            serverState.documentManager.ensureOpen(seedFile).catch((error) => {
+            serverState.documentManager.acquire(seedFile).catch((error) => {
               logger.debug(`[workspaceSymbol] Failed to open seed ${seedFile}: ${error}\n`);
-              return false;
+              return undefined;
             })
           )
-        );
-      }
+        )
+      ).filter((lease) => lease !== undefined);
 
-      const confirmed = await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+      let confirmed: boolean;
+      try {
+        confirmed = await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+      } finally {
+        for (const lease of seedLeases) lease.release();
+      }
 
       // Only treat the server as permanently primed when readiness was confirmed.
       // An indexing server whose index didn't finish in the budget is left unprimed
