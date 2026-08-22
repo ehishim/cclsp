@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto';
 import {
   copyFileSync,
   existsSync,
@@ -9,6 +10,9 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { lstat, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { dirname } from 'node:path';
+import type { PreparedRewrite, RewriteRollback } from './ast/types.js';
 import { logger } from './logger.js';
 import type { LSPClient } from './lsp-client.js';
 import { uriToPath } from './utils.js';
@@ -30,6 +34,206 @@ export interface ApplyEditResult {
   filesModified: string[];
   backupFiles: string[];
   error?: string;
+}
+
+export type AtomicRewriteStage =
+  | 'before-preflight'
+  | 'before-temp-write'
+  | 'before-rename'
+  | 'before-forward-sync'
+  | 'before-forward-invalidate'
+  | 'before-rollback-write'
+  | 'before-rollback-sync'
+  | 'before-rollback-invalidate';
+
+export interface AtomicRewriteHooks {
+  synchronize(files: Array<{ path: string; content: string }>): Promise<void>;
+  invalidate(paths: string[]): Promise<void>;
+  inject?(stage: AtomicRewriteStage, file?: string, index?: number): void | Promise<void>;
+}
+
+export interface AtomicRewriteResult {
+  success: boolean;
+  filesModified: string[];
+  rollback: RewriteRollback;
+  code?: 'AST_REWRITE_STALE' | 'AST_REWRITE_TRANSACTION_FAILED';
+  error?: string;
+}
+
+function bufferSha256(value: Buffer): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+async function writeOwnedTemp(path: string, content: Buffer, mode: number): Promise<void> {
+  let created = false;
+  try {
+    const handle = await open(path, 'wx', mode & 0o7777);
+    created = true;
+    try {
+      await handle.writeFile(content);
+      await handle.chmod(mode & 0o7777);
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if (created) await unlink(path).catch(() => undefined);
+    throw error;
+  }
+}
+
+function rewriteTempPath(target: string): string {
+  return `${target}.cclsp-rewrite-${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
+}
+
+async function assertCanonicalRewriteTarget(path: string): Promise<void> {
+  const [canonicalTarget, canonicalParent] = await Promise.all([
+    realpath(path),
+    realpath(dirname(path)),
+  ]);
+  if (canonicalTarget !== path || canonicalParent !== dirname(path)) {
+    throw new Error(`unsafe rewrite target changed canonical path: ${path}`);
+  }
+}
+
+export async function applyAtomicRewrite(
+  prepared: PreparedRewrite,
+  hooks: AtomicRewriteHooks
+): Promise<AtomicRewriteResult> {
+  const files = [...prepared.files].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+  const tempPaths = new Map<string, string>();
+  const replaced: typeof files = [];
+  const failedFiles = new Set<string>();
+  let mutationStarted = false;
+
+  try {
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      if (!file) continue;
+      await hooks.inject?.('before-preflight', file.absolutePath, index);
+      await assertCanonicalRewriteTarget(file.absolutePath);
+      const fileStat = await lstat(file.absolutePath);
+      if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+        throw new Error(`unsafe rewrite target: ${file.absolutePath}`);
+      }
+      const current = await readFile(file.absolutePath);
+      if (bufferSha256(current) !== file.originalSha256) {
+        const stale = new Error(`rewrite target changed: ${file.absolutePath}`);
+        stale.name = 'AST_REWRITE_STALE';
+        throw stale;
+      }
+    }
+
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      if (!file) continue;
+      await hooks.inject?.('before-temp-write', file.absolutePath, index);
+      await assertCanonicalRewriteTarget(file.absolutePath);
+      const tempPath = rewriteTempPath(file.absolutePath);
+      await writeOwnedTemp(tempPath, file.output, file.mode);
+      tempPaths.set(file.absolutePath, tempPath);
+    }
+
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      if (!file) continue;
+      await hooks.inject?.('before-rename', file.absolutePath, index);
+      await assertCanonicalRewriteTarget(file.absolutePath);
+      const current = await readFile(file.absolutePath);
+      if (bufferSha256(current) !== file.originalSha256) {
+        const stale = new Error(`rewrite target changed: ${file.absolutePath}`);
+        stale.name = 'AST_REWRITE_STALE';
+        throw stale;
+      }
+      const tempPath = tempPaths.get(file.absolutePath);
+      if (!tempPath) throw new Error(`missing prepared temp for ${file.absolutePath}`);
+      await rename(tempPath, file.absolutePath);
+      tempPaths.delete(file.absolutePath);
+      replaced.push(file);
+      mutationStarted = true;
+    }
+
+    if (files.length > 0) {
+      await hooks.inject?.('before-forward-sync');
+      await hooks.synchronize(
+        files.map((file) => ({ path: file.absolutePath, content: file.output.toString('utf8') }))
+      );
+      await hooks.inject?.('before-forward-invalidate');
+      await hooks.invalidate(files.map((file) => file.absolutePath));
+    }
+    return {
+      success: true,
+      filesModified: files.map((file) => file.absolutePath),
+      rollback: {
+        attempted: false,
+        disk: 'not-needed',
+        providers: 'not-needed',
+        failedFiles: [],
+      },
+    };
+  } catch (error) {
+    const rollback: RewriteRollback = {
+      attempted: mutationStarted,
+      disk: mutationStarted ? 'complete' : 'not-needed',
+      providers: mutationStarted ? 'complete' : 'not-needed',
+      failedFiles: [],
+    };
+    if (mutationStarted) {
+      for (let index = replaced.length - 1; index >= 0; index--) {
+        const file = replaced[index];
+        if (!file) continue;
+        try {
+          await hooks.inject?.('before-rollback-write', file.absolutePath, index);
+          await assertCanonicalRewriteTarget(file.absolutePath);
+          const restorePath = rewriteTempPath(file.absolutePath);
+          try {
+            await writeOwnedTemp(restorePath, file.original, file.mode);
+            await rename(restorePath, file.absolutePath);
+          } finally {
+            await unlink(restorePath).catch(() => undefined);
+          }
+        } catch {
+          rollback.disk = 'failed';
+          failedFiles.add(file.absolutePath);
+        }
+      }
+      let providerRollbackFailed = false;
+      try {
+        await hooks.inject?.('before-rollback-sync');
+        await hooks.synchronize(
+          files.map((file) => ({
+            path: file.absolutePath,
+            content: file.original.toString('utf8'),
+          }))
+        );
+      } catch {
+        providerRollbackFailed = true;
+      }
+      try {
+        await hooks.inject?.('before-rollback-invalidate');
+        await hooks.invalidate(files.map((file) => file.absolutePath));
+      } catch {
+        providerRollbackFailed = true;
+      }
+      if (providerRollbackFailed) {
+        rollback.providers = 'failed';
+        for (const file of files) failedFiles.add(file.absolutePath);
+      }
+    }
+    rollback.failedFiles = [...failedFiles].sort();
+    return {
+      success: false,
+      filesModified: [],
+      rollback,
+      code:
+        error instanceof Error && error.name === 'AST_REWRITE_STALE'
+          ? 'AST_REWRITE_STALE'
+          : 'AST_REWRITE_TRANSACTION_FAILED',
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await Promise.all([...tempPaths.values()].map((path) => unlink(path).catch(() => undefined)));
+  }
 }
 
 interface FileBackup {

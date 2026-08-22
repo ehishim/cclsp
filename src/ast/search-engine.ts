@@ -3,9 +3,9 @@ import { SourceLocator } from './source-locator.js';
 import {
   AST_MAX_CAPTURE_TEXT_BYTES,
   AST_MAX_MATCH_TEXT_BYTES,
-  type AstCapture,
   type AstMatch,
   type CompiledPattern,
+  type ExactStructuralMatch,
   type PatternMetavariable,
 } from './types.js';
 
@@ -55,7 +55,25 @@ export class SearchEngine {
     file: string,
     maxResults: number
   ): AstMatch[] {
-    const results: AstMatch[] = [];
+    return this.searchExact(tree, source, compiled, file, maxResults).map((match) => ({
+      file: match.file,
+      range: match.range,
+      text: truncateUtf8(match.matchedText, AST_MAX_MATCH_TEXT_BYTES),
+      captures: match.captures.map(({ startIndex: _start, endIndex: _end, ...capture }) => ({
+        ...capture,
+        text: truncateUtf8(capture.text, AST_MAX_CAPTURE_TEXT_BYTES),
+      })),
+    }));
+  }
+
+  searchExact(
+    tree: Parser.Tree,
+    source: string,
+    compiled: CompiledPattern,
+    file: string,
+    maxResults: number
+  ): ExactStructuralMatch[] {
+    const results: ExactStructuralMatch[] = [];
     const locator = new SourceLocator(source);
     const variables = new Map(
       compiled.metavariables.map((variable) => [variable.sentinel, variable])
@@ -65,23 +83,27 @@ export class SearchEngine {
       if (results.length >= maxResults) return;
       const bindings = this.matchNode(compiled.node, node, locator, variables, new Map());
       if (bindings) {
-        const captures: AstCapture[] = [...bindings.values()]
+        const captures = [...bindings.values()]
           .sort((a, b) => a.order - b.order || a.startIndex - b.startIndex)
           .map((capture) => ({
             name: capture.name,
             variadic: capture.variadic,
+            startIndex: capture.startIndex,
+            endIndex: capture.endIndex,
             range: locator.rangeByIndex(
               capture.startIndex,
               capture.endIndex,
               capture.startLine,
               capture.endLine
             ),
-            text: truncateUtf8(capture.text, AST_MAX_CAPTURE_TEXT_BYTES),
+            text: capture.text,
           }));
         results.push({
           file,
+          startIndex: node.startIndex,
+          endIndex: node.endIndex,
           range: locator.range(node),
-          text: truncateUtf8(node.text, AST_MAX_MATCH_TEXT_BYTES),
+          matchedText: locator.text(node.startIndex, node.endIndex),
           captures,
         });
       }

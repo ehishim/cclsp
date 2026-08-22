@@ -1,12 +1,15 @@
+import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { open, stat } from 'node:fs/promises';
+import { lstat, open, realpath, stat } from 'node:fs/promises';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
+import { promisify } from 'node:util';
 import type Parser from 'web-tree-sitter';
 import { type Location, SymbolKind } from '../lsp/types.js';
 import { pathToUri } from '../utils.js';
 import { extractDeclarations } from './declaration-extractor.js';
 import { GrammarRegistry } from './grammar-registry.js';
 import { PatternCompiler } from './pattern-compiler.js';
+import { RewriteBuildError, RewriteEngine, type RewriteSourceFile } from './rewrite-engine.js';
 import { SearchEngine } from './search-engine.js';
 import {
   AST_DEFAULT_RESULTS,
@@ -15,18 +18,27 @@ import {
   AST_MAX_FAILED_FILES,
   AST_MAX_FILE_BYTES,
   AST_MAX_RESULTS,
+  AST_REWRITE_GENERATED_SCAN_CHARACTERS,
+  AST_REWRITE_MAX_CHANGES,
   type AstLanguage,
   type AstRejected,
+  type AstRewriteErrorCode,
+  type AstRewriteInput,
+  type AstRewriteRejected,
   type AstSearchInput,
   type AstSearchOutcome,
   type CompiledPattern,
   type IndexedFile,
+  type PreparedRewrite,
+  type PreparedRewriteResult,
   type ProviderDefinitions,
   type ProviderDocumentSymbols,
 } from './types.js';
 import { WorkspaceIndex, languageForPath } from './workspace-index.js';
 
 const LIMITATIONS = ['syntax-only', 'no-import-resolution', 'no-overload-resolution'];
+const execFileAsync = promisify(execFile);
+const fatalUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 class OversizedFileError extends Error {
   constructor(
@@ -73,6 +85,76 @@ function rejected(
   return { outcome: 'rejected', provider, code, reason, ...extra };
 }
 
+function rewriteRejected(
+  provider: AstRewriteRejected['provider'],
+  code: AstRewriteErrorCode,
+  reason: string
+): AstRewriteRejected {
+  return { outcome: 'rejected', provider, isError: true, code, reason };
+}
+
+async function readRewriteSource(path: string): Promise<{
+  original: Buffer;
+  source: string;
+  mode: number;
+}> {
+  const [canonical, pathStat] = await Promise.all([realpath(path), lstat(path)]);
+  if (canonical !== path || pathStat.isSymbolicLink() || !pathStat.isFile()) {
+    throw new Error('AST_REWRITE_TARGET_UNSAFE:not a canonical regular file');
+  }
+  const handle = await open(path, 'r');
+  try {
+    const fileStat = await handle.stat();
+    if (!fileStat.isFile()) throw new Error('AST_REWRITE_TARGET_UNSAFE:not a regular file');
+    if (fileStat.size > AST_MAX_FILE_BYTES) {
+      throw new OversizedFileError(fileStat.size, AST_MAX_FILE_BYTES);
+    }
+    const original = Buffer.alloc(fileStat.size);
+    let offset = 0;
+    while (offset < original.length) {
+      const { bytesRead } = await handle.read(original, offset, original.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset !== original.length) {
+      throw new Error('AST_REWRITE_TARGET_UNSAFE:file changed while being read');
+    }
+    let source: string;
+    try {
+      source = fatalUtf8.decode(original);
+    } catch {
+      throw new Error('AST_REWRITE_ENCODING_INVALID:file is not valid UTF-8');
+    }
+    const header = source.slice(0, AST_REWRITE_GENERATED_SCAN_CHARACTERS);
+    if (/@generated/i.test(header) || /^.*Code generated .*DO NOT EDIT.*$/im.test(header)) {
+      throw new Error('AST_REWRITE_TARGET_UNSAFE:generated files cannot be rewritten');
+    }
+    return { original, source, mode: fileStat.mode };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function rejectDirtyFiles(root: string, relativePaths: string[]): Promise<void> {
+  if (relativePaths.length === 0) return;
+  try {
+    const { stdout } = await execFileAsync(
+      'git',
+      ['status', '--porcelain=v1', '-z', '--', ...relativePaths],
+      { cwd: root, encoding: 'buffer', maxBuffer: 1024 * 1024 }
+    );
+    if (stdout.length > 0) {
+      throw new Error('AST_REWRITE_TARGET_DIRTY:matched files have Git changes');
+    }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('AST_REWRITE_TARGET_DIRTY:'))
+      throw error;
+    const stderr = String((error as { stderr?: unknown }).stderr ?? '');
+    if (/not a git repository/i.test(stderr)) return;
+    throw new Error(`AST_REWRITE_TARGET_UNSAFE:unable to verify Git state: ${String(error)}`);
+  }
+}
+
 function isAstLanguage(value: string): value is AstLanguage {
   return (AST_LANGUAGES as readonly string[]).includes(value);
 }
@@ -85,6 +167,7 @@ export class AstProvider {
   private readonly grammars = new GrammarRegistry();
   private readonly compiler = new PatternCompiler(this.grammars);
   private readonly searchEngine = new SearchEngine();
+  private readonly rewriteEngine = new RewriteEngine();
   private readonly indexPromise: Promise<WorkspaceIndex>;
 
   constructor(root = process.cwd()) {
@@ -240,6 +323,200 @@ export class AstProvider {
         parseFailureCount,
         failedFiles,
       };
+    } finally {
+      compiled.tree.delete();
+    }
+  }
+
+  async prepareRewrite(input: AstRewriteInput): Promise<PreparedRewriteResult> {
+    if (!isAstLanguage(input.language)) {
+      return rewriteRejected(
+        'none',
+        'AST_LANGUAGE_UNSUPPORTED',
+        `Unsupported AST language: ${input.language}`
+      );
+    }
+    if (typeof input.pattern !== 'string' || typeof input.replacement !== 'string') {
+      return rewriteRejected(
+        'none',
+        'AST_ARGUMENT_INVALID',
+        'pattern and replacement must be strings'
+      );
+    }
+    const index = await this.indexPromise;
+    let scope: string;
+    try {
+      scope = await index.resolveRewritePath(input.path);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith('AST_PATH_ESCAPED:')) {
+        return rewriteRejected(
+          'none',
+          'AST_PATH_ESCAPED',
+          message.slice('AST_PATH_ESCAPED:'.length)
+        );
+      }
+      if (message.startsWith('AST_REWRITE_TARGET_UNSAFE:')) {
+        return rewriteRejected(
+          'none',
+          'AST_REWRITE_TARGET_UNSAFE',
+          message.slice('AST_REWRITE_TARGET_UNSAFE:'.length)
+        );
+      }
+      return rewriteRejected('none', 'AST_PATH_INVALID', message.replace(/^AST_PATH_INVALID:/, ''));
+    }
+
+    let compiled: CompiledPattern;
+    try {
+      compiled = await this.compiler.compile(input.pattern, input.language);
+    } catch (error) {
+      return rewriteRejected(
+        'tree-sitter',
+        'AST_PATTERN_INVALID',
+        error instanceof Error ? error.message.replace(/^AST_PATTERN_INVALID:/, '') : String(error)
+      );
+    }
+
+    try {
+      try {
+        this.rewriteEngine.validateReplacementReferences(compiled, input.replacement);
+      } catch (error) {
+        if (error instanceof RewriteBuildError) {
+          return rewriteRejected('tree-sitter', error.code, error.message);
+        }
+        throw error;
+      }
+      let selection: Awaited<ReturnType<WorkspaceIndex['getRewriteFiles']>>;
+      try {
+        selection = await index.getRewriteFiles(scope, input.language);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return rewriteRejected(
+          'none',
+          message.startsWith('AST_REWRITE_TARGET_UNSAFE:')
+            ? 'AST_REWRITE_TARGET_UNSAFE'
+            : 'AST_PATH_INVALID',
+          message.replace(/^AST_[A-Z_]+:/, '')
+        );
+      }
+      if (selection.capped) {
+        return rewriteRejected(
+          'tree-sitter',
+          'AST_REWRITE_SCOPE_INCOMPLETE',
+          'Workspace index is capped; narrow the rewrite scope before applying changes'
+        );
+      }
+
+      const sourceFiles: RewriteSourceFile[] = [];
+      let matchCount = 0;
+      for (const file of selection.files) {
+        let read: Awaited<ReturnType<typeof readRewriteSource>>;
+        try {
+          read = await readRewriteSource(file.absolutePath);
+        } catch (error) {
+          if (error instanceof OversizedFileError) {
+            return rewriteRejected(
+              'tree-sitter',
+              selection.explicitFile ? 'AST_FILE_OVERSIZED' : 'AST_REWRITE_SCOPE_INCOMPLETE',
+              selection.explicitFile
+                ? `${file.relativePath} exceeds the AST file cap`
+                : `Scope includes oversized file ${file.relativePath}`
+            );
+          }
+          const message = error instanceof Error ? error.message : String(error);
+          const code = message.startsWith('AST_REWRITE_ENCODING_INVALID:')
+            ? 'AST_REWRITE_ENCODING_INVALID'
+            : 'AST_REWRITE_TARGET_UNSAFE';
+          return rewriteRejected('tree-sitter', code, message.replace(/^AST_[A-Z_]+:/, ''));
+        }
+
+        const tree = await this.grammars.parse(read.source, input.language);
+        try {
+          if (tree.rootNode.hasError) {
+            return rewriteRejected(
+              'tree-sitter',
+              selection.explicitFile ? 'AST_PARSE_FAILED' : 'AST_REWRITE_SCOPE_INCOMPLETE',
+              `Source parse failed for ${file.relativePath}`
+            );
+          }
+          const remaining = AST_REWRITE_MAX_CHANGES - matchCount + 1;
+          const matches = this.searchEngine.searchExact(
+            tree,
+            read.source,
+            compiled,
+            file.absolutePath,
+            Math.max(1, remaining)
+          );
+          matchCount += matches.length;
+          if (matchCount > AST_REWRITE_MAX_CHANGES) {
+            return rewriteRejected(
+              'tree-sitter',
+              'AST_REWRITE_TOO_MANY_MATCHES',
+              `Structural rewrite exceeds ${AST_REWRITE_MAX_CHANGES} changes`
+            );
+          }
+          if (matches.length > 0) {
+            sourceFiles.push({
+              absolutePath: file.absolutePath,
+              relativePath: file.relativePath,
+              mode: read.mode,
+              original: read.original,
+              source: read.source,
+              matches,
+            });
+          }
+        } finally {
+          tree.delete();
+        }
+      }
+
+      try {
+        await rejectDirtyFiles(index.root, sourceFiles.map((file) => file.relativePath).sort());
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return rewriteRejected(
+          'tree-sitter',
+          message.startsWith('AST_REWRITE_TARGET_DIRTY:')
+            ? 'AST_REWRITE_TARGET_DIRTY'
+            : 'AST_REWRITE_TARGET_UNSAFE',
+          message.replace(/^AST_[A-Z_]+:/, '')
+        );
+      }
+
+      let prepared: PreparedRewrite;
+      try {
+        prepared = this.rewriteEngine.build({
+          root: index.root,
+          language: input.language,
+          pattern: input.pattern,
+          replacement: input.replacement,
+          scope,
+          compiled,
+          files: sourceFiles,
+        });
+      } catch (error) {
+        if (error instanceof RewriteBuildError) {
+          return rewriteRejected('tree-sitter', error.code, error.message);
+        }
+        throw error;
+      }
+
+      for (const file of prepared.files) {
+        const output = fatalUtf8.decode(file.output);
+        const tree = await this.grammars.parse(output, input.language);
+        try {
+          if (tree.rootNode.hasError) {
+            return rewriteRejected(
+              'tree-sitter',
+              'AST_REWRITE_REPLACEMENT_INVALID',
+              `Replacement produces invalid ${input.language} in ${file.relativePath}`
+            );
+          }
+        } finally {
+          tree.delete();
+        }
+      }
+      return { outcome: 'prepared', prepared };
     } finally {
       compiled.tree.delete();
     }

@@ -110,6 +110,7 @@ root that owns `--file`. Line/character are **1-indexed**.
 | Tool (exact) | Alias | Required | Optional |
 |---|---|---|---|
 | `ast_search` | `ast-search` | `--pattern --language` | `--path --max-results --root` |
+| `code_rewrite` | `code-rewrite` | `--pattern --replacement --language` | `--path --root --dry-run=false --candidate-id` |
 | `find_definition` | `definition` | `--file --symbol-name` | `--symbol-kind` |
 | `find_references` | `references` | `--file --symbol-name` | `--symbol-kind --include-declaration` |
 | `find_implementation` | `implementation` | `--file --line --character` | |
@@ -147,6 +148,25 @@ cclsp-hub ast_search --root /workspace/app \
 `$NAME` captures one named syntax node and `$$$NAME` captures zero or more named siblings. The default result limit is 100 and the ceiling is 1,000. Search stays inside the registered root, indexes at most 5,000 deterministically ordered files, skips files larger than 512 KiB during directory searches, and reports typed errors for invalid patterns, unsupported languages, escaped paths, explicit oversized files, and parse failures.
 
 Results carry `provider: "tree-sitter"`, zero-indexed structured ranges, capture ranges, and truncation/index metadata. Tree-sitter fallback for definitions, document symbols, and query-position resolution is explicitly syntax-only; it does not provide semantic references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety. A supported empty LSP answer remains an LSP answer and never falls back.
+
+### Atomic structural rewrite
+
+Use `ast_search` first, then preview `code_rewrite` (dry-run is the default) and inspect its per-file changes and candidate ID:
+
+```bash
+preview=$(cclsp-hub code-rewrite --root /workspace/app --json \
+  --language typescript --path src \
+  --pattern 'foo($ARG)' --replacement 'bar(0, $ARG)')
+
+cclsp-hub code-rewrite --root /workspace/app \
+  --language typescript --path src \
+  --pattern 'foo($ARG)' --replacement 'bar(0, $ARG)' \
+  --dry-run=false --candidate-id 'sha256:<candidate from preview>'
+```
+
+Apply requires an unchanged fresh candidate. It is limited to 100 changes, 512 KiB per output file, and 16 MiB of total original-plus-output bytes. Rewrites reject ignored/generated/symlinked/out-of-root/invalid-UTF-8/Git-dirty targets, incomplete indexes, invalid output, unsafe overlaps, and stale previews without writing. Multi-file writes and live-provider synchronization are all-or-rollback; JSON reports `rollback.disk`, `rollback.providers`, and `failedFiles` if recovery is incomplete.
+
+This is syntax-only transformation, not semantic rename. Identifier-only changes return `AST_REWRITE_SEMANTIC_RENAME`; use `rename_symbol_strict` so LSP `prepareRename` and semantic references own symbol changes. Preview-required, stale, capture, target, conflict, output, and scope failures are typed `AST_REWRITE_*` nonzero outcomes.
 
 Flag notes:
 - `--file` is sugar for `--file-path`; `--symbol` for `--symbol-name`.
@@ -201,8 +221,9 @@ governs the subdir). Use `--isolate` when a nested package needs its own instanc
 - Rename validation failures return `outcome = "rejected"` and preserve the
   language server's reason; no rename request or file edit follows a rejection.
 - AST rejections return `structuredContent.outcome = "rejected"`, a typed
-  `AST_*` code, and exit non-zero. A valid empty AST search is `outcome = "ok"`,
-  `provider = "tree-sitter"`, `matches = []`, and exit 0.
+  `AST_*` code, and exit non-zero. A valid empty AST search or zero-change rewrite is
+  `outcome = "ok"`, `provider = "tree-sitter"`, and exit 0. Transaction failures
+  return `outcome = "failed"`, rollback detail, and exit non-zero.
 
 ## Configuration
 

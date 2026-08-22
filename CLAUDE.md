@@ -62,6 +62,7 @@ npm run prepublishOnly  # build + test + typecheck
 - Loads installed Tree-sitter/WASM grammars for TypeScript/TSX, JavaScript/JSX, Python, PHP, Go, Rust, and Java without request-time downloads
 - Owns a root-contained, gitignore-aware index capped at 5,000 files and 512 KiB per file
 - Exposes structural patterns with `$NAME` single-node and `$$$NAME` variadic captures
+- Builds root-bound structural rewrite previews and candidate identities; `file-editor.ts` owns exact-byte atomic commit/rollback and `LSPClient` owns strict provider synchronization
 - Supplies explicitly syntax-only declaration, document-symbol, and query-position fallback when no configured LSP exists or the selected server does not support the required method
 - Preserves provider provenance: LSP success, including supported-empty, remains `lsp`; AST results are `tree-sitter`; unavailable results are `none`
 
@@ -84,10 +85,11 @@ npm run prepublishOnly  # build + test + typecheck
 
 1. MCP client sends tool request (e.g., `find_definition`)
 2. Main server resolves file path and extracts position
-3. `LSPClient` remains the provider-selection owner: `ast_search` goes directly to its root-bound AST provider; semantic tools prefer the appropriate language server
-4. If an admitted declaration/document-symbol operation has no configured server or the method is unsupported, `LSPClient` may return a syntax-only Tree-sitter fallback with explicit limitations; supported-empty and other LSP failures never fall back
-5. If an LSP server is needed and not running, spawns the language server process
-6. Sends the request to the selected provider and transforms the result back to MCP format with explicit provider provenance
+3. `LSPClient` remains the provider-selection owner: `ast_search` and syntax-only `code_rewrite` candidate construction go to its root-bound AST provider; semantic tools prefer the appropriate language server
+4. `code_rewrite` defaults to preview; explicit apply recomputes the candidate under a lock, commits through the exact-byte file transaction, then synchronizes LSP documents/diagnostics and AST state or rolls all providers and disk back
+5. If an admitted declaration/document-symbol operation has no configured server or the method is unsupported, `LSPClient` may return a syntax-only Tree-sitter fallback with explicit limitations; supported-empty and other LSP failures never fall back
+6. If an LSP server is needed and not running, spawns the language server process
+7. Sends the request to the selected provider and transforms the result back to MCP format with explicit provider provenance
 
 ### LSP Server Management
 
@@ -169,6 +171,12 @@ bun run lint:fix && bun run format && bun run typecheck && bun run test
 Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, explicit oversized files, and parse failures are typed `AST_*` rejections. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
 
 Tree-sitter evidence is syntax-only. Never use it as semantic proof for references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety.
+
+## Structural Rewrite
+
+`code_rewrite(pattern, replacement, language, path?, dry_run=true, candidate_id?)` reuses the structural matcher. Preview first; apply only with `dry_run=false` and the unchanged opaque candidate ID. Rewrites are root-contained, Git-clean, UTF-8, generated/ignore excluding, overlap rejecting, parse validating, capped at 100 changes/512 KiB per output/16 MiB per transaction, and atomic across disk plus live providers. Rollback reports disk and provider restoration separately and leaves no partial-success result.
+
+Use `ast_search` before rewrite. Use prepare-first LSP `rename_symbol_strict` for identifier/symbol renames; structural rewrite deliberately rejects identifier-only rename shapes and makes no semantic reference/import safety claim.
 
 ## LSP Protocol Details
 

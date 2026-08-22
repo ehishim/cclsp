@@ -930,10 +930,14 @@ export async function findSymbolsByName(
 // edits made within one filesystem-timestamp tick (coarse-resolution or overlay
 // filesystems), silently serving stale results. The read is cheap next to the LSP
 // round-trip it lets us skip, and the content is reused for didChange when it differs.
+export function contentSignature(content: string): string {
+  return createHash('sha1').update(content).digest('hex');
+}
+
 function readAndSign(filePath: string): { content: string; sig: string } | null {
   try {
     const content = readFileSync(filePath, 'utf-8');
-    return { content, sig: createHash('sha1').update(content).digest('hex') };
+    return { content, sig: contentSignature(content) };
   } catch {
     return null;
   }

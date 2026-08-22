@@ -1,4 +1,4 @@
-import { readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, readdir, realpath, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Ignore } from 'ignore';
 import { loadGitignore } from '../file-scanner.js';
@@ -89,6 +89,78 @@ export class WorkspaceIndex {
       throw new Error(`AST_PATH_ESCAPED:${candidate}`);
     }
     return canonical;
+  }
+
+  async resolveRewritePath(input?: string): Promise<string> {
+    const candidate = resolve(
+      input ? (isAbsolute(input) ? input : join(this.root, input)) : this.root
+    );
+    if (!isContained(this.root, candidate)) {
+      throw new Error(`AST_PATH_ESCAPED:${candidate}`);
+    }
+    const relativeCandidate = normalizedRelative(relative(this.root, candidate));
+    if (relativeCandidate && this.ignoreFilter.ignores(relativeCandidate)) {
+      throw new Error(`AST_REWRITE_TARGET_UNSAFE:${candidate} is ignored or generated output`);
+    }
+    try {
+      let current = this.root;
+      for (const part of relative(this.root, candidate).split(sep).filter(Boolean)) {
+        current = join(current, part);
+        if ((await lstat(current)).isSymbolicLink()) {
+          throw new Error(`AST_REWRITE_TARGET_UNSAFE:${candidate} traverses a symbolic link`);
+        }
+      }
+      const canonical = await realpath(candidate);
+      if (!isContained(this.root, canonical)) {
+        throw new Error(`AST_PATH_ESCAPED:${candidate}`);
+      }
+      const candidateStat = await lstat(canonical);
+      if (!candidateStat.isFile() && !candidateStat.isDirectory()) {
+        throw new Error(
+          `AST_REWRITE_TARGET_UNSAFE:${candidate} is not a regular file or directory`
+        );
+      }
+      return canonical;
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('AST_')) throw error;
+      throw new Error(`AST_PATH_INVALID:${candidate}`);
+    }
+  }
+
+  async getRewriteFiles(
+    scope: string,
+    language: AstLanguage
+  ): Promise<{ files: IndexedFile[]; capped: boolean; explicitFile: boolean }> {
+    const scopeStat = await lstat(scope);
+    if (scopeStat.isFile()) {
+      const fileLanguage = languageForPath(scope);
+      if (!fileLanguage || !this.matchesLanguage(fileLanguage, language)) {
+        throw new Error('AST_PATH_INVALID:Requested file does not match the requested language');
+      }
+      const fileStat = await stat(scope);
+      return {
+        files: [
+          {
+            absolutePath: scope,
+            relativePath: normalizedRelative(relative(this.root, scope)),
+            language: fileLanguage,
+            bytes: fileStat.size,
+            mtimeMs: fileStat.mtimeMs,
+          },
+        ],
+        capped: false,
+        explicitFile: true,
+      };
+    }
+    if (!scopeStat.isDirectory()) {
+      throw new Error('AST_PATH_INVALID:AST path must be a file or directory');
+    }
+    const snapshot = await this.ensure();
+    return {
+      files: this.allFilesFor(snapshot, scope, language),
+      capped: snapshot.capped,
+      explicitFile: false,
+    };
   }
 
   async ensure(): Promise<WorkspaceSnapshot> {

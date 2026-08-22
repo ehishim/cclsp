@@ -1,6 +1,6 @@
 import { describe, expect, it, jest } from 'bun:test';
 import type { LSPClient } from './lsp-client.js';
-import { astSearchTool } from './tools/ast-search.js';
+import { astSearchTool, astTools } from './tools/ast-search.js';
 
 function client(result: Record<string, unknown>): LSPClient {
   return {
@@ -9,6 +9,9 @@ function client(result: Record<string, unknown>): LSPClient {
 }
 
 describe('ast_search tool', () => {
+  it('registers structural search and rewrite exactly once', () => {
+    expect(astTools.map((tool) => tool.name)).toEqual(['ast_search', 'code_rewrite']);
+  });
   it('requires pattern and language in the public schema', () => {
     expect(astSearchTool.inputSchema).toMatchObject({ required: ['pattern', 'language'] });
   });

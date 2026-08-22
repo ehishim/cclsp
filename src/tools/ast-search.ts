@@ -1,4 +1,5 @@
 import type { AstSearchOutcome } from '../ast/types.js';
+import { codeRewriteTool } from './code-rewrite.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
 
 function renderText(result: AstSearchOutcome): string {
@@ -69,4 +70,4 @@ export const astSearchTool: ToolDefinition = {
   },
 };
 
-export const astTools: ToolDefinition[] = [astSearchTool];
+export const astTools: ToolDefinition[] = [astSearchTool, codeRewriteTool];

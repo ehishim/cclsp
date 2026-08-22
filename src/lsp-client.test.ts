@@ -1638,6 +1638,98 @@ describe('LSPClient', () => {
     });
   });
 
+  describe('strict rewrite synchronization', () => {
+    it('takes one exclusive lease, sends one change, updates signature, and clears diagnostics', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const documentManager = createMockDocumentManager();
+      const diagnosticsCache = createMockDiagnosticsCache();
+      const release = jest.fn();
+      documentManager.acquire.mockResolvedValue({ justOpened: false, release });
+      const serverState = {
+        initializationPromise: Promise.resolve(),
+        documentManager,
+        diagnosticsCache,
+      };
+      const getServerSpy = spyOn(
+        (
+          client as unknown as {
+            serverManager: { getServer: (config: unknown) => Promise<unknown> };
+          }
+        ).serverManager,
+        'getServer'
+      ).mockResolvedValue(serverState);
+
+      await client.synchronizeRewriteFilesStrict([
+        { path: MOCK_TEST_TS, content: 'const x = 2;\n' },
+      ]);
+
+      expect(documentManager.acquire).toHaveBeenCalledWith(MOCK_TEST_TS, true);
+      expect(documentManager.sendChange).toHaveBeenCalledTimes(1);
+      expect(documentManager.sendChange).toHaveBeenCalledWith(MOCK_TEST_TS, 'const x = 2;\n');
+      expect(documentManager.setSyncSig).toHaveBeenCalledWith(
+        MOCK_TEST_TS,
+        operations.contentSignature('const x = 2;\n')
+      );
+      expect(diagnosticsCache.delete).toHaveBeenCalledWith(pathToUri(MOCK_TEST_TS));
+      expect(release).toHaveBeenCalledTimes(1);
+      getServerSpy.mockRestore();
+    });
+
+    it('groups files by server while sending one change per configured document', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const documentManager = createMockDocumentManager();
+      const getServerSpy = spyOn(
+        (
+          client as unknown as {
+            serverManager: { getServer: (config: unknown) => Promise<unknown> };
+          }
+        ).serverManager,
+        'getServer'
+      ).mockResolvedValue({
+        initializationPromise: Promise.resolve(),
+        documentManager,
+        diagnosticsCache: createMockDiagnosticsCache(),
+      });
+
+      await client.synchronizeRewriteFilesStrict([
+        { path: MOCK_TEST_TS, content: 'const x = 1;\n' },
+        { path: MOCK_IMPL_TS, content: 'const y = 2;\n' },
+      ]);
+
+      expect(getServerSpy).toHaveBeenCalledTimes(1);
+      expect(documentManager.sendChange).toHaveBeenCalledTimes(2);
+      getServerSpy.mockRestore();
+    });
+
+    it('propagates document synchronization failures and always releases the lease', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const documentManager = createMockDocumentManager();
+      const release = jest.fn();
+      documentManager.acquire.mockResolvedValue({ justOpened: false, release });
+      documentManager.sendChange.mockImplementation(() => {
+        throw new Error('didChange failed');
+      });
+      const getServerSpy = spyOn(
+        (
+          client as unknown as {
+            serverManager: { getServer: (config: unknown) => Promise<unknown> };
+          }
+        ).serverManager,
+        'getServer'
+      ).mockResolvedValue({
+        initializationPromise: Promise.resolve(),
+        documentManager,
+        diagnosticsCache: createMockDiagnosticsCache(),
+      });
+
+      await expect(
+        client.synchronizeRewriteFilesStrict([{ path: MOCK_TEST_TS, content: 'const x = 2;\n' }])
+      ).rejects.toThrow('didChange failed');
+      expect(release).toHaveBeenCalledTimes(1);
+      getServerSpy.mockRestore();
+    });
+  });
+
   describe('outgoingCalls', () => {
     it('should return outgoing calls using uriToPath', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);

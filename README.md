@@ -32,6 +32,7 @@ https://github.com/user-attachments/assets/52980f32-64d6-4b78-9cbf-18d6ae120cdd
 - [🛠️ Development](#️-development)
 - [🔧 MCP Tools](#-mcp-tools)
   - [`ast_search`](#ast_search)
+  - [`code_rewrite`](#code_rewrite)
   - [`find_definition`](#find_definition)
   - [`find_references`](#find_references)
   - [`rename_symbol`](#rename_symbol)
@@ -58,7 +59,7 @@ When using AI-powered coding assistants like Claude, you often need to navigate 
 
 ## Features
 
-- **Structural Search**: Match syntax with offline Tree-sitter grammars and bounded metavariables
+- **Structural Search and Rewrite**: Match syntax with offline Tree-sitter grammars, preview capture substitutions, and apply unchanged candidates atomically
 - **Go to Definition**: Find where symbols are defined
 - **Find References**: Locate all references to a symbol
 - **Multi-language Support**: Configurable LSP servers for different file types
@@ -393,6 +394,23 @@ Search syntax structure with offline Tree-sitter grammars for TypeScript/TSX, Ja
 - Results identify `provider: tree-sitter`, include zero-indexed structured ranges and capture ranges, and type invalid patterns, unsupported languages, escaped paths, oversized files, parse failures, and truncation.
 
 Tree-sitter fallback is syntax-only. It may enumerate declarations, find same-name declaration locations, or resolve a query position when the configured LSP is absent or does not support document symbols/definitions. It never supplies semantic references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety. A supported empty LSP result stays `provider: lsp` and never falls back.
+
+### `code_rewrite`
+
+Preview and atomically apply syntax-shaped transformations with the same `$NAME` and `$$$NAME` captures as `ast_search`. Search first, then inspect the default dry-run preview and its opaque candidate ID:
+
+```bash
+cclsp-hub code_rewrite --root /workspace/app --language typescript --path src \
+  --pattern 'foo($ARG)' --replacement 'bar(0, $ARG)' --json
+
+cclsp-hub code_rewrite --root /workspace/app --language typescript --path src \
+  --pattern 'foo($ARG)' --replacement 'bar(0, $ARG)' \
+  --dry-run=false --candidate-id 'sha256:<preview-id>'
+```
+
+Apply requires the exact `candidate_id` returned by a fresh preview. cclsp recomputes the complete candidate under an apply lock; stale or Git-dirty matched files, symlinks, ignored/generated files, invalid UTF-8, parse-invalid output, overlap/nesting, incomplete scopes, more than 100 changes, outputs above 512 KiB, and transactions above 16 MiB are refused before mutation. A successful multi-file apply updates disk, configured LSP buffers/signatures/diagnostics, and Tree-sitter index/cache state. A write or provider-sync failure restores exact original bytes and reports disk/provider rollback separately; partial success is never reported.
+
+Structural rewrite remains syntax-only. Identifier-only changes are rejected with `AST_REWRITE_SEMANTIC_RENAME`; use prepare-first `rename_symbol_strict` for semantic symbol rename, references, imports, and rename safety. Other recovery codes include `AST_REWRITE_PREVIEW_REQUIRED`, `AST_REWRITE_STALE`, `AST_REWRITE_CAPTURE_INVALID`, `AST_REWRITE_TARGET_UNSAFE`, `AST_REWRITE_TARGET_DIRTY`, `AST_REWRITE_CONFLICT`, and `AST_REWRITE_SCOPE_INCOMPLETE`.
 
 ### `find_definition`
 

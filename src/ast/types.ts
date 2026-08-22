@@ -13,6 +13,10 @@ export const AST_MAX_PATTERN_NODES = 256;
 export const AST_MAX_METAVARIABLES = 32;
 export const AST_MAX_FAILED_FILES = 20;
 export const AST_FALLBACK_DEFINITION_RESULTS = 100;
+export const AST_REWRITE_MAX_CHANGES = 100;
+export const AST_REWRITE_MAX_TRANSACTION_BYTES = 16 * 1024 * 1024;
+export const AST_REWRITE_GENERATED_SCAN_CHARACTERS = 2_048;
+export const AST_REWRITE_PREVIEW_TEXT_BYTES = 4_096;
 
 export const AST_LANGUAGES = [
   'typescript',
@@ -46,6 +50,20 @@ export interface AstMatch {
   range: AstRange;
   text: string;
   captures: AstCapture[];
+}
+
+export interface ExactAstCapture extends AstCapture {
+  startIndex: number;
+  endIndex: number;
+}
+
+export interface ExactStructuralMatch {
+  file: string;
+  startIndex: number;
+  endIndex: number;
+  range: AstRange;
+  matchedText: string;
+  captures: ExactAstCapture[];
 }
 
 export interface AstSearchInput {
@@ -89,6 +107,121 @@ export interface AstRejected {
 }
 
 export type AstSearchOutcome = AstSearchOk | AstRejected;
+
+export interface AstRewriteInput {
+  pattern: string;
+  replacement: string;
+  language: string;
+  path?: string;
+  dryRun?: boolean;
+  candidateId?: string;
+}
+
+export type AstRewriteErrorCode =
+  | AstErrorCode
+  | 'AST_REWRITE_PREVIEW_REQUIRED'
+  | 'AST_REWRITE_STALE'
+  | 'AST_REWRITE_CAPTURE_INVALID'
+  | 'AST_REWRITE_SEMANTIC_RENAME'
+  | 'AST_REWRITE_TARGET_UNSAFE'
+  | 'AST_REWRITE_TARGET_DIRTY'
+  | 'AST_REWRITE_ENCODING_INVALID'
+  | 'AST_REWRITE_REPLACEMENT_INVALID'
+  | 'AST_REWRITE_OUTPUT_OVERSIZED'
+  | 'AST_REWRITE_CONFLICT'
+  | 'AST_REWRITE_TOO_MANY_MATCHES'
+  | 'AST_REWRITE_SCOPE_INCOMPLETE'
+  | 'AST_REWRITE_TRANSACTION_FAILED';
+
+export interface AstRewriteChange {
+  file: string;
+  range: AstRange;
+  before: string;
+  after: string;
+}
+
+export interface RewriteRollback {
+  attempted: boolean;
+  disk: 'not-needed' | 'complete' | 'failed';
+  providers: 'not-needed' | 'complete' | 'failed';
+  failedFiles: string[];
+}
+
+export interface AstRewritePreview {
+  outcome: 'ok';
+  provider: 'tree-sitter';
+  dryRun: true;
+  language: AstLanguage;
+  candidateId: `sha256:${string}`;
+  changes: AstRewriteChange[];
+  filesMatched: number;
+  filesChanged: number;
+  changesPlanned: number;
+  effectiveMaxChanges: number;
+  totalOriginalBytes: number;
+  totalOutputBytes: number;
+}
+
+export interface AstRewriteApplied extends Omit<AstRewritePreview, 'dryRun'> {
+  dryRun: false;
+  filesModified: string[];
+  changesApplied: number;
+  rollback: RewriteRollback;
+}
+
+export interface AstRewriteRejected {
+  outcome: 'rejected';
+  provider: 'tree-sitter' | 'none';
+  isError: true;
+  code: AstRewriteErrorCode;
+  reason: string;
+  rollback?: RewriteRollback;
+}
+
+export interface AstRewriteFailed {
+  outcome: 'failed';
+  provider: 'tree-sitter';
+  isError: true;
+  code: AstRewriteErrorCode;
+  reason: string;
+  rollback: RewriteRollback;
+}
+
+export type AstRewriteOutcome =
+  | AstRewritePreview
+  | AstRewriteApplied
+  | AstRewriteRejected
+  | AstRewriteFailed;
+
+export interface PreparedRewriteEdit {
+  startIndex: number;
+  endIndex: number;
+  before: string;
+  after: string;
+  range: AstRange;
+}
+
+export interface PreparedRewriteFile {
+  absolutePath: string;
+  relativePath: string;
+  mode: number;
+  original: Buffer;
+  output: Buffer;
+  originalSha256: string;
+  edits: PreparedRewriteEdit[];
+}
+
+export interface PreparedRewrite {
+  root: string;
+  language: AstLanguage;
+  candidateId: `sha256:${string}`;
+  files: PreparedRewriteFile[];
+  publicPreview: AstRewritePreview;
+}
+
+export type PreparedRewriteResult =
+  | { outcome: 'prepared'; prepared: PreparedRewrite }
+  | AstRewriteRejected;
 
 export type ProviderValue<T> =
   | {

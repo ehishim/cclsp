@@ -9,6 +9,7 @@ import type { ToolSchema } from './pool.js';
 // Friendly subcommand -> cclsp tool name.
 const ALIASES: Record<string, string> = {
   'ast-search': 'ast_search',
+  'code-rewrite': 'code_rewrite',
   definition: 'find_definition',
   references: 'find_references',
   implementation: 'find_implementation',
@@ -177,6 +178,8 @@ ROOTS & DAEMON
 
 CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need --root)
   ast_search              --pattern P --language L [--path P] [--max-results N] [--root R]
+  code_rewrite            --pattern P --replacement R --language L [--path P] [--root R]
+                          [--dry-run=false --candidate-id ID]
   find_definition         --file F --symbol-name NAME [--symbol-kind K]
   find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
   find_implementation     --file F (--query Q | --line N --character C)
@@ -199,7 +202,10 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need -
   restart_server          --root R [--extensions ts,tsx]
   call <tool>             Raw passthrough; combine with --params-json '{...}'
 
-Short aliases (and kebab-case) also work: ast-search, definition, references, implementation,
+Structural rewrite is syntax-only and defaults to preview. Inspect its candidate ID before
+explicit apply; use rename_symbol_strict for semantic symbol renames.
+
+Short aliases (and kebab-case) also work: ast-search, code-rewrite, definition, references, implementation,
 hover, document-symbols, completions, signatures, code-actions, rename-file,
 diagnostics, diagnostics-batch, rename, rename-strict, symbols, call-hierarchy,
 incoming-calls, outgoing-calls, restart-server.

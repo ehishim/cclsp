@@ -15,6 +15,34 @@ async function writeInBatches(root: string, paths: string[]): Promise<void> {
 }
 
 describe('WorkspaceIndex maximum representative scope', () => {
+  it('fails closed for ignored, symlinked, escaped, and language-mismatched rewrite targets', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-index-safe-'));
+    const outside = await mkdtemp(join(tmpdir(), 'cclsp-index-safe-outside-'));
+    const index = await WorkspaceIndex.create(root);
+    try {
+      await mkdir(join(root, 'dist'));
+      await writeFile(join(root, 'dist', 'ignored.ts'), 'const x = 1;\n');
+      await writeFile(join(root, 'safe.ts'), 'const x = 1;\n');
+      await writeFile(join(root, 'wrong.py'), 'x = 1\n');
+      await writeFile(join(outside, 'escaped.ts'), 'const x = 1;\n');
+      await symlink(join(outside, 'escaped.ts'), join(root, 'linked.ts'));
+
+      await expect(index.resolveRewritePath('dist/ignored.ts')).rejects.toThrow(
+        'AST_REWRITE_TARGET_UNSAFE'
+      );
+      await expect(index.resolveRewritePath('linked.ts')).rejects.toThrow(
+        'AST_REWRITE_TARGET_UNSAFE'
+      );
+      await expect(index.resolveRewritePath('../escaped.ts')).rejects.toThrow('AST_PATH_ESCAPED');
+      const wrong = await index.resolveRewritePath('wrong.py');
+      await expect(index.getRewriteFiles(wrong, 'typescript')).rejects.toThrow('AST_PATH_INVALID');
+      expect(await index.resolveRewritePath('safe.ts')).toBe(join(root, 'safe.ts'));
+    } finally {
+      index.dispose();
+      await rm(root, { recursive: true, force: true });
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
   it('deletes every parsed tree exactly once across cache eviction and disposal', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cclsp-index-cache-'));
     const deleted = Array.from({ length: 129 }, () => 0);

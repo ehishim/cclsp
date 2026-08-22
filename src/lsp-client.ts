@@ -1,20 +1,25 @@
+import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, normalize, relative } from 'node:path';
 import { AstProvider } from './ast/provider.js';
 import type {
+  AstRewriteInput,
+  AstRewriteOutcome,
   AstSearchInput,
   AstSearchOutcome,
   ProviderDefinitions,
   ProviderDocumentSymbols,
   ProviderValue,
 } from './ast/types.js';
+import { type AtomicRewriteStage, applyAtomicRewrite } from './file-editor.js';
 import { loadGitignore, scanDirectoryForExtensions } from './file-scanner.js';
 import { logger } from './logger.js';
 import { LspToolOutcomeError, supportsMethod } from './lsp/capabilities.js';
 import { loadConfig } from './lsp/config.js';
 import {
+  contentSignature,
   getValidSymbolKinds,
   didRenameFiles as opsDidRenameFiles,
   findDefinition as opsFindDefinition,
@@ -101,6 +106,7 @@ export class LSPClient {
   private astProvider: AstProvider;
   private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
   private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<void>>();
+  private rewriteApplyTail: Promise<void> = Promise.resolve();
 
   constructor(configPath?: string, root = process.cwd()) {
     this.config = loadConfig(configPath);
@@ -290,6 +296,124 @@ export class LSPClient {
 
   async astSearch(input: AstSearchInput): Promise<AstSearchOutcome> {
     return this.astProvider.search(input);
+  }
+
+  async codeRewrite(input: AstRewriteInput): Promise<AstRewriteOutcome> {
+    if (input.dryRun !== false) {
+      const result = await this.astProvider.prepareRewrite(input);
+      return result.outcome === 'prepared' ? result.prepared.publicPreview : result;
+    }
+    if (!input.candidateId) {
+      return {
+        outcome: 'rejected',
+        provider: 'tree-sitter',
+        isError: true,
+        code: 'AST_REWRITE_PREVIEW_REQUIRED',
+        reason: 'dry_run=false requires candidate_id from an inspected dry-run preview',
+      };
+    }
+    return this.withRewriteApplyLock(async () => {
+      const result = await this.astProvider.prepareRewrite(input);
+      if (result.outcome !== 'prepared') return result;
+      const actual = Buffer.from(result.prepared.candidateId);
+      const supplied = Buffer.from(input.candidateId ?? '');
+      if (actual.length !== supplied.length || !timingSafeEqual(actual, supplied)) {
+        return {
+          outcome: 'rejected',
+          provider: 'tree-sitter',
+          isError: true,
+          code: 'AST_REWRITE_STALE',
+          reason: 'Candidate identity no longer matches a fresh structural rewrite preview',
+        };
+      }
+      const transaction = await applyAtomicRewrite(result.prepared, {
+        synchronize: (files) => this.synchronizeRewriteFilesStrict(files),
+        invalidate: async (paths) => {
+          await Promise.all(paths.map((path) => this.astProvider.invalidate(path)));
+        },
+        inject: (stage, _file, index) => this.injectRewriteFailureForTest(stage, index),
+      });
+      if (!transaction.success) {
+        if (transaction.code === 'AST_REWRITE_STALE' && !transaction.rollback.attempted) {
+          return {
+            outcome: 'rejected',
+            provider: 'tree-sitter',
+            isError: true,
+            code: 'AST_REWRITE_STALE',
+            reason: transaction.error ?? 'Rewrite target changed before mutation',
+            rollback: transaction.rollback,
+          };
+        }
+        return {
+          outcome: 'failed',
+          provider: 'tree-sitter',
+          isError: true,
+          code: transaction.code ?? 'AST_REWRITE_TRANSACTION_FAILED',
+          reason: transaction.error ?? 'Structural rewrite transaction failed',
+          rollback: transaction.rollback,
+        };
+      }
+      return {
+        ...result.prepared.publicPreview,
+        dryRun: false,
+        filesModified: transaction.filesModified,
+        changesApplied: result.prepared.publicPreview.changesPlanned,
+        rollback: transaction.rollback,
+      };
+    });
+  }
+
+  async synchronizeRewriteFilesStrict(
+    files: Array<{ path: string; content: string }>
+  ): Promise<void> {
+    const groups = new Map<
+      string,
+      { config: LSPServerConfig; files: Array<{ path: string; content: string }> }
+    >();
+    for (const file of files) {
+      const config = this.getServerForFile(file.path);
+      if (!config) continue;
+      const key = JSON.stringify(config);
+      const group = groups.get(key);
+      if (group) group.files.push(file);
+      else groups.set(key, { config, files: [file] });
+    }
+    for (const group of groups.values()) {
+      const serverState = await this.serverManager.getServer(group.config);
+      await serverState.initializationPromise;
+      for (const file of group.files) {
+        const lease = await serverState.documentManager.acquire(file.path, true);
+        try {
+          serverState.documentManager.sendChange(file.path, file.content);
+          serverState.documentManager.setSyncSig(file.path, contentSignature(file.content));
+          serverState.diagnosticsCache.delete(pathToUri(file.path));
+        } finally {
+          lease.release();
+        }
+      }
+    }
+  }
+
+  private injectRewriteFailureForTest(stage: AtomicRewriteStage, index?: number): void {
+    if (process.env.CCLSP_REWRITE_TEST_MODE !== '1') return;
+    const expected = process.env.CCLSP_REWRITE_TEST_FAILURE;
+    if (!expected) return;
+    const actual = `${stage}${index === undefined ? '' : `:${index}`}`;
+    if (actual === expected) throw new Error(`injected structural rewrite failure at ${actual}`);
+  }
+
+  private async withRewriteApplyLock<T>(action: () => Promise<T>): Promise<T> {
+    const previous = this.rewriteApplyTail;
+    let release = (): void => undefined;
+    this.rewriteApplyTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+    }
   }
 
   async findDefinition(filePath: string, position: Position): Promise<Location[]> {
