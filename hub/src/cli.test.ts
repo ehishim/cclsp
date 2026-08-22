@@ -24,6 +24,9 @@ describe('cclsp-hub semantic ergonomics', () => {
     } finally {
       process.stdout.write = originalWrite;
     }
+    expect(output).toContain('ast_search');
+    expect(output).toContain('--pattern P --language L');
+    expect(output).toContain('ast-search');
     expect(output).toContain('--query Q | --line N --character C');
     expect(output).toContain('--resolve-limit N');
     expect(output).toContain('--synthetic-trigger');

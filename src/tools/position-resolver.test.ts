@@ -4,7 +4,11 @@ import { positionResolutionResult, resolveToolPosition } from './position-resolv
 
 function client(symbols: unknown[]): LSPClient {
   return {
-    getDocumentSymbols: jest.fn().mockResolvedValue(symbols),
+    getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({
+      outcome: 'ok',
+      provider: 'lsp',
+      value: symbols,
+    }),
     symbolKindToString: (kind: number) =>
       ({ 5: 'class', 6: 'method', 12: 'function' })[kind] ?? 'unknown',
   } as unknown as LSPClient;
@@ -117,6 +121,6 @@ describe('resolveToolPosition', () => {
     await expect(resolveToolPosition('/fixture.ts', { line: 1 }, mock)).resolves.toMatchObject({
       outcome: 'invalid',
     });
-    expect(mock.getDocumentSymbols).not.toHaveBeenCalled();
+    expect(mock.getDocumentSymbolsWithProvider).not.toHaveBeenCalled();
   });
 });

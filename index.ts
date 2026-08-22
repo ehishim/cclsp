@@ -4,6 +4,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { logger } from './src/logger.js';
 import { LSPClient } from './src/lsp-client.js';
+import { astTools } from './src/tools/ast-search.js';
 import { diagnosticsTools } from './src/tools/diagnostics.js';
 import { hoverTools } from './src/tools/hover.js';
 import { languageFeatureTools } from './src/tools/language-features.js';
@@ -49,6 +50,7 @@ const server = new Server(
 );
 
 const allTools = [
+  ...astTools,
   ...navigationTools,
   ...refactoringTools,
   ...diagnosticsTools,

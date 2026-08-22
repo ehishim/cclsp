@@ -31,6 +31,7 @@ https://github.com/user-attachments/assets/52980f32-64d6-4b78-9cbf-18d6ae120cdd
   - [Configuration](#configuration)
 - [🛠️ Development](#️-development)
 - [🔧 MCP Tools](#-mcp-tools)
+  - [`ast_search`](#ast_search)
   - [`find_definition`](#find_definition)
   - [`find_references`](#find_references)
   - [`rename_symbol`](#rename_symbol)
@@ -57,6 +58,7 @@ When using AI-powered coding assistants like Claude, you often need to navigate 
 
 ## Features
 
+- **Structural Search**: Match syntax with offline Tree-sitter grammars and bounded metavariables
 - **Go to Definition**: Find where symbols are defined
 - **Find References**: Locate all references to a symbol
 - **Multi-language Support**: Configurable LSP servers for different file types
@@ -379,6 +381,18 @@ bun run typecheck
 ## 🔧 MCP Tools
 
 The server exposes these MCP tools:
+
+### `ast_search`
+
+Search syntax structure with offline Tree-sitter grammars for TypeScript/TSX, JavaScript/JSX, Python, PHP, Go, Rust, and Java. `language` is required; `path` may narrow the registered root to one contained file or directory.
+
+- `$NAME` captures exactly one named syntax node.
+- `$$$NAME` captures zero or more named siblings.
+- `max_results` defaults to 100 and is capped at 1,000.
+- Files larger than 512 KiB are not parsed and a workspace index admits at most 5,000 files in deterministic order.
+- Results identify `provider: tree-sitter`, include zero-indexed structured ranges and capture ranges, and type invalid patterns, unsupported languages, escaped paths, oversized files, parse failures, and truncation.
+
+Tree-sitter fallback is syntax-only. It may enumerate declarations, find same-name declaration locations, or resolve a query position when the configured LSP is absent or does not support document symbols/definitions. It never supplies semantic references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety. A supported empty LSP result stays `provider: lsp` and never falls back.
 
 ### `find_definition`
 

@@ -1,4 +1,3 @@
-import { logger } from '../logger.js';
 import type { LSPClient } from '../lsp-client.js';
 import {
   formatLocations,
@@ -45,54 +44,45 @@ export const findDefinitionTool: ToolDefinition = {
     };
     const absolutePath = resolvePath(file_path);
 
-    const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
-    const { matches: symbolMatches, warning } = result;
-
-    logger.debug(
-      `[find_definition] Found ${symbolMatches.length} symbol matches for "${symbol_name}"\n`
-    );
-
-    if (symbolMatches.length === 0) {
-      return textResult(
-        `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}. Please verify the symbol name and ensure the language server is properly configured.`
+    try {
+      const result = await client.findDefinitionsWithProvider(
+        absolutePath,
+        symbol_name,
+        symbol_kind
       );
-    }
-
-    const results = [];
-    for (const match of symbolMatches) {
-      logger.debug(
-        `[find_definition] Processing match: ${match.name} (${client.symbolKindToString(match.kind)}) at ${match.position.line}:${match.position.character}\n`
-      );
-      try {
-        const locations = await client.findDefinition(absolutePath, match.position);
-        logger.debug(`[find_definition] findDefinition returned ${locations.length} locations\n`);
-
-        if (locations.length > 0) {
-          const locationResults = formatLocations(locations);
-          results.push(
-            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${file_path}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
-          );
-        } else {
-          logger.debug(
-            `[find_definition] No definition found for ${match.name} at position ${match.position.line}:${match.position.character}\n`
-          );
-        }
-      } catch (error) {
-        rethrowToolOutcome(error);
-        logger.error(`[find_definition] Error processing match: ${error}\n`);
+      if (result.outcome !== 'ok') {
+        return {
+          content: [{ type: 'text', text: `${result.code}: ${result.reason}` }],
+          structuredContent: result,
+          isError: true,
+        };
       }
+      const text =
+        result.value.length > 0
+          ? `Found ${result.value.length} definition(s) for "${symbol_name}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(result.value)}`
+          : result.provider === 'lsp' && result.matchedSymbols === 0
+            ? `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}.`
+            : `Found ${result.provider === 'lsp' ? (result.matchedSymbols ?? 0) : 0} symbol(s) but no definitions could be retrieved (${result.provider}).`;
+      return {
+        content: [
+          {
+            type: 'text',
+            text: withWarning(result.provider === 'lsp' ? result.warning : undefined, text),
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          provider: result.provider,
+          locations: result.value,
+          ...(result.provider === 'tree-sitter'
+            ? { limitations: result.limitations, truncated: result.truncated ?? false }
+            : {}),
+        },
+      };
+    } catch (error) {
+      rethrowToolOutcome(error);
+      throw error;
     }
-
-    if (results.length === 0) {
-      return textResult(
-        withWarning(
-          warning,
-          `Found ${symbolMatches.length} symbol(s) but no definitions could be retrieved. Please ensure the language server is properly configured.`
-        )
-      );
-    }
-
-    return textResult(withWarning(warning, results.join('\n\n')));
   },
 };
 

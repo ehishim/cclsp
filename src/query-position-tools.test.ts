@@ -19,14 +19,18 @@ const POSITION = { line: 3, character: 7 };
 
 function createClient(): LSPClient {
   return {
-    getDocumentSymbols: jest.fn().mockResolvedValue([
-      {
-        name: 'run',
-        kind: 6,
-        range: { start: POSITION, end: { line: 5, character: 1 } },
-        selectionRange: { start: POSITION, end: { line: 3, character: 10 } },
-      },
-    ]),
+    getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({
+      outcome: 'ok',
+      provider: 'lsp',
+      value: [
+        {
+          name: 'run',
+          kind: 6,
+          range: { start: POSITION, end: { line: 5, character: 1 } },
+          selectionRange: { start: POSITION, end: { line: 3, character: 10 } },
+        },
+      ],
+    }),
     symbolKindToString: jest.fn().mockReturnValue('method'),
     hover: jest.fn().mockResolvedValue(null),
     findImplementation: jest.fn().mockResolvedValue([]),
@@ -145,23 +149,29 @@ describe('query selector parity', () => {
 
   it('returns ambiguity candidates without issuing the semantic request', async () => {
     const client = createClient();
-    (client.getDocumentSymbols as unknown as ReturnType<typeof jest.fn>).mockResolvedValue([
-      {
-        name: 'run',
-        kind: 6,
-        range: { start: POSITION, end: POSITION },
-        selectionRange: { start: POSITION, end: POSITION },
-      },
-      {
-        name: 'run',
-        kind: 6,
-        range: { start: { line: 8, character: 2 }, end: { line: 8, character: 5 } },
-        selectionRange: {
-          start: { line: 8, character: 2 },
-          end: { line: 8, character: 5 },
+    (
+      client.getDocumentSymbolsWithProvider as unknown as ReturnType<typeof jest.fn>
+    ).mockResolvedValue({
+      outcome: 'ok',
+      provider: 'lsp',
+      value: [
+        {
+          name: 'run',
+          kind: 6,
+          range: { start: POSITION, end: POSITION },
+          selectionRange: { start: POSITION, end: POSITION },
         },
-      },
-    ]);
+        {
+          name: 'run',
+          kind: 6,
+          range: { start: { line: 8, character: 2 }, end: { line: 8, character: 5 } },
+          selectionRange: {
+            start: { line: 8, character: 2 },
+            end: { line: 8, character: 5 },
+          },
+        },
+      ],
+    });
     const result = await getHoverTool.handler({ file_path: 'example.ts', query: 'run' }, client);
     expect(result).toMatchObject({
       isError: true,

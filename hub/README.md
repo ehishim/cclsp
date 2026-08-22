@@ -63,7 +63,7 @@ wrapper to `~/.local/bin/cclsp-hub` (override the directory with
 `CCLSP_HUB_BIN_DIR`). The wrapper defaults `CCLSP_HUB_ENTRY` to the sibling core
 build from the same checkout, so a hub install cannot silently keep spawning an
 older core; an explicit runtime `CCLSP_HUB_ENTRY` still overrides it. The pieces
-are also available separately:
+are also available separately. `hub/scripts/ast-installed-smoke.sh` builds and installs a temporary wrapper, exercises every bundled AST grammar plus fallback, bounds, errors, invalidation, and root restart on an isolated daemon/root, then tears everything down.
 
 ```bash
 bun run build          # → hub/dist/index.js
@@ -109,6 +109,7 @@ root that owns `--file`. Line/character are **1-indexed**.
 
 | Tool (exact) | Alias | Required | Optional |
 |---|---|---|---|
+| `ast_search` | `ast-search` | `--pattern --language` | `--path --max-results --root` |
 | `find_definition` | `definition` | `--file --symbol-name` | `--symbol-kind` |
 | `find_references` | `references` | `--file --symbol-name` | `--symbol-kind --include-declaration` |
 | `find_implementation` | `implementation` | `--file --line --character` | |
@@ -132,6 +133,20 @@ root that owns `--file`. Line/character are **1-indexed**.
 Use the exact name, the short alias, or kebab-case (`find-definition`) — all three
 work. New cclsp tools are callable by their exact name immediately, no hub release.
 Run `cclsp-hub describe` to list whatever the connected cclsp exposes.
+
+### Structural AST search
+
+`ast_search` parses source with installed Tree-sitter/WASM grammars; it does not require a language server. Supported `--language` values are `typescript`, `tsx`, `javascript`, `jsx`, `python`, `php`, `go`, `rust`, and `java`.
+
+```bash
+cclsp-hub ast_search --root /workspace/app \
+  --language typescript --path src \
+  --pattern 'function $NAME($$$ARGS) { $$$BODY }' --max-results 25
+```
+
+`$NAME` captures one named syntax node and `$$$NAME` captures zero or more named siblings. The default result limit is 100 and the ceiling is 1,000. Search stays inside the registered root, indexes at most 5,000 deterministically ordered files, skips files larger than 512 KiB during directory searches, and reports typed errors for invalid patterns, unsupported languages, escaped paths, explicit oversized files, and parse failures.
+
+Results carry `provider: "tree-sitter"`, zero-indexed structured ranges, capture ranges, and truncation/index metadata. Tree-sitter fallback for definitions, document symbols, and query-position resolution is explicitly syntax-only; it does not provide semantic references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety. A supported empty LSP answer remains an LSP answer and never falls back.
 
 Flag notes:
 - `--file` is sugar for `--file-path`; `--symbol` for `--symbol-name`.
@@ -185,6 +200,9 @@ governs the subdir). Use `--isolate` when a nested package needs its own instanc
   supported empty result, which remains exit 0.
 - Rename validation failures return `outcome = "rejected"` and preserve the
   language server's reason; no rename request or file edit follows a rejection.
+- AST rejections return `structuredContent.outcome = "rejected"`, a typed
+  `AST_*` code, and exit non-zero. A valid empty AST search is `outcome = "ok"`,
+  `provider = "tree-sitter"`, `matches = []`, and exit 0.
 
 ## Configuration
 

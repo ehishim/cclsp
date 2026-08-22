@@ -15,6 +15,7 @@ const SRC_OTHER = join(tmpdir(), 'src', 'other.ts');
 type MockLSPClient = {
   findSymbolsByName: ReturnType<typeof jest.fn>;
   findDefinition: ReturnType<typeof jest.fn>;
+  findDefinitionsWithProvider: ReturnType<typeof jest.fn>;
   findReferences: ReturnType<typeof jest.fn>;
   renameSymbol: ReturnType<typeof jest.fn>;
   symbolKindToString: ReturnType<typeof jest.fn>;
@@ -22,9 +23,10 @@ type MockLSPClient = {
 };
 
 function createMockClient(): MockLSPClient {
-  return {
+  const mock = {
     findSymbolsByName: jest.fn(),
     findDefinition: jest.fn(),
+    findDefinitionsWithProvider: jest.fn(),
     findReferences: jest.fn(),
     renameSymbol: jest.fn(),
     symbolKindToString: jest.fn((kind: number) => {
@@ -38,6 +40,27 @@ function createMockClient(): MockLSPClient {
     }),
     syncFileContent: jest.fn().mockResolvedValue(undefined),
   };
+  mock.findDefinitionsWithProvider.mockImplementation(
+    async (filePath: string, symbolName: string, symbolKind?: string) => {
+      const { matches, warning } = await mock.findSymbolsByName(filePath, symbolName, symbolKind);
+      const locations = [];
+      for (const match of matches) {
+        locations.push(...(await mock.findDefinition(filePath, match.position)));
+      }
+      return {
+        outcome: 'ok',
+        provider: 'lsp',
+        value: locations,
+        warning,
+        matchedSymbols: matches.length,
+        matchedDescriptions: matches.map(
+          (match: { name: string; kind: number }) =>
+            `${match.name} (${mock.symbolKindToString(match.kind)})`
+        ),
+      };
+    }
+  );
+  return mock;
 }
 
 function asClient(mock: MockLSPClient): LSPClient {

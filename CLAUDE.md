@@ -57,6 +57,14 @@ npm run prepublishOnly  # build + test + typecheck
 - Maintains process lifecycle and request/response correlation
 - Auto-detects and applies server-specific adapters
 
+**AST Provider** (`src/ast/`)
+
+- Loads installed Tree-sitter/WASM grammars for TypeScript/TSX, JavaScript/JSX, Python, PHP, Go, Rust, and Java without request-time downloads
+- Owns a root-contained, gitignore-aware index capped at 5,000 files and 512 KiB per file
+- Exposes structural patterns with `$NAME` single-node and `$$$NAME` variadic captures
+- Supplies explicitly syntax-only declaration, document-symbol, and query-position fallback when no configured LSP exists or the selected server does not support the required method
+- Preserves provider provenance: LSP success, including supported-empty, remains `lsp`; AST results are `tree-sitter`; unavailable results are `none`
+
 **Server Adapter System** (`src/lsp/adapters/`)
 
 - Built-in adapters for LSP servers with non-standard behavior
@@ -76,10 +84,10 @@ npm run prepublishOnly  # build + test + typecheck
 
 1. MCP client sends tool request (e.g., `find_definition`)
 2. Main server resolves file path and extracts position
-3. LSP client determines appropriate language server for file extension
-4. If server not running, spawns new LSP server process
-5. Sends LSP request to server and correlates response
-6. Transforms LSP response back to MCP format
+3. `LSPClient` remains the provider-selection owner: `ast_search` goes directly to its root-bound AST provider; semantic tools prefer the appropriate language server
+4. If an admitted declaration/document-symbol operation has no configured server or the method is unsupported, `LSPClient` may return a syntax-only Tree-sitter fallback with explicit limitations; supported-empty and other LSP failures never fall back
+5. If an LSP server is needed and not running, spawns the language server process
+6. Sends the request to the selected provider and transforms the result back to MCP format with explicit provider provenance
 
 ### LSP Server Management
 
@@ -153,6 +161,14 @@ Run quality checks before committing:
 ```bash
 bun run lint:fix && bun run format && bun run typecheck && bun run test
 ```
+
+## Structural AST Search
+
+`ast_search(pattern, language, path?, max_results?)` is an offline structural-search tool. `language` is required. A relative `path` resolves under the registered root, and canonical path checks reject traversal or symlink escape. `max_results` defaults to 100 and is capped at 1,000.
+
+Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, explicit oversized files, and parse failures are typed `AST_*` rejections. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
+
+Tree-sitter evidence is syntax-only. Never use it as semantic proof for references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety.
 
 ## LSP Protocol Details
 

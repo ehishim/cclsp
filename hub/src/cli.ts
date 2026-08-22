@@ -8,6 +8,7 @@ import type { ToolSchema } from './pool.js';
 
 // Friendly subcommand -> cclsp tool name.
 const ALIASES: Record<string, string> = {
+  'ast-search': 'ast_search',
   definition: 'find_definition',
   references: 'find_references',
   implementation: 'find_implementation',
@@ -175,6 +176,7 @@ ROOTS & DAEMON
   describe                List the available cclsp tools
 
 CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need --root)
+  ast_search              --pattern P --language L [--path P] [--max-results N] [--root R]
   find_definition         --file F --symbol-name NAME [--symbol-kind K]
   find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
   find_implementation     --file F (--query Q | --line N --character C)
@@ -197,7 +199,7 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need -
   restart_server          --root R [--extensions ts,tsx]
   call <tool>             Raw passthrough; combine with --params-json '{...}'
 
-Short aliases (and kebab-case) also work: definition, references, implementation,
+Short aliases (and kebab-case) also work: ast-search, definition, references, implementation,
 hover, document-symbols, completions, signatures, code-actions, rename-file,
 diagnostics, diagnostics-batch, rename, rename-strict, symbols, call-hierarchy,
 incoming-calls, outgoing-calls, restart-server.

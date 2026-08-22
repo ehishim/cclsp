@@ -2,9 +2,17 @@ import { readFileSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
 import { extname, isAbsolute, join, normalize, relative } from 'node:path';
+import { AstProvider } from './ast/provider.js';
+import type {
+  AstSearchInput,
+  AstSearchOutcome,
+  ProviderDefinitions,
+  ProviderDocumentSymbols,
+  ProviderValue,
+} from './ast/types.js';
 import { loadGitignore, scanDirectoryForExtensions } from './file-scanner.js';
 import { logger } from './logger.js';
-import { supportsMethod } from './lsp/capabilities.js';
+import { LspToolOutcomeError, supportsMethod } from './lsp/capabilities.js';
 import { loadConfig } from './lsp/config.js';
 import {
   getValidSymbolKinds,
@@ -56,14 +64,47 @@ import type {
 import type { SymbolKind } from './lsp/types.js';
 import { pathToUri, uriToPath } from './utils.js';
 
+class NoConfiguredLanguageServerError extends Error {
+  constructor(readonly filePath: string) {
+    super(`No LSP server configured for file: ${filePath}`);
+    this.name = 'NoConfiguredLanguageServerError';
+  }
+}
+
+function isAstFallbackEligible(error: unknown): boolean {
+  return (
+    error instanceof NoConfiguredLanguageServerError ||
+    (error instanceof LspToolOutcomeError && error.outcome.code === 'LSP_METHOD_UNSUPPORTED')
+  );
+}
+
+function preserveUnsupportedOrigin<T>(
+  error: unknown,
+  fallback: ProviderValue<T>
+): ProviderValue<T> {
+  if (!(error instanceof LspToolOutcomeError) || fallback.outcome === 'ok') return fallback;
+  return {
+    outcome: 'unavailable',
+    provider: 'none',
+    code: error.outcome.code,
+    reason: error.message,
+    method: error.outcome.method,
+    server: error.outcome.server,
+    ...(error.outcome.reason ? { lspReason: error.outcome.reason } : {}),
+    fallback: { code: fallback.code, reason: fallback.reason },
+  };
+}
+
 export class LSPClient {
   private config: Config;
   private serverManager = new ServerManager();
+  private astProvider: AstProvider;
   private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
   private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<void>>();
 
-  constructor(configPath?: string) {
+  constructor(configPath?: string, root = process.cwd()) {
     this.config = loadConfig(configPath);
+    this.astProvider = new AstProvider(root);
   }
 
   private getServerForFile(filePath: string): LSPServerConfig | null {
@@ -229,7 +270,8 @@ export class LSPClient {
       }
     } catch (error) {
       logger.error(`[syncFileContent] Failed to sync file ${filePath}: ${error}\n`);
-      // Don't throw - syncing is best effort
+    } finally {
+      await this.astProvider.invalidate(filePath);
     }
   }
 
@@ -238,7 +280,7 @@ export class LSPClient {
 
     const serverConfig = this.getServerForFile(filePath);
     if (!serverConfig) {
-      throw new Error(`No LSP server configured for file: ${filePath}`);
+      throw new NoConfiguredLanguageServerError(filePath);
     }
 
     logger.debug(`[getServer] Found server config: ${serverConfig.command.join(' ')}\n`);
@@ -246,9 +288,46 @@ export class LSPClient {
     return this.serverManager.getServer(serverConfig);
   }
 
+  async astSearch(input: AstSearchInput): Promise<AstSearchOutcome> {
+    return this.astProvider.search(input);
+  }
+
   async findDefinition(filePath: string, position: Position): Promise<Location[]> {
     const serverState = await this.getServer(filePath);
     return opsFindDefinition(serverState, filePath, position);
+  }
+
+  async findDefinitionsWithProvider(
+    filePath: string,
+    symbolName: string,
+    symbolKind?: string
+  ): Promise<ProviderDefinitions> {
+    try {
+      const { matches, warning } = await this.findSymbolsByName(filePath, symbolName, symbolKind);
+      if (matches.length === 0) {
+        return { outcome: 'ok', provider: 'lsp', value: [], warning, matchedSymbols: 0 };
+      }
+      const locations: Location[] = [];
+      for (const match of matches) {
+        locations.push(...(await this.findDefinition(filePath, match.position)));
+      }
+      return {
+        outcome: 'ok',
+        provider: 'lsp',
+        value: locations,
+        warning,
+        matchedSymbols: matches.length,
+        matchedDescriptions: matches.map(
+          (match) => `${match.name} (${this.symbolKindToString(match.kind)})`
+        ),
+      };
+    } catch (error) {
+      if (!isAstFallbackEligible(error)) throw error;
+      return preserveUnsupportedOrigin(
+        error,
+        await this.astProvider.findDeclarations(filePath, symbolName, symbolKind)
+      );
+    }
   }
 
   async findReferences(
@@ -291,6 +370,15 @@ export class LSPClient {
   async getDocumentSymbols(filePath: string): Promise<DocumentSymbol[] | SymbolInformation[]> {
     const serverState = await this.getServer(filePath);
     return opsGetDocumentSymbols(serverState, filePath);
+  }
+
+  async getDocumentSymbolsWithProvider(filePath: string): Promise<ProviderDocumentSymbols> {
+    try {
+      return { outcome: 'ok', provider: 'lsp', value: await this.getDocumentSymbols(filePath) };
+    } catch (error) {
+      if (!isAstFallbackEligible(error)) throw error;
+      return preserveUnsupportedOrigin(error, await this.astProvider.documentSymbols(filePath));
+    }
   }
 
   async getCompletions(
@@ -346,8 +434,13 @@ export class LSPClient {
   }
 
   async didRenameFiles(oldPath: string, newPath: string): Promise<void> {
-    const serverState = await this.getServer(oldPath);
-    return opsDidRenameFiles(serverState, oldPath, newPath);
+    try {
+      const serverState = await this.getServer(oldPath);
+      return opsDidRenameFiles(serverState, oldPath, newPath);
+    } finally {
+      await this.astProvider.invalidate(oldPath);
+      await this.astProvider.invalidate(newPath);
+    }
   }
 
   async getDiagnostics(filePath: string): Promise<Diagnostic[]> {
@@ -828,6 +921,7 @@ export class LSPClient {
   }
 
   async dispose(): Promise<void> {
+    await this.astProvider.dispose();
     await this.serverManager.dispose();
   }
 }

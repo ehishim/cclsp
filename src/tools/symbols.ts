@@ -64,7 +64,15 @@ export const getDocumentSymbolsTool: ToolDefinition = {
     const { file_path } = args as { file_path: string };
     const absolutePath = resolvePath(file_path);
     try {
-      const symbols = await client.getDocumentSymbols(absolutePath);
+      const result = await client.getDocumentSymbolsWithProvider(absolutePath);
+      if (result.outcome !== 'ok') {
+        return {
+          content: [{ type: 'text', text: `${result.code}: ${result.reason}` }],
+          structuredContent: result,
+          isError: true,
+        };
+      }
+      const symbols = result.value;
       const hierarchical =
         symbols.length === 0 ||
         ('range' in (symbols[0] as DocumentSymbol) &&
@@ -78,11 +86,17 @@ export const getDocumentSymbolsTool: ToolDefinition = {
             type: 'text',
             text:
               output.length === 0
-                ? `No document symbols found in ${file_path}`
-                : `Document symbols in ${file_path}:\n${JSON.stringify(output, null, 2)}`,
+                ? `No document symbols found in ${file_path} (${result.provider})`
+                : `Document symbols in ${file_path} (${result.provider}):\n${JSON.stringify(output, null, 2)}`,
           },
         ],
-        structuredContent: { outcome: 'ok', file: absolutePath, symbols: output },
+        structuredContent: {
+          outcome: 'ok',
+          provider: result.provider,
+          file: absolutePath,
+          symbols: output,
+          ...(result.provider === 'tree-sitter' ? { limitations: result.limitations } : {}),
+        },
       };
     } catch (error) {
       rethrowToolOutcome(error);

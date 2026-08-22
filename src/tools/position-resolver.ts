@@ -18,9 +18,35 @@ export interface SymbolCandidate {
 }
 
 export type ToolPositionResolution =
-  | { outcome: 'resolved'; position: Position; candidate?: SymbolCandidate; query?: string }
-  | { outcome: 'ambiguous'; query: string; candidates: SymbolCandidate[] }
-  | { outcome: 'not_found'; query: string; candidates: SymbolCandidate[] }
+  | {
+      outcome: 'resolved';
+      position: Position;
+      candidate?: SymbolCandidate;
+      query?: string;
+      provider?: 'lsp' | 'tree-sitter';
+    }
+  | {
+      outcome: 'ambiguous';
+      query: string;
+      candidates: SymbolCandidate[];
+      provider: 'lsp' | 'tree-sitter';
+    }
+  | {
+      outcome: 'not_found';
+      query: string;
+      candidates: SymbolCandidate[];
+      provider: 'lsp' | 'tree-sitter';
+    }
+  | {
+      outcome: 'unavailable';
+      provider: 'none';
+      code: string;
+      reason: string;
+      method?: string;
+      server?: string;
+      lspReason?: string;
+      fallback?: { code: string; reason: string };
+    }
   | { outcome: 'invalid'; reason: string };
 
 type InternalCandidate = SymbolCandidate;
@@ -52,7 +78,20 @@ export async function resolveToolPosition(
   const query = selector.query?.trim() ?? '';
   if (!query) return { outcome: 'invalid', reason: 'query must not be empty' };
 
-  const symbols = await client.getDocumentSymbols(filePath);
+  const symbolResult = await client.getDocumentSymbolsWithProvider(filePath);
+  if (symbolResult.outcome !== 'ok') {
+    return {
+      outcome: 'unavailable',
+      provider: 'none',
+      code: symbolResult.code,
+      reason: symbolResult.reason,
+      ...(symbolResult.method ? { method: symbolResult.method } : {}),
+      ...(symbolResult.server ? { server: symbolResult.server } : {}),
+      ...(symbolResult.lspReason ? { lspReason: symbolResult.lspReason } : {}),
+      ...(symbolResult.fallback ? { fallback: symbolResult.fallback } : {}),
+    };
+  }
+  const symbols = symbolResult.value;
   const candidates = flattenSymbols(symbols, client);
   const queryLower = query.toLowerCase();
   const tiers = [
@@ -70,7 +109,13 @@ export async function resolveToolPosition(
     if (matches.length === 1) {
       const candidate = matches[0];
       if (candidate) {
-        return { outcome: 'resolved', position: candidate.position, candidate, query };
+        return {
+          outcome: 'resolved',
+          position: candidate.position,
+          candidate,
+          query,
+          provider: symbolResult.provider,
+        };
       }
     }
     if (matches.length > 1) {
@@ -78,6 +123,7 @@ export async function resolveToolPosition(
         outcome: 'ambiguous',
         query,
         candidates: matches.slice(0, MAX_RECOVERY_CANDIDATES),
+        provider: symbolResult.provider,
       };
     }
   }
@@ -86,6 +132,7 @@ export async function resolveToolPosition(
     outcome: 'not_found',
     query,
     candidates: candidates.slice(0, MAX_RECOVERY_CANDIDATES),
+    provider: symbolResult.provider,
   };
 }
 
@@ -99,6 +146,16 @@ export function positionResolutionResult(
       `Invalid position selector for ${filePath}: ${resolution.reason}`,
       { reason: resolution.reason }
     );
+  }
+
+  if (resolution.outcome === 'unavailable') {
+    return failureResult(resolution.code, resolution.reason, {
+      provider: 'none',
+      ...(resolution.method ? { method: resolution.method } : {}),
+      ...(resolution.server ? { server: resolution.server } : {}),
+      ...(resolution.lspReason ? { lspReason: resolution.lspReason } : {}),
+      ...(resolution.fallback ? { fallback: resolution.fallback } : {}),
+    });
   }
 
   const candidates = resolution.candidates.map(({ name, qualifiedName, kind, position }) => ({
@@ -122,8 +179,9 @@ export function positionResolutionResult(
   const recovery =
     candidates.length > 0
       ? `\nCandidates (max ${MAX_RECOVERY_CANDIDATES}):\n${rendered}`
-      : '\nThe language server returned no document symbols for recovery.';
+      : `\nThe ${resolution.provider} provider returned no document symbols for recovery.`;
   return failureResult(code, `${prefix}${recovery}`, {
+    provider: resolution.provider,
     query: resolution.query,
     candidates,
   });
@@ -131,7 +189,7 @@ export function positionResolutionResult(
 
 export function resolvedFromText(resolution: ToolPositionResolution): string | undefined {
   if (resolution.outcome !== 'resolved' || !resolution.candidate) return undefined;
-  return `Resolved "${resolution.candidate.qualifiedName}" at ${resolution.position.line + 1}:${resolution.position.character + 1}`;
+  return `Resolved "${resolution.candidate.qualifiedName}" at ${resolution.position.line + 1}:${resolution.position.character + 1}${resolution.provider ? ` (${resolution.provider})` : ''}`;
 }
 
 export function resolvedFromMetadata(
@@ -147,6 +205,7 @@ export function resolvedFromMetadata(
     kind: resolution.candidate.kind,
     line: resolution.position.line + 1,
     character: resolution.position.character + 1,
+    ...(resolution.provider ? { provider: resolution.provider } : {}),
   };
 }
 
@@ -159,7 +218,7 @@ function failureResult(code: string, text: string, extra: Record<string, unknown
 }
 
 function flattenSymbols(
-  symbols: DocumentSymbol[] | SymbolInformation[],
+  symbols: Array<DocumentSymbol | SymbolInformation>,
   client: LSPClient
 ): InternalCandidate[] {
   if (symbols.length === 0) return [];
