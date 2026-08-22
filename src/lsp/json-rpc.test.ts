@@ -5,6 +5,15 @@ import { JsonRpcTransport } from './json-rpc.js';
 import type { LSPMessage } from './types.js';
 
 /**
+ * Build the exact bytes a server writes for one message. Content-Length is a BYTE
+ * count, so a body carrying multi-byte characters is longer than its string length.
+ */
+function frameBytes(message: LSPMessage): Buffer {
+  const content = JSON.stringify(message);
+  return Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8');
+}
+
+/**
  * Create a mock ChildProcess with emittable stdout and writable stdin.
  */
 function createMockProcess() {
@@ -30,9 +39,16 @@ function createMockProcess() {
     stdinData,
     /** Simulate the server sending a Content-Length framed message */
     simulateResponse(message: LSPMessage) {
-      const content = JSON.stringify(message);
-      const frame = `Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`;
-      stdout.emit('data', Buffer.from(frame));
+      stdout.emit('data', frameBytes(message));
+    },
+    /** Simulate the server writing exact bytes, split at the given byte offsets */
+    simulateBytes(bytes: Buffer, ...splitAt: number[]) {
+      const offsets = [0, ...splitAt, bytes.length];
+      for (let i = 0; i < offsets.length - 1; i++) {
+        const start = offsets[i] as number;
+        const end = offsets[i + 1] as number;
+        if (end > start) stdout.emit('data', bytes.subarray(start, end));
+      }
     },
   };
 }
@@ -180,6 +196,106 @@ describe('JsonRpcTransport', () => {
       mock.stdout.emit('data', Buffer.from(frame.substring(mid)));
 
       expect(messageHandler).toHaveBeenCalledTimes(1);
+    });
+
+    it('delivers a body carrying multi-byte characters instead of stalling', () => {
+      // The real repro: a hover response whose docblock contains an em dash and an
+      // arrow. Measured against a string buffer, the frame is 4 bytes short of its
+      // declared Content-Length, so the completeness check stayed false forever.
+      const text = 'Revokes every token \u2014 the session ends \u2192 nothing resumes';
+      mock.simulateResponse({
+        jsonrpc: '2.0',
+        method: 'window/logMessage',
+        params: { text },
+      });
+
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+      const received = messageHandler.mock.calls[0]?.[0] as LSPMessage;
+      expect((received.params as { text: string }).text).toBe(text);
+    });
+
+    it('resolves a pending request whose response carries non-ASCII prose', async () => {
+      const promise = transport.sendRequest('textDocument/hover', {});
+      const written = mock.stdinData[0] as string;
+      const sent = JSON.parse(written.substring(written.indexOf('{'))) as LSPMessage;
+
+      const value = '```php\npublic function revoke(): void\n```\n\u2014 invalidates \u2192 all';
+      mock.simulateResponse({
+        jsonrpc: '2.0',
+        id: sent.id,
+        result: { contents: { kind: 'markdown', value } },
+      });
+
+      const result = (await promise) as { contents: { value: string } };
+      expect(result.contents.value).toBe(value);
+    });
+
+    it('decodes a multi-byte character split across two data events', () => {
+      const text = 'before \u2014 after';
+      const bytes = frameBytes({ jsonrpc: '2.0', method: 'notification', params: { text } });
+      // Split strictly inside the em dash: its three UTF-8 bytes straddle the writes,
+      // so decoding each chunk on arrival would corrupt the character.
+      const emDashStart = bytes.indexOf(Buffer.from('\u2014', 'utf8'));
+      expect(emDashStart).toBeGreaterThan(0);
+      mock.simulateBytes(bytes, emDashStart + 1);
+
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+      const received = messageHandler.mock.calls[0]?.[0] as LSPMessage;
+      expect((received.params as { text: string }).text).toBe(text);
+    });
+
+    it('keeps framing later messages after a multi-byte body', () => {
+      // The desync this guards: undelivered bytes left at the head of the buffer
+      // slice every later response against a stale header for the life of the server.
+      mock.simulateResponse({
+        jsonrpc: '2.0',
+        method: 'first',
+        params: { text: '\u2014\u2192\u00e9\u{1f600}' },
+      });
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'second', params: {} });
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'third', params: {} });
+
+      expect(messageHandler).toHaveBeenCalledTimes(3);
+      expect((messageHandler.mock.calls[2]?.[0] as LSPMessage).method).toBe('third');
+    });
+
+    it('costs one message when a body cannot be parsed', () => {
+      const broken = '{"jsonrpc":"2.0",';
+      mock.stdout.emit(
+        'data',
+        Buffer.from(`Content-Length: ${Buffer.byteLength(broken)}\r\n\r\n${broken}`, 'utf8')
+      );
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'after', params: {} });
+
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+      expect((messageHandler.mock.calls[0]?.[0] as LSPMessage).method).toBe('after');
+    });
+
+    it('costs one header block when Content-Length is absent or unusable', () => {
+      mock.stdout.emit('data', Buffer.from('X-Trace: 1\r\n\r\n', 'utf8'));
+      mock.stdout.emit('data', Buffer.from(`Content-Length: ${'9'.repeat(40)}\r\n\r\n`, 'utf8'));
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'after', params: {} });
+
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+      expect((messageHandler.mock.calls[0]?.[0] as LSPMessage).method).toBe('after');
+    });
+
+    it('does not abandon frames buffered behind a throwing handler', () => {
+      const local = createMockProcess();
+      const seen: string[] = [];
+      const throwing = jest.fn((message: LSPMessage) => {
+        seen.push(message.method as string);
+        if (message.method === 'boom') throw new Error('handler exploded');
+      });
+      new JsonRpcTransport(local.process, throwing);
+
+      const both = Buffer.concat([
+        frameBytes({ jsonrpc: '2.0', method: 'boom', params: {} }),
+        frameBytes({ jsonrpc: '2.0', method: 'survivor', params: {} }),
+      ]);
+      local.stdout.emit('data', both);
+
+      expect(seen).toEqual(['boom', 'survivor']);
     });
 
     it('handles multiple messages in a single data event', () => {

@@ -8,6 +8,9 @@ import type { LSPMessage } from './types.js';
  */
 export type MessageHandler = (message: LSPMessage) => void;
 
+/** LSP header/body separator. Bytes, so the offset it yields indexes the byte buffer. */
+const HEADER_TERMINATOR = Buffer.from('\r\n\r\n', 'latin1');
+
 /**
  * JSON-RPC 2.0 transport over stdio with Content-Length framing.
  *
@@ -25,7 +28,15 @@ export class JsonRpcTransport {
     number,
     { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }
   > = new Map();
-  private buffer = '';
+  /**
+   * Incoming stdout bytes awaiting framing.
+   *
+   * Bytes, never a string: `Content-Length` counts BYTES while a JS string counts
+   * UTF-16 code units, so a body carrying any multi-byte character measures short
+   * and its completeness check stays false with the whole message already received.
+   * Holding raw bytes also lets a UTF-8 sequence straddle two stdout writes.
+   */
+  private buffer: Buffer = Buffer.alloc(0);
 
   constructor(
     private readonly process: ChildProcess,
@@ -39,39 +50,62 @@ export class JsonRpcTransport {
    * Parses incoming data into complete JSON-RPC messages.
    */
   private setupStdoutHandler(): void {
-    this.process.stdout?.on('data', (data: Buffer) => {
-      this.buffer += data.toString();
-
-      while (this.buffer.includes('\r\n\r\n')) {
-        const headerEndIndex = this.buffer.indexOf('\r\n\r\n');
-        const headerPart = this.buffer.substring(0, headerEndIndex);
-        const contentLengthMatch = headerPart.match(/Content-Length: (\d+)/);
-
-        if (contentLengthMatch?.[1]) {
-          const contentLength = Number.parseInt(contentLengthMatch[1]);
-          const messageStart = headerEndIndex + 4;
-
-          if (this.buffer.length >= messageStart + contentLength) {
-            const messageContent = this.buffer.substring(
-              messageStart,
-              messageStart + contentLength
-            );
-            this.buffer = this.buffer.substring(messageStart + contentLength);
-
-            try {
-              const message: LSPMessage = JSON.parse(messageContent);
-              this.handleIncoming(message);
-            } catch (error) {
-              logger.error(`Failed to parse LSP message: ${error}\n`);
-            }
-          } else {
-            break;
-          }
-        } else {
-          this.buffer = this.buffer.substring(headerEndIndex + 4);
-        }
-      }
+    this.process.stdout?.on('data', (data: Buffer | string) => {
+      const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
+      this.buffer = Buffer.concat([this.buffer, chunk]);
+      this.drainFrames();
     });
+  }
+
+  /**
+   * Consume every complete frame currently buffered.
+   *
+   * Each iteration either advances past exactly one frame or returns to await more
+   * bytes, so an unframeable message costs one message rather than desynchronizing
+   * the transport for the life of the server: undelivered bytes left at the head of
+   * the buffer would slice every later response against a stale header.
+   */
+  private drainFrames(): void {
+    while (true) {
+      const headerEndIndex = this.buffer.indexOf(HEADER_TERMINATOR);
+      if (headerEndIndex === -1) return;
+
+      const bodyStart = headerEndIndex + HEADER_TERMINATOR.length;
+      // Headers are ASCII per the LSP specification; latin1 maps bytes 1:1, so a
+      // non-ASCII byte cannot be folded into a digit the way 'ascii' truncation would.
+      const headerPart = this.buffer.toString('latin1', 0, headerEndIndex);
+      const contentLengthMatch = headerPart.match(/Content-Length: (\d+)/);
+      const contentLength = contentLengthMatch?.[1]
+        ? Number.parseInt(contentLengthMatch[1], 10)
+        : Number.NaN;
+
+      if (!Number.isSafeInteger(contentLength)) {
+        // Missing or unusable length: drop this header block only and resynchronize
+        // on the next one. Retaining it would stall the buffer permanently.
+        this.buffer = this.buffer.subarray(bodyStart);
+        continue;
+      }
+
+      if (this.buffer.length < bodyStart + contentLength) return;
+
+      const messageContent = this.buffer.toString('utf8', bodyStart, bodyStart + contentLength);
+      this.buffer = this.buffer.subarray(bodyStart + contentLength);
+
+      let message: LSPMessage;
+      try {
+        message = JSON.parse(messageContent);
+      } catch (error) {
+        logger.error(`Failed to parse LSP message: ${error}\n`);
+        continue;
+      }
+
+      try {
+        this.handleIncoming(message);
+      } catch (error) {
+        // A throwing consumer must not abandon frames already buffered behind it.
+        logger.error(`Failed to dispatch LSP message: ${error}\n`);
+      }
+    }
   }
 
   /**
