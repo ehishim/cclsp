@@ -5,7 +5,7 @@ import type {
   TextDocumentEditResult,
   WorkspaceEditResult,
 } from '../lsp/operations.js';
-import { resolvePath, rethrowToolOutcome, textResult } from './helpers.js';
+import { resolvePath, rethrowToolOutcome } from './helpers.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -195,7 +195,7 @@ export const getCompletionsTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: items.length > 0 ? 'ok' : 'empty',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           items,
           isIncomplete: result.isIncomplete,
@@ -259,9 +259,9 @@ export const getSignatureHelpTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'empty', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            signatures: [],
+            signatures: [], shown: 0, total: 0, omitted: 0,
           },
         };
       }
@@ -273,9 +273,12 @@ export const getSignatureHelpTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: 'ok', provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           ...result,
+          shown: result.signatures.length,
+          total: result.signatures.length,
+          omitted: 0,
         },
       };
     } catch (error) {
@@ -444,7 +447,7 @@ export const getCodeActionsTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: summaries.length > 0 ? 'ok' : 'empty',
             ...(resolvedFrom ? { resolvedFrom } : {}),
             actions: summaries,
             truncated: actions.length > summaries.length,

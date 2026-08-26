@@ -118,8 +118,10 @@ describe('query selector parity', () => {
       expect(method).toHaveBeenCalled();
       expect(JSON.stringify(method.mock.calls[0])).toContain(JSON.stringify(POSITION));
       expect(result.isError).not.toBe(true);
+      // Every fixture answers with no rows, so the honest outcome is `empty`;
+      // the selector parity this case proves is carried by `resolvedFrom`.
       expect(result.structuredContent).toMatchObject({
-        outcome: 'ok',
+        outcome: 'empty',
         resolvedFrom: {
           query: 'run',
           qualifiedName: 'run',
@@ -137,7 +139,7 @@ describe('query selector parity', () => {
       client
     );
     expect(result.structuredContent).toMatchObject({
-      outcome: 'ok',
+      outcome: 'empty',
       resolvedFrom: {
         query: 'run',
         qualifiedName: 'run',

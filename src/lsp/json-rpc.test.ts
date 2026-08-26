@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, jest } from 'bun:test';
 import type { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { LspToolOutcomeError } from './capabilities.js';
 import { JsonRpcTransport } from './json-rpc.js';
 import type { LSPMessage } from './types.js';
 
@@ -327,6 +331,145 @@ describe('JsonRpcTransport', () => {
     it('does nothing when no requests are pending', () => {
       // Should not throw
       transport.rejectAllPending('No-op');
+    });
+  });
+
+  describe('over-bound response bodies', () => {
+    const spoolDir = mkdtempSync(join(tmpdir(), 'cclsp-ingress-'));
+    const previousDir = process.env.CCLSP_RESULT_DIR;
+    const previousBound = process.env.CCLSP_LSP_MAX_MESSAGE_BYTES;
+
+    beforeEach(() => {
+      process.env.CCLSP_RESULT_DIR = spoolDir;
+      process.env.CCLSP_LSP_MAX_MESSAGE_BYTES = '2048';
+    });
+
+    afterEach(() => {
+      if (previousDir === undefined) delete process.env.CCLSP_RESULT_DIR;
+      else process.env.CCLSP_RESULT_DIR = previousDir;
+      if (previousBound === undefined) delete process.env.CCLSP_LSP_MAX_MESSAGE_BYTES;
+      else process.env.CCLSP_LSP_MAX_MESSAGE_BYTES = previousBound;
+      rmSync(spoolDir, { recursive: true, force: true });
+    });
+
+    it('streams an over-bound body to a spool file and returns a typed pointer', async () => {
+      const pending = transport.sendRequest('textDocument/documentSymbol', {}, 5000);
+      const rows = Array.from({ length: 400 }, (_, index) => ({ name: `symbol${index}`, detail: 'x'.repeat(60) }));
+      const content = JSON.stringify({ jsonrpc: '2.0', id: 1, result: rows });
+      expect(Buffer.byteLength(content)).toBeGreaterThan(2048);
+      const bytes = Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8');
+
+      // Split mid-body: the transport must never hold the whole body in memory.
+      mock.simulateBytes(bytes, 64, 900, 4_000);
+
+      const error = await pending.then(() => null, (reason) => reason);
+      expect(error).toBeInstanceOf(LspToolOutcomeError);
+      const outcome = (error as LspToolOutcomeError).outcome;
+      expect(outcome).toMatchObject({ outcome: 'too-large', code: 'LSP_RESPONSE_SPOOLED' });
+      expect(outcome.bytes).toBe(Buffer.byteLength(content));
+      expect(outcome.recovery).toContain(outcome.resultFile as string);
+      const spooled = JSON.parse(readFileSync(outcome.resultFile as string, 'utf8'));
+      expect(spooled.result).toHaveLength(400);
+    });
+
+    it('correlates a response whose id follows a large result', async () => {
+      const pending = transport.sendRequest('textDocument/references', {}, 5000);
+      // Real servers emit the id after the payload; a head-only scan would miss it
+      // and leave this request to time out.
+      const content = `{"jsonrpc":"2.0","result":${JSON.stringify(Array.from({ length: 400 }, (_, i) => ({ uri: `file:///src/f${i}.ts`, detail: 'z'.repeat(40) })))},"id":1}`;
+      expect(Buffer.byteLength(content)).toBeGreaterThan(2048);
+      const bytes = Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8');
+      mock.simulateBytes(bytes, 40, 700, 5_000);
+
+      const error = await pending.then(() => null, (reason) => reason);
+      expect(error).toBeInstanceOf(LspToolOutcomeError);
+      expect((error as LspToolOutcomeError).outcome).toMatchObject({
+        outcome: 'too-large', code: 'LSP_RESPONSE_SPOOLED',
+      });
+    });
+
+    it('correlates each oversized response to its own concurrent request', async () => {
+      const first = transport.sendRequest('textDocument/references', {}, 5000);
+      const second = transport.sendRequest('textDocument/documentSymbol', {}, 5000);
+      // Distinct row counts per id, so the rejected byte size proves WHICH request
+      // each spooled body reached rather than only that both were rejected. Every
+      // row also carries the id of the OTHER pending request: a text match would
+      // find it first and reject the wrong caller.
+      const payload = (id: number) =>
+        `{"jsonrpc":"2.0","id":${id},"result":${JSON.stringify(Array.from({ length: id === 1 ? 200 : 300 }, () => ({ nested: { id: id === 1 ? 2 : 1 }, pad: 'q'.repeat(30) })))}}`;
+
+      for (const id of [2, 1]) {
+        const content = payload(id);
+        mock.stdout.emit('data', Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8'));
+      }
+
+      const secondError = await second.then(() => null, (reason) => reason);
+      const firstError = await first.then(() => null, (reason) => reason);
+      expect(secondError).toBeInstanceOf(LspToolOutcomeError);
+      expect(firstError).toBeInstanceOf(LspToolOutcomeError);
+      const files = [firstError, secondError].map((error) => (error as LspToolOutcomeError).outcome.resultFile);
+      expect(new Set(files).size).toBe(2);
+      expect((firstError as LspToolOutcomeError).outcome.bytes).toBe(Buffer.byteLength(payload(1)));
+      expect((secondError as LspToolOutcomeError).outcome.bytes).toBe(Buffer.byteLength(payload(2)));
+    });
+
+    it('rejects only the answered request when the payload names another pending id', async () => {
+      const first = transport.sendRequest('textDocument/references', {}, 5000);
+      let firstSettled = false;
+      void first.then(() => { firstSettled = true; }, () => { firstSettled = true; });
+      const second = transport.sendRequest('textDocument/documentSymbol', {}, 5000);
+
+      // The response to request 2 carries request 1's id inside its own result,
+      // AFTER its real id, so neither a first-match nor a last-match text scan
+      // can pass this case.
+      const content = `{"jsonrpc":"2.0","id":2,"result":${JSON.stringify(Array.from({ length: 300 }, () => ({ id: 1, pad: 'r'.repeat(30) })))}}`;
+      mock.stdout.emit('data', Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8'));
+
+      const error = await second.then(() => null, (reason) => reason);
+      expect(error).toBeInstanceOf(LspToolOutcomeError);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(firstSettled).toBe(false);
+
+      // Request 1 is still pending and still correlatable by its own answer.
+      mock.simulateResponse({ jsonrpc: '2.0', id: 1, result: ['small'] });
+      await expect(first).resolves.toEqual(['small']);
+    });
+
+    it('leaves every caller alone when an oversized frame answers nothing', async () => {
+      const pending = transport.sendRequest('textDocument/references', {}, 5000);
+      let settled = false;
+      void pending.then(() => { settled = true; }, () => { settled = true; });
+
+      // A notification, and then a server-initiated request: neither answers a
+      // caller, so neither may reject the sole outstanding request.
+      for (const frame of [
+        { jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'z'.repeat(4096), id: 1 } },
+        { jsonrpc: '2.0', id: 1, method: 'workspace/applyEdit', params: { edit: 'y'.repeat(4096) } },
+      ]) {
+        const content = JSON.stringify(frame);
+        mock.stdout.emit('data', Buffer.from(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`, 'utf8'));
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(settled).toBe(false);
+      mock.simulateResponse({ jsonrpc: '2.0', id: 1, result: ['own answer'] });
+      await expect(pending).resolves.toEqual(['own answer']);
+    });
+
+    it('resynchronizes on the next frame after an over-bound body', async () => {
+      const pending = transport.sendRequest('textDocument/documentSymbol', {}, 5000);
+      const big = JSON.stringify({ jsonrpc: '2.0', id: 1, result: 'y'.repeat(4096) });
+      mock.stdout.emit('data', Buffer.from(`Content-Length: ${Buffer.byteLength(big)}\r\n\r\n${big}`, 'utf8'));
+      await pending.then(() => null, () => null);
+
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'alive' } });
+      expect(messageHandler).toHaveBeenCalledTimes(1);
+    });
+
+    it('drops an unterminated header block instead of buffering it forever', () => {
+      mock.stdout.emit('data', Buffer.from('Content-Length: 10'.padEnd(70_000, ' '), 'utf8'));
+      mock.simulateResponse({ jsonrpc: '2.0', method: 'window/logMessage', params: { message: 'alive' } });
+      expect(messageHandler).toHaveBeenCalledTimes(1);
     });
   });
 });

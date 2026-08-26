@@ -43,12 +43,12 @@ export const CCLSP_CONFIG_PATH =
   join(homedir(), '.config/claude/cclsp.json');
 
 // Lifecycle tunables.
-export const MAX_ROOTS = intEnv('CCLSP_HUB_MAX_ROOTS', 30);
+export const MAX_ROOTS = Math.max(1, intEnv('CCLSP_HUB_MAX_ROOTS', 30));
 export const IDLE_ROOT_MS = intEnv('CCLSP_HUB_IDLE_ROOT_SEC', 30 * 60) * 1000;
 // 0 = daemon never self-exits; otherwise exit after this long with zero roots.
 export const IDLE_DAEMON_MS = intEnv('CCLSP_HUB_IDLE_DAEMON_SEC', 0) * 1000;
 // Generous default: a cold language-server index on the first real call is slow.
-export const TOOL_TIMEOUT_MS = intEnv('CCLSP_HUB_TOOL_TIMEOUT_SEC', 180) * 1000;
+export const TOOL_TIMEOUT_MS = Math.max(1, intEnv('CCLSP_HUB_TOOL_TIMEOUT_SEC', 180)) * 1000;
 
 // NOTE: diagnostics-batch file limits are NOT hub vars. They live in cclsp core
 // (CCLSP_MAX_FILES_DEFAULT / CCLSP_MAX_FILES_LIMIT) and reach the children via the

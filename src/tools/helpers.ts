@@ -1,8 +1,28 @@
 import { resolve } from 'node:path';
 import { LspToolOutcomeError } from '../lsp/capabilities.js';
+import { resultSpoolDir, spoolFullResult } from '../result-spool.js';
 import type { Location } from '../lsp/types.js';
 import { uriToPath } from '../utils.js';
 import type { ToolResult } from './registry.js';
+
+/**
+ * Row limits are generous on purpose: a caller mapping architecture needs the
+ * whole answer in one read, so the practical bound is the transport byte
+ * ceiling rather than an arbitrary row count. `max_results` exists to NARROW a
+ * known-broad question, not to trim answers by default.
+ */
+export const SEMANTIC_DEFAULT_LIMIT = 1_000;
+export const SEMANTIC_MAX_LIMIT = 5_000;
+
+export { resultSpoolDir, spoolFullResult };
+
+export function boundedResultLimit(value: unknown): number {
+  if (value === undefined) return SEMANTIC_DEFAULT_LIMIT;
+  if (!Number.isInteger(value) || Number(value) < 1 || Number(value) > SEMANTIC_MAX_LIMIT) {
+    throw new Error(`max_results must be an integer from 1 to ${SEMANTIC_MAX_LIMIT}`);
+  }
+  return Number(value);
+}
 
 export function resolvePath(filePath: string): string {
   return resolve(filePath);

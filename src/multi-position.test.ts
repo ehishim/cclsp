@@ -85,7 +85,7 @@ describe('Position-based Tool Handlers', () => {
         asClient(mockClient)
       );
 
-      expect(result.content[0]?.text).toContain('Found 2 implementation(s)');
+      expect(result.content[0]?.text).toContain('Implementations (2/2)');
       expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_IMPL1))}:6:1`);
       expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_IMPL2))}:11:5`);
     });
@@ -104,14 +104,10 @@ describe('Position-based Tool Handlers', () => {
     it('should handle errors from findImplementation', async () => {
       mockClient.findImplementation.mockRejectedValue(new Error('Server unavailable'));
 
-      const result = await findImplementationTool.handler(
+      await expect(findImplementationTool.handler(
         { file_path: 'test.ts', line: 1, character: 1 },
         asClient(mockClient)
-      );
-
-      expect(result.content[0]?.text).toContain(
-        'Error finding implementations: Server unavailable'
-      );
+      )).rejects.toThrow('Server unavailable');
     });
 
     it('should handle line 1, character 1 correctly (converts to 0, 0)', async () => {
@@ -210,12 +206,10 @@ describe('Position-based Tool Handlers', () => {
     it('should handle renameSymbol throwing an error', async () => {
       mockClient.renameSymbol.mockRejectedValue(new Error('LSP error'));
 
-      const result = await renameSymbolStrictTool.handler(
+      await expect(renameSymbolStrictTool.handler(
         { file_path: 'test.ts', line: 5, character: 10, new_name: 'newName' },
         asClient(mockClient)
-      );
-
-      expect(result.content[0]?.text).toContain('Error renaming symbol: LSP error');
+      )).rejects.toThrow('LSP error');
     });
 
     it('should show changes across multiple files in dry_run', async () => {

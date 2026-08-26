@@ -1,4 +1,4 @@
-import { resolvePath, rethrowToolOutcome, textResult } from './helpers.js';
+import { resolvePath, rethrowToolOutcome } from './helpers.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -49,9 +49,9 @@ export const getHoverTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'empty', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            hover: null,
+            hover: null, shown: 0, total: 0, omitted: 0,
           },
         };
       }
@@ -67,17 +67,16 @@ export const getHoverTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: 'ok', provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           position: resolution.position,
           hover: result,
+          shown: 1, total: 1, omitted: 0,
         },
       };
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error getting hover info: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };

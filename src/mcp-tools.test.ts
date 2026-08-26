@@ -278,7 +278,7 @@ describe('MCP Tool Handlers', () => {
 
       expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_TEST))}:4:7`);
       expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_OTHER))}:21:4`);
-      expect(result.content[0]?.text).toContain('myVar (variable)');
+      expect(result.content[0]?.text).toContain('References (2/2) for "myVar"');
     });
 
     it('should pass include_declaration to findReferences', async () => {

@@ -164,9 +164,13 @@ export class ServerManager {
     }
 
     // Create transport with message handler for non-response messages
-    const transport = new JsonRpcTransport(childProcess, (message: LSPMessage) => {
-      this.handleMessage(message, serverState);
-    });
+    const transport = new JsonRpcTransport(
+      childProcess,
+      (message: LSPMessage) => {
+        this.handleMessage(message, serverState);
+      },
+      serverConfig.command[0] ?? 'lsp',
+    );
 
     const diagnosticsCache = new DiagnosticsCache();
     const documentManager = new DocumentManager(

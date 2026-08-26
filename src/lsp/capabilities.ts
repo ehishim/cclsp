@@ -1,14 +1,22 @@
 import { extname } from 'node:path';
 import type { ServerState } from './types.js';
 
-export type LspToolOutcomeKind = 'unsupported' | 'rejected';
+export type LspToolOutcomeKind = 'unsupported' | 'rejected' | 'too-large';
 
 export interface LspToolOutcome {
   outcome: LspToolOutcomeKind;
-  code: 'LSP_METHOD_UNSUPPORTED' | 'LSP_RENAME_REJECTED' | 'LSP_ACTION_NOT_APPLICABLE';
+  code:
+    | 'LSP_METHOD_UNSUPPORTED'
+    | 'LSP_RENAME_REJECTED'
+    | 'LSP_ACTION_NOT_APPLICABLE'
+    | 'LSP_RESPONSE_SPOOLED';
   method: string;
   server: string;
   reason?: string;
+  /** Complete raw response when the ingress refused to materialize it in memory. */
+  resultFile?: string;
+  bytes?: number;
+  recovery?: string;
 }
 
 export class LspToolOutcomeError extends Error {

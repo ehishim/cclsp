@@ -1,7 +1,13 @@
 import { readdir, stat } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import { loadGitignore } from '../file-scanner.js';
-import { resolvePath, textResult } from './helpers.js';
+import {
+  SEMANTIC_DEFAULT_LIMIT,
+  SEMANTIC_MAX_LIMIT,
+  boundedResultLimit,
+  resolvePath,
+  textResult,
+} from './helpers.js';
 import type { ToolDefinition } from './registry.js';
 
 export const getDiagnosticsTool: ToolDefinition = {
@@ -15,27 +21,44 @@ export const getDiagnosticsTool: ToolDefinition = {
         type: 'string',
         description: 'The path to the file to get diagnostics for',
       },
+      max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path } = args as { file_path: string };
+    const { file_path, max_results } = args as { file_path: string; max_results?: number };
     const absolutePath = resolvePath(file_path);
 
     try {
-      const diagnostics = await client.getDiagnostics(absolutePath);
-
-      if (diagnostics.length === 0) {
-        return textResult(
-          `No diagnostics found for ${file_path}. The file has no errors, warnings, or hints.`
-        );
-      }
-
-      return textResult(formatDiagnosticsForFile(file_path, diagnostics));
+      const allDiagnostics = await client.getDiagnostics(absolutePath);
+      const diagnostics = allDiagnostics.slice(0, boundedResultLimit(max_results));
+      const omitted = allDiagnostics.length - diagnostics.length;
+      const text = diagnostics.length === 0
+        ? `No diagnostics found for ${file_path}. The file has no errors, warnings, or hints.`
+        : `${formatDiagnosticsForFile(file_path, diagnostics)}${omitted > 0 ? `\n\n... ${omitted} omitted. Narrow the file or severity.` : ''}`;
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: {
+          outcome: diagnostics.length > 0 ? 'ok' : 'empty',
+          provider: 'lsp',
+          file: absolutePath,
+          diagnostics,
+          shown: diagnostics.length,
+          total: allDiagnostics.length,
+          omitted,
+          recovery: omitted > 0 ? 'Narrow the diagnostic scope or severity.' : null,
+        },
+      };
     } catch (error) {
-      return textResult(
-        `Error getting diagnostics: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Error getting diagnostics: ${reason}` }],
+        structuredContent: {
+          outcome: 'unavailable', provider: 'none', code: 'LSP_DIAGNOSTICS_UNAVAILABLE', reason,
+          diagnostics: [], shown: 0, total: 0, omitted: 0,
+        },
+        isError: true,
+      };
     }
   },
 };

@@ -2,9 +2,10 @@
 // calls to the right warm cclsp child, and evicts idle roots. Started detached by
 // the CLI on first use (see client.ts), or directly via `cclsp-hub --daemon`.
 
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { type Server, type Socket, createServer } from 'node:net';
-import { dirname, join, resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
+
 import {
   IDLE_DAEMON_MS,
   IDLE_ROOT_MS,
@@ -12,31 +13,10 @@ import {
   RUNTIME_DIR,
   SOCKET_PATH,
 } from './config.js';
-import { type RootEntry, RootPool, normalizeRoot, type ToolSchema } from './pool.js';
-
-// Strong language-project markers — a dir with one of these is a real project root.
-// Checked first so an outer tsconfig.json wins over a nested bare package.json.
-const STRONG_MARKERS = ['tsconfig.json', 'jsconfig.json', 'composer.json', 'go.mod', 'pyproject.toml'];
-
-// Walk up from a path to guess its project root: nearest dir with a strong marker,
-// else nearest package.json, else the enclosing git repo. Only used for the hint.
-function detectProjectRoot(target: string): string | undefined {
-  let dir = resolve(target);
-  let pkgRoot: string | undefined;
-  let gitRoot: string | undefined;
-  for (let i = 0; i < 40; i++) {
-    for (const m of STRONG_MARKERS) {
-      if (existsSync(join(dir, m))) return dir;
-    }
-    if (!pkgRoot && existsSync(join(dir, 'package.json'))) pkgRoot = dir;
-    if (!gitRoot && existsSync(join(dir, '.git'))) gitRoot = dir;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return pkgRoot ?? gitRoot;
-}
+import { type RootEntry, RootPool, normalizeRoot, type RoutedRoot, type ToolSchema } from './pool.js';
+import { markColdIndexResult, normalizeToolResult } from './tool-result.js';
 import { type HubRequest, createLineReader, writeMessage } from './protocol.js';
+import { acquireDaemonLock } from './startup-lock.js';
 
 // Coerce raw string/bool flag values into the types cclsp's JSON schema expects.
 function coerceParams(raw: Record<string, unknown>, schema: ToolSchema | undefined): Record<string, unknown> {
@@ -58,66 +38,98 @@ function coerceParams(raw: Record<string, unknown>, schema: ToolSchema | undefin
   return out;
 }
 
+const FILESYSTEM_PARAMS = new Set(['file_path', 'path', 'old_path', 'new_path']);
+
+function resolveFilesystemParams(
+  raw: Record<string, unknown>,
+  cwd: string,
+): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(raw).map(([key, value]) => {
+    if (!FILESYSTEM_PARAMS.has(key) || typeof value !== 'string' || value.length === 0) {
+      return [key, value];
+    }
+    return [key, isAbsolute(value) ? value : resolve(cwd, value)];
+  }));
+}
+
+function withRoutingMetadata(result: unknown, route: RoutedRoot): unknown {
+  if (!result || typeof result !== 'object') return result;
+  const envelope = result as Record<string, unknown>;
+  const structured = envelope.structuredContent && typeof envelope.structuredContent === 'object'
+    ? envelope.structuredContent as Record<string, unknown>
+    : {};
+  return {
+    ...envelope,
+    structuredContent: {
+      ...structured,
+      detectedProjectRoot: route.detectedRoot,
+      servingProjectRoot: route.servingRoot,
+    },
+  };
+}
+
 async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Promise<unknown> {
   const name = String(args.name);
-  const rawParams = (args.params ?? {}) as Record<string, unknown>;
-  const explicitRoot = args.root ? String(args.root) : undefined;
+  const cwd = typeof args.cwd === 'string' ? resolve(args.cwd) : process.cwd();
+  const rawParams = resolveFilesystemParams((args.params ?? {}) as Record<string, unknown>, cwd);
+  const explicitRoot = args.root
+    ? (isAbsolute(String(args.root)) ? String(args.root) : resolve(cwd, String(args.root)))
+    : undefined;
 
-  // The param that decides routing — file_path for most tools, path for batch.
+  // A file/path is the strongest routing intent; target-less workspace calls use
+  // the caller cwd. Explicit --root remains the only exact-root override.
   const pathArg =
     typeof rawParams.file_path === 'string'
       ? (rawParams.file_path as string)
       : typeof rawParams.path === 'string'
         ? (rawParams.path as string)
-        : undefined;
+        : cwd;
 
-  // Resolve the target root FIRST (needs only the raw path), so the explicit-only
-  // contract is enforced without spawning anything.
-  let entry: RootEntry;
+  let route: RoutedRoot;
   if (explicitRoot) {
-    const e = pool.get(explicitRoot);
-    if (!e) {
-      throw new Error(`root not registered: ${explicitRoot}\n  run: cclsp-hub ensure-root ${explicitRoot}`);
-    }
-    entry = e;
-  } else if (pathArg) {
-    const e = pool.resolveRootForFile(pathArg);
-    if (!e) {
-      const active = pool.list().map((r) => r.root).join(', ') || 'none';
-      const guess = detectProjectRoot(pathArg);
-      throw new Error(
-        `no registered root owns ${pathArg}\n` +
-          `  run: cclsp-hub ensure-root ${guess ?? '<project-root>'}${guess ? '   (detected project root)' : ''}\n` +
-          `  active roots: ${active}`,
-      );
-    }
-    entry = e;
+    const detectedRoot = normalizeRoot(explicitRoot);
+    const { entry, reused } = await pool.ensure(detectedRoot);
+    route = { entry, detectedRoot, servingRoot: entry.root, reused };
   } else {
-    const roots = pool.list();
-    const first = roots[0];
-    if (roots.length === 1 && first) {
-      entry = first;
-    } else {
-      const active = roots.map((r) => r.root).join(', ') || 'none';
-      throw new Error(`tool '${name}' has no file to route by; pass --root <path>\n  active roots: ${active}`);
-    }
+    route = await pool.routeTarget(pathArg);
   }
+  const entry: RootEntry = route.entry;
 
   // We have a live child, so its (cached) schema is available for coercion + checks.
   const schemas = await pool.describe();
   const schema = schemas.find((t) => t.name === name);
+  if (!schema) {
+    // A mistyped command reaches here as a tool name; say so plainly instead of
+    // failing later with routing vocabulary the caller never used.
+    throw new Error(
+      `unknown tool '${name}': run 'cclsp-hub describe' for the tool list or 'cclsp-hub --help' for daemon commands`,
+    );
+  }
   const params = coerceParams(rawParams, schema);
   const required: string[] = schema?.inputSchema?.required ?? [];
   const missing = required.filter((r) => params[r] === undefined || params[r] === '');
   if (missing.length) {
     throw new Error(`missing required parameter(s) for ${name}: ${missing.join(', ')}`);
   }
-  return pool.callTool(entry, name, params);
+  const routed = withRoutingMetadata(await pool.callTool(entry, name, params), route);
+  if (args.rawMcp === true) return routed;
+  const defaultProvider = name === 'ast_search' || name === 'code_rewrite' ? 'tree-sitter' : 'lsp';
+  const normalized = normalizeToolResult(routed, { defaultProvider });
+  return markColdIndexResult(normalized, name, Date.now() - entry.startedAt);
 }
 
 export async function runDaemon(): Promise<void> {
   mkdirSync(RUNTIME_DIR, { recursive: true });
-  // Clear a stale socket left by a crashed daemon.
+  const releaseLock = acquireDaemonLock(PID_PATH);
+  if (!releaseLock) return;
+  let cleaned = false;
+  const cleanupRuntime = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH); } catch {}
+    releaseLock();
+  };
+  // Only the startup-lock owner may clear a socket left by a crashed daemon.
   if (existsSync(SOCKET_PATH)) {
     try {
       unlinkSync(SOCKET_PATH);
@@ -197,7 +209,10 @@ export async function runDaemon(): Promise<void> {
           reply(true, { stopped: true });
           await pool.stopAll();
           server.close();
-          setTimeout(() => process.exit(0), 50);
+          setTimeout(() => {
+            cleanupRuntime();
+            process.exit(0);
+          }, 50);
           break;
         default:
           reply(false, undefined, `unknown command: ${req.cmd}`);
@@ -216,6 +231,7 @@ export async function runDaemon(): Promise<void> {
     if (IDLE_DAEMON_MS > 0 && pool.list().length === 0 && now - lastActivity > IDLE_DAEMON_MS) {
       void pool.stopAll().then(() => {
         server.close();
+        cleanupRuntime();
         process.exit(0);
       });
     }
@@ -224,11 +240,7 @@ export async function runDaemon(): Promise<void> {
 
   const shutdown = () => {
     void pool.stopAll().finally(() => {
-      try {
-        if (existsSync(SOCKET_PATH)) unlinkSync(SOCKET_PATH);
-      } catch {
-        // ignore
-      }
+      cleanupRuntime();
       process.exit(0);
     });
   };
@@ -236,14 +248,10 @@ export async function runDaemon(): Promise<void> {
   process.on('SIGTERM', shutdown);
 
   await new Promise<void>((res, rej) => {
-    server.once('error', rej);
-    server.listen(SOCKET_PATH, () => {
-      try {
-        writeFileSync(PID_PATH, String(process.pid));
-      } catch {
-        // ignore
-      }
-      res();
+    server.once('error', (error) => {
+      cleanupRuntime();
+      rej(error);
     });
+    server.listen(SOCKET_PATH, res);
   });
 }

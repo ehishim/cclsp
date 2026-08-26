@@ -4,10 +4,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
 import { LspToolOutcomeError } from './lsp/capabilities.js';
+import { getDiagnosticsTool } from './tools/diagnostics.js';
 import { getCodeActionsTool, getCompletionsTool } from './tools/language-features.js';
+import { findReferencesTool } from './tools/navigation.js';
 import { renameFileTool } from './tools/refactoring.js';
-import { type ToolDefinition, registerTools } from './tools/registry.js';
-import { getDocumentSymbolsTool } from './tools/symbols.js';
+import { type ToolDefinition, boundToolResult, registerTools } from './tools/registry.js';
+import { findWorkspaceSymbolsTool, getDocumentSymbolsTool } from './tools/symbols.js';
 import { pathToUri } from './utils.js';
 
 function asClient(value: Record<string, unknown>): LSPClient {
@@ -15,7 +17,7 @@ function asClient(value: Record<string, unknown>): LSPClient {
 }
 
 describe('capability tool contracts', () => {
-  it('returns hierarchical document symbols with ranges, containers, and children', async () => {
+  it('returns compact flattened document symbols with ranges, totals, and readable text', async () => {
     const client = asClient({
       getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({
         outcome: 'ok',
@@ -48,15 +50,131 @@ describe('capability tool contracts', () => {
     const result = await getDocumentSymbolsTool.handler({ file_path: 'example.ts' }, client);
     expect(result.structuredContent).toMatchObject({
       outcome: 'ok',
+      shown: 2,
+      total: 2,
+      omitted: 0,
+      recovery: null,
       symbols: [
         {
           name: 'Example',
           kind: 'class',
           range: { start: { line: 0, character: 0 } },
           selectionRange: { start: { line: 0, character: 13 } },
-          children: [{ name: 'run', kind: 'method', container: 'Example', children: [] }],
+          children: [],
         },
+        { name: 'run', kind: 'method', container: 'Example', children: [] },
       ],
+    });
+    expect(result.content[0]?.text).toContain('Document symbols (2/2)');
+    expect(result.content[0]?.text).toContain('L1:C1-L5:C2 · class · Example');
+    expect(result.content[0]?.text).not.toContain('{\n');
+  });
+
+  it('bounds document-symbol rows and exposes raw hierarchy only when requested', async () => {
+    const value = ['alpha', 'beta', 'gamma'].map((name, index) => ({
+      name,
+      kind: 13,
+      range: { start: { line: index, character: 0 }, end: { line: index, character: name.length } },
+      selectionRange: { start: { line: index, character: 0 }, end: { line: index, character: name.length } },
+      children: [],
+    }));
+    const client = asClient({
+      getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({ outcome: 'ok', provider: 'lsp', value }),
+      symbolKindToString: () => 'variable',
+    });
+    const bounded = await getDocumentSymbolsTool.handler({ file_path: 'example.ts', max_results: 2 }, client);
+    expect(bounded.structuredContent).toMatchObject({ shown: 2, total: 3, omitted: 1 });
+    expect((bounded.structuredContent as any).rawSymbols).toBeUndefined();
+
+    const spooled = (bounded.structuredContent as any).resultFile as string;
+    expect(typeof spooled).toBe('string');
+    expect(bounded.content[0]?.text).toContain(spooled);
+    const complete = JSON.parse(readFileSync(spooled, 'utf8'));
+    expect(complete.symbols.map((row: { name: string }) => row.name)).toEqual(['alpha', 'beta', 'gamma']);
+
+    const diagnostic = await getDocumentSymbolsTool.handler({ file_path: 'example.ts', max_results: 1, include_raw: true }, client);
+    expect((diagnostic.structuredContent as any).rawSymbols).toHaveLength(1);
+  });
+
+  it('returns every declaration when no explicit narrowing is requested', async () => {
+    const value = Array.from({ length: 300 }, (_, index) => ({
+      name: `symbol${index}`,
+      kind: 13,
+      range: { start: { line: index, character: 0 }, end: { line: index, character: 4 } },
+      selectionRange: { start: { line: index, character: 0 }, end: { line: index, character: 4 } },
+      children: [],
+    }));
+    const result = await getDocumentSymbolsTool.handler({ file_path: 'example.ts' }, asClient({
+      getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({ outcome: 'ok', provider: 'lsp', value }),
+      symbolKindToString: () => 'variable',
+    }));
+    expect(result.structuredContent).toMatchObject({ shown: 300, total: 300, omitted: 0 });
+    expect((result.structuredContent as any).resultFile).toBeUndefined();
+  });
+
+  it('reports an empty outcome for a file with no declarations', async () => {
+    const result = await getDocumentSymbolsTool.handler({ file_path: 'empty.ts' }, asClient({
+      getDocumentSymbolsWithProvider: jest.fn().mockResolvedValue({ outcome: 'ok', provider: 'lsp', value: [] }),
+      symbolKindToString: () => 'variable',
+    }));
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'empty', provider: 'lsp', shown: 0, total: 0, omitted: 0,
+    });
+  });
+
+  it('returns typed reference locations for Hub range normalization', async () => {
+    const locations = [
+      { uri: 'file:///workspace/src/a.ts', range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } } },
+      { uri: 'file:///workspace/src/b.ts', range: { start: { line: 8, character: 2 }, end: { line: 8, character: 7 } } },
+    ];
+    const client = asClient({
+      findSymbolsByName: jest.fn().mockResolvedValue({
+        matches: [{ name: 'answer', kind: 12, position: { line: 0, character: 0 } }],
+      }),
+      findReferences: jest.fn().mockResolvedValue(locations),
+      symbolKindToString: () => 'function',
+    });
+    const result = await findReferencesTool.handler({
+      file_path: '/workspace/src/a.ts', symbol_name: 'answer', include_declaration: true,
+    }, client);
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'ok', provider: 'lsp', locations, shown: 2, total: 2, omitted: 0,
+    });
+    expect(result.content[0]?.text).toContain('/workspace/src/b.ts:9:3');
+  });
+
+  it('bounds workspace symbols with canonical totals and recovery', async () => {
+    const symbols = ['alpha', 'beta', 'gamma'].map((name, index) => ({
+      name, kind: 13,
+      location: {
+        uri: `file:///workspace/src/${name}.ts`,
+        range: { start: { line: index, character: 0 }, end: { line: index, character: name.length } },
+      },
+    }));
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'a', max_results: 2 },
+      asClient({ workspaceSymbol: jest.fn().mockResolvedValue(symbols), symbolKindToString: () => 'variable' }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'ok', provider: 'lsp', shown: 2, total: 3, omitted: 1,
+    });
+    const spooled = (result.structuredContent as any).resultFile as string;
+    expect(result.content[0]?.text).toContain(spooled);
+    expect(JSON.parse(readFileSync(spooled, 'utf8')).symbols).toHaveLength(3);
+  });
+
+  it('returns typed diagnostics including the source file for range normalization', async () => {
+    const diagnostic = {
+      severity: 1, message: 'broken',
+      range: { start: { line: 2, character: 1 }, end: { line: 2, character: 4 } },
+    };
+    const result = await getDiagnosticsTool.handler(
+      { file_path: '/workspace/src/a.ts' },
+      asClient({ getDiagnostics: jest.fn().mockResolvedValue([diagnostic]) }),
+    );
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'ok', provider: 'lsp', file: '/workspace/src/a.ts',
+      diagnostics: [diagnostic], shown: 1, total: 1, omitted: 0,
     });
   });
 
@@ -427,5 +545,20 @@ describe('capability tool contracts', () => {
         server: 'fixture-ls',
       },
     });
+  });
+
+  it('spools an oversized result and points at it instead of refusing the answer', () => {
+    const rows = Array.from({ length: 2_000 }, (_, index) => ({ name: `symbol${index}`, detail: 'x'.repeat(200) }));
+    const bounded = boundToolResult({
+      content: [{ type: 'text', text: `head line\n${'row\n'.repeat(5_000)}` }],
+      structuredContent: { outcome: 'ok', provider: 'lsp', shown: 2_000, total: 2_000, omitted: 0, symbols: rows },
+    }, 4_096);
+    expect(bounded.isError).toBeUndefined();
+    expect(bounded.structuredContent).toMatchObject({ outcome: 'ok', provider: 'lsp', bounded: true, total: 2_000 });
+    const spooled = (bounded.structuredContent as any).resultFile as string;
+    expect(bounded.content[0]?.text.startsWith('head line')).toBe(true);
+    expect(bounded.content[0]?.text).toContain(spooled);
+    const complete = JSON.parse(readFileSync(spooled, 'utf8'));
+    expect(complete.structuredContent.symbols).toHaveLength(2_000);
   });
 });

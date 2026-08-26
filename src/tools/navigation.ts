@@ -1,9 +1,12 @@
 import type { LSPClient } from '../lsp-client.js';
 import {
+  SEMANTIC_DEFAULT_LIMIT,
+  SEMANTIC_MAX_LIMIT,
+  boundedResultLimit,
   formatLocations,
   resolvePath,
   rethrowToolOutcome,
-  textResult,
+  spoolFullResult,
   withWarning,
 } from './helpers.js';
 import {
@@ -33,6 +36,7 @@ export const findDefinitionTool: ToolDefinition = {
         type: 'string',
         description: 'The kind of symbol (function, class, variable, method, etc.)',
       },
+      max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
     },
     required: ['file_path', 'symbol_name'],
   },
@@ -41,7 +45,9 @@ export const findDefinitionTool: ToolDefinition = {
       file_path: string;
       symbol_name: string;
       symbol_kind?: string;
+      max_results?: number;
     };
+    const maxResults = boundedResultLimit((args as { max_results?: number }).max_results);
     const absolutePath = resolvePath(file_path);
 
     try {
@@ -57,9 +63,16 @@ export const findDefinitionTool: ToolDefinition = {
           isError: true,
         };
       }
+      const selected = result.value.slice(0, maxResults);
+      const omitted = result.value.length - selected.length;
+      const resultFile = omitted > 0
+        ? spoolFullResult('find_definition', {
+            file: absolutePath, symbol: symbol_name, total: result.value.length, locations: result.value,
+          })
+        : null;
       const text =
-        result.value.length > 0
-          ? `Found ${result.value.length} definition(s) for "${symbol_name}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(result.value)}`
+        selected.length > 0
+          ? `Found ${selected.length}/${result.value.length} definition(s) for "${symbol_name}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
           : result.provider === 'lsp' && result.matchedSymbols === 0
             ? `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}.`
             : `Found ${result.provider === 'lsp' ? (result.matchedSymbols ?? 0) : 0} symbol(s) but no definitions could be retrieved (${result.provider}).`;
@@ -71,9 +84,16 @@ export const findDefinitionTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: result.value.length > 0 ? 'ok' : 'empty',
           provider: result.provider,
-          locations: result.value,
+          locations: selected,
+          shown: selected.length,
+          total: result.value.length,
+          omitted,
+          recovery: omitted > 0
+            ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the definition query.`
+            : null,
+          ...(resultFile ? { resultFile } : {}),
           ...(result.provider === 'tree-sitter'
             ? { limitations: result.limitations, truncated: result.truncated ?? false }
             : {}),
@@ -110,6 +130,7 @@ export const findReferencesTool: ToolDefinition = {
         description: 'Whether to include the declaration',
         default: true,
       },
+      max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
     },
     required: ['file_path', 'symbol_name'],
   },
@@ -119,57 +140,79 @@ export const findReferencesTool: ToolDefinition = {
       symbol_name,
       symbol_kind,
       include_declaration = true,
+      max_results,
     } = args as {
       file_path: string;
       symbol_name: string;
       symbol_kind?: string;
       include_declaration?: boolean;
+      max_results?: number;
     };
+    const maxResults = boundedResultLimit(max_results);
     const absolutePath = resolvePath(file_path);
 
     const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
     const { matches: symbolMatches, warning } = result;
-
     if (symbolMatches.length === 0) {
-      return textResult(
-        withWarning(
-          warning,
-          `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}. Please verify the symbol name and ensure the language server is properly configured.`
-        )
+      const text = withWarning(
+        warning,
+        `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}.`,
       );
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: {
+          outcome: 'empty', provider: 'lsp', locations: [], shown: 0, total: 0, omitted: 0,
+        },
+      };
     }
 
-    const results = [];
+    const unique: Awaited<ReturnType<LSPClient['findReferences']>> = [];
+    const seenLocations = new Set<string>();
     for (const match of symbolMatches) {
       try {
         const locations = await client.findReferences(
           absolutePath,
           match.position,
-          include_declaration
+          include_declaration,
         );
-
-        if (locations.length > 0) {
-          const locationResults = formatLocations(locations);
-          results.push(
-            `Results for ${match.name} (${client.symbolKindToString(match.kind)}) at ${file_path}:${match.position.line + 1}:${match.position.character + 1}:\n${locationResults}`
-          );
+        for (const location of locations) {
+          const range = location.range;
+          const key = `${location.uri}\u0000${range.start.line}\u0000${range.start.character}\u0000${range.end.line}\u0000${range.end.character}`;
+          if (seenLocations.has(key)) continue;
+          seenLocations.add(key);
+          unique.push(location);
         }
       } catch (error) {
         rethrowToolOutcome(error);
-        // Continue trying other symbols if one fails
       }
     }
-
-    if (results.length === 0) {
-      return textResult(
-        withWarning(
+    const selected = unique.slice(0, maxResults);
+    const total = unique.length;
+    const omitted = total - selected.length;
+    const resultFile = omitted > 0
+      ? spoolFullResult('find_references', { file: absolutePath, symbol: symbol_name, total, locations: unique })
+      : null;
+    const text = selected.length > 0
+      ? withWarning(
           warning,
-          `Found ${symbolMatches.length} symbol(s) but no references could be retrieved. Please ensure the language server is properly configured.`
+          `References (${selected.length}/${total}) for "${symbol_name}":\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`,
         )
-      );
-    }
-
-    return textResult(withWarning(warning, results.join('\n\n')));
+      : withWarning(warning, `Found ${symbolMatches.length} symbol(s) but no references were returned.`);
+    return {
+      content: [{ type: 'text', text }],
+      structuredContent: {
+        outcome: selected.length > 0 ? 'ok' : 'empty',
+        provider: 'lsp',
+        locations: selected,
+        shown: selected.length,
+        total,
+        omitted,
+        recovery: omitted > 0
+          ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the reference query.`
+          : null,
+        ...(resultFile ? { resultFile } : {}),
+      },
+    };
   },
 };
 
@@ -183,15 +226,17 @@ export const findImplementationTool: ToolDefinition = {
       query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
       line: { type: 'number', description: 'The line number (1-indexed)' },
       character: { type: 'number', description: 'The character position (1-indexed)' },
+      max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, query, line, character } = args as {
+    const { file_path, query, line, character, max_results } = args as {
       file_path: string;
       query?: string;
       line?: number;
       character?: number;
+      max_results?: number;
     };
     const absolutePath = resolvePath(file_path);
     try {
@@ -203,7 +248,12 @@ export const findImplementationTool: ToolDefinition = {
       if (resolution.outcome !== 'resolved') {
         return positionResolutionResult(resolution, file_path);
       }
-      const locations = await client.findImplementation(absolutePath, resolution.position);
+      const allLocations = await client.findImplementation(absolutePath, resolution.position);
+      const locations = allLocations.slice(0, boundedResultLimit(max_results));
+      const omitted = allLocations.length - locations.length;
+      const resultFile = omitted > 0
+        ? spoolFullResult('find_implementation', { file: absolutePath, total: allLocations.length, locations: allLocations })
+        : null;
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
       if (locations.length === 0) {
@@ -215,9 +265,9 @@ export const findImplementationTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'empty', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            locations: [],
+            locations: [], shown: 0, total: 0, omitted: 0,
           },
         };
       }
@@ -225,20 +275,25 @@ export const findImplementationTool: ToolDefinition = {
         content: [
           {
             type: 'text',
-            text: `${resolved ? `${resolved}\n\n` : ''}Found ${locations.length} implementation(s):\n\n${formatLocations(locations)}`,
+            text: `${resolved ? `${resolved}\n\n` : ''}Implementations (${locations.length}/${allLocations.length}):\n\n${formatLocations(locations)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`,
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: 'ok', provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           locations,
+          shown: locations.length,
+          total: allLocations.length,
+          omitted,
+          recovery: omitted > 0
+            ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the selector.`
+            : null,
+          ...(resultFile ? { resultFile } : {}),
         },
       };
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error finding implementations: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };

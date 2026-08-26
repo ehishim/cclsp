@@ -5,6 +5,8 @@
 import { request, tryRequest } from './client.js';
 import { CCLSP_ENTRY, VERSION } from './config.js';
 import type { ToolSchema } from './pool.js';
+import { toolResultText } from './tool-result.js';
+export { normalizeToolResult as normalizeToolJson } from './tool-result.js';
 
 // Friendly subcommand -> cclsp tool name.
 const ALIASES: Record<string, string> = {
@@ -51,6 +53,7 @@ const FLAG_ALIASES: Record<string, string> = {
 // (e.g. `--json diagnostics` is the json flag + the diagnostics command).
 const KNOWN_BOOLEAN = new Set([
   'json',
+  'raw-mcp',
   'help',
   'version',
   'dry-run',
@@ -64,11 +67,6 @@ interface Parsed {
   command?: string;
   positionals: string[];
   flags: Map<string, string | boolean>;
-}
-
-interface ToolResultEnvelope {
-  content?: unknown;
-  isError?: boolean;
 }
 
 interface RootSummary {
@@ -125,30 +123,12 @@ function asJson(v: unknown): string {
 }
 
 function printToolResult(result: unknown, json: boolean): void {
-  const envelope =
-    result && typeof result === 'object' ? (result as ToolResultEnvelope) : undefined;
-  if (json) {
-    out(asJson(result));
-  } else {
-    const text = Array.isArray(envelope?.content)
-      ? envelope.content
-          .map((content) => {
-            if (
-              content &&
-              typeof content === 'object' &&
-              (content as { type?: unknown }).type === 'text' &&
-              typeof (content as { text?: unknown }).text === 'string'
-            ) {
-              return (content as { text: string }).text;
-            }
-            return asJson(content);
-          })
-          .join('\n')
-      : asJson(result);
-    if (envelope?.isError) err(text);
-    else out(text);
-  }
-  if (envelope?.isError) process.exitCode = 1;
+  const isError = Boolean(result && typeof result === 'object' && (result as { isError?: unknown }).isError === true);
+  const text = toolResultText(result) || asJson(result);
+  if (json) out(asJson(result));
+  else if (isError) err(text);
+  else out(text);
+  if (isError) process.exitCode = 1;
 }
 
 function rootArg(p: Parsed): string | undefined {
@@ -160,8 +140,8 @@ function rootArg(p: Parsed): string | undefined {
 const TOP_HELP = `cclsp-hub ${VERSION} — multi-root daemon + CLI over the cclsp language-server MCP
 
 One warm cclsp instance (and its language servers) is kept per project ROOT and
-shared by every caller. Code-intelligence calls route to the root that owns the
-target file. Routing is explicit: the root must be registered first.
+shared by every caller. Target-bearing calls first reuse the most-specific warm
+root; only on a miss does the Hub discover and warm the owning language project.
 
 USAGE
   cclsp-hub <command> [options]
@@ -176,7 +156,7 @@ ROOTS & DAEMON
   shutdown                Stop all roots and the daemon
   describe                List the available cclsp tools
 
-CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need --root)
+CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd)
   ast_search              --pattern P --language L [--path P] [--max-results N] [--root R]
   code_rewrite            --pattern P --replacement R --language L [--path P] [--root R]
                           [--dry-run=false --candidate-id ID]
@@ -195,7 +175,7 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by file path, workspace tools need -
   rename_symbol           --file F --symbol-name NAME --new-name NEW [--dry-run]
   rename_symbol_strict    --file F (--query Q | --line N --character C) --new-name NEW [--dry-run]
   rename_file             --old-path F --new-path F [--dry-run=false]
-  find_workspace_symbols  --query Q --root R
+  find_workspace_symbols  --query Q [--root R]
   prepare_call_hierarchy  --file F (--query Q | --line N --character C)
   get_incoming_calls      --file F (--query Q | --line N --character C)
   get_outgoing_calls      --file F (--query Q | --line N --character C)
@@ -211,14 +191,16 @@ diagnostics, diagnostics-batch, rename, rename-strict, symbols, call-hierarchy,
 incoming-calls, outgoing-calls, restart-server.
 
 OPTIONS
-  --root <path>     Force which registered root serves the call
-  --json            Machine-readable JSON output
+  --root <path>     Override auto-routing; ensure/reuse this project root
+  --json            Normalized machine output (transport envelope removed)
+  --raw-mcp         Diagnostic raw MCP envelope (implies --json)
   -h, --help        This help (or '<command> --help' for a command's parameters)
   --version         Print version
 
 POSITION TOOLS accept exactly one selector: --query Q or a complete 1-indexed
 line/character pair. Ambiguous and unknown queries return bounded candidates.
-Run 'cclsp-hub <command> --help' for parameters.
+A first empty workspace-index query on a newly warmed root returns stale with
+retry recovery instead of false absence. Run '<command> --help' for parameters.
 
 TIP  Prefer a root at the PROJECT ROOT — the directory with tsconfig.json /
      package.json (TS/JS) or composer.json (PHP). Pointing at a random subdir makes
@@ -261,21 +243,17 @@ async function printToolHelp(command: string, toolName: string): Promise<void> {
     out(`  ${flag}${type}${req}${desc}`);
   }
   if (props.file_path) out('\n  --file is accepted as an alias for --file-path');
-  out('\nThe call routes to the registered root that owns --file (or pass --root).');
+  out('\nTarget paths auto-route through warm coverage and project discovery; --root overrides.');
 }
 
 function printManagementHelp(command: string): void {
   const help: Record<string, string> = {
     'ensure-root':
       'cclsp-hub ensure-root <path> [--isolate]\n' +
-      '  Register a project root and warm its language servers (idempotent).\n\n' +
-      '  Prefer the PROJECT ROOT — the directory containing tsconfig.json / package.json\n' +
-      '  (TS/JS) or composer.json (PHP). A random subdir makes the language server fall\n' +
-      '  back to an inferred project (missed cross-file refs, no path-alias resolution).\n' +
-      '  Register the repo root, then query files anywhere under it.\n\n' +
-      '  If <path> sits inside an already-warm root, that root is reused (no second\n' +
-      '  server). Pass --isolate to force a dedicated instance — e.g. a monorepo\n' +
-      '  package with its own tsconfig that the outer root does not reference.',
+      '  Explicitly warm a project root. Normal target-bearing calls first reuse warm\n' +
+      '  coverage, then discover and ensure the owning language project on a miss.\n' +
+      '  A covered subroot reuses its enclosing instance; pass --isolate only to force\n' +
+      '  a dedicated instance.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
     'restart-root': 'cclsp-hub restart-root <path>\n  Restart one root (recover a stale index).',
     'list-roots':
@@ -290,7 +268,8 @@ function printManagementHelp(command: string): void {
 
 export async function runCli(argv: string[]): Promise<void> {
   const p = parse(argv);
-  const json = p.flags.get('json') === true;
+  const rawMcp = p.flags.get('raw-mcp') === true;
+  const json = rawMcp || p.flags.get('json') === true;
   const wantHelp = p.flags.get('help') === true;
 
   if (p.flags.get('version') === true) {
@@ -428,7 +407,7 @@ export async function runCli(argv: string[]): Promise<void> {
   // Collect parameters from flags (kebab -> snake, plus --file/--symbol sugar).
   const params: Record<string, unknown> = {};
   for (const [k, v] of p.flags) {
-    if (['json', 'help', 'version', 'root', 'params-json'].includes(k)) continue;
+    if (['json', 'raw-mcp', 'help', 'version', 'root', 'params-json'].includes(k)) continue;
     const key = FLAG_ALIASES[k] ?? k.replace(/-/g, '_');
     params[key] =
       KNOWN_BOOLEAN.has(k) && typeof v === 'string' && (v === 'true' || v === 'false')
@@ -442,6 +421,8 @@ export async function runCli(argv: string[]): Promise<void> {
     name: toolName,
     params,
     root: typeof p.flags.get('root') === 'string' ? p.flags.get('root') : undefined,
+    cwd: process.cwd(),
+    rawMcp,
   });
   printToolResult(result, json);
 }

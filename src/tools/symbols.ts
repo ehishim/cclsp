@@ -1,6 +1,13 @@
 import type { DocumentSymbol, SymbolInformation } from '../lsp/types.js';
 import { uriToPath } from '../utils.js';
-import { resolvePath, rethrowToolOutcome, textResult } from './helpers.js';
+import {
+  SEMANTIC_DEFAULT_LIMIT,
+  SEMANTIC_MAX_LIMIT,
+  boundedResultLimit,
+  resolvePath,
+  rethrowToolOutcome,
+  spoolFullResult,
+} from './helpers.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -17,6 +24,26 @@ interface DocumentSymbolOutput {
   container?: string;
   detail?: string;
   children: DocumentSymbolOutput[];
+}
+
+const DOCUMENT_SYMBOLS_DEFAULT_LIMIT = SEMANTIC_DEFAULT_LIMIT;
+const DOCUMENT_SYMBOLS_MAX_LIMIT = SEMANTIC_MAX_LIMIT;
+
+function flattenDocumentSymbols(symbols: DocumentSymbolOutput[]): DocumentSymbolOutput[] {
+  const rows: DocumentSymbolOutput[] = [];
+  const visit = (symbol: DocumentSymbolOutput) => {
+    rows.push({ ...symbol, children: [] });
+    for (const child of symbol.children) visit(child);
+  };
+  for (const symbol of symbols) visit(symbol);
+  return rows;
+}
+
+function renderDocumentSymbol(symbol: DocumentSymbolOutput): string {
+  const { start, end } = symbol.range;
+  const container = symbol.container ? ` · ${symbol.container}` : '';
+  const detail = symbol.detail ? ` · ${symbol.detail}` : '';
+  return `L${start.line + 1}:C${start.character + 1}-L${end.line + 1}:C${end.character + 1} · ${symbol.kind} · ${symbol.name}${container}${detail}`;
 }
 
 function mapHierarchicalSymbol(
@@ -57,11 +84,15 @@ export const getDocumentSymbolsTool: ToolDefinition = {
     'Enumerate declarations in one file. Returns each symbol name, kind, full range, selection range, container, and children.',
   inputSchema: {
     type: 'object',
-    properties: { file_path: { type: 'string', description: 'The path to the file to enumerate' } },
+    properties: {
+      file_path: { type: 'string', description: 'The path to the file to enumerate' },
+      max_results: { type: 'number', description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})` },
+      include_raw: { type: 'boolean', description: 'Include bounded selected native symbol rows for explicit diagnostics' },
+    },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path } = args as { file_path: string };
+    const { file_path, max_results, include_raw } = args as { file_path: string; max_results?: number; include_raw?: boolean };
     const absolutePath = resolvePath(file_path);
     try {
       const result = await client.getDocumentSymbolsWithProvider(absolutePath);
@@ -77,24 +108,41 @@ export const getDocumentSymbolsTool: ToolDefinition = {
         symbols.length === 0 ||
         ('range' in (symbols[0] as DocumentSymbol) &&
           'selectionRange' in (symbols[0] as DocumentSymbol));
-      const output = hierarchical
+      const hierarchy = hierarchical
         ? (symbols as DocumentSymbol[]).map((symbol) => mapHierarchicalSymbol(symbol, client))
         : (symbols as SymbolInformation[]).map((symbol) => mapFlatSymbol(symbol, client));
+      const limit = boundedResultLimit(max_results);
+      const rows = flattenDocumentSymbols(hierarchy);
+      const selected = rows.slice(0, limit);
+      const omitted = rows.length - selected.length;
+      const resultFile = omitted > 0
+        ? spoolFullResult('get_document_symbols', {
+            file: absolutePath, provider: result.provider, total: rows.length, symbols: rows,
+          })
+        : null;
+      const recovery = omitted > 0
+        ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or retry with max_results up to ${DOCUMENT_SYMBOLS_MAX_LIMIT}.`
+        : null;
+      const text = selected.length === 0
+        ? `Document symbols (0/0) in ${file_path} · provider ${result.provider}`
+        : [
+            `Document symbols (${selected.length}/${rows.length}) in ${file_path} · provider ${result.provider}`,
+            ...selected.map(renderDocumentSymbol),
+            ...(omitted > 0 ? [`... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`] : []),
+          ].join('\n');
       return {
-        content: [
-          {
-            type: 'text',
-            text:
-              output.length === 0
-                ? `No document symbols found in ${file_path} (${result.provider})`
-                : `Document symbols in ${file_path} (${result.provider}):\n${JSON.stringify(output, null, 2)}`,
-          },
-        ],
+        content: [{ type: 'text', text }],
         structuredContent: {
-          outcome: 'ok',
+          outcome: rows.length > 0 ? 'ok' : 'empty',
           provider: result.provider,
           file: absolutePath,
-          symbols: output,
+          symbols: selected,
+          shown: selected.length,
+          total: rows.length,
+          omitted,
+          recovery,
+          ...(resultFile ? { resultFile } : {}),
+          ...(include_raw ? { rawSymbols: selected } : {}),
           ...(result.provider === 'tree-sitter' ? { limitations: result.limitations } : {}),
         },
       };
@@ -107,30 +155,52 @@ export const getDocumentSymbolsTool: ToolDefinition = {
 
 export const findWorkspaceSymbolsTool: ToolDefinition = {
   name: 'find_workspace_symbols',
-  description: 'Search for symbols across the entire workspace by name.',
+  description: 'Search for symbols across the workspace by name with bounded rows and totals.',
   inputSchema: {
     type: 'object',
-    properties: { query: { type: 'string', description: 'The symbol name or pattern' } },
+    properties: {
+      query: { type: 'string', description: 'The symbol name or pattern' },
+      max_results: { type: 'number', description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})` },
+    },
     required: ['query'],
   },
   handler: async (args, client) => {
-    const { query } = args as { query: string };
+    const { query, max_results } = args as { query: string; max_results?: number };
     try {
       const symbols = await client.workspaceSymbol(query);
-      if (symbols.length === 0) return textResult(`No symbols found matching "${query}"`);
-      return textResult(
-        `Found ${symbols.length} symbol(s) matching "${query}":\n\n${symbols
-          .map((symbol) => {
-            const start = symbol.location.range.start;
-            return `• ${symbol.name} (${client.symbolKindToString(symbol.kind)}) at ${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1}`;
-          })
-          .join('\n')}`
-      );
+      const selected = symbols.slice(0, boundedResultLimit(max_results));
+      const omitted = symbols.length - selected.length;
+      const resultFile = omitted > 0
+        ? spoolFullResult('find_workspace_symbols', { query, total: symbols.length, symbols })
+        : null;
+      const text = selected.length === 0
+        ? `Workspace symbols (0/0) matching "${query}"`
+        : [
+            `Workspace symbols (${selected.length}/${symbols.length}) matching "${query}" · provider lsp`,
+            ...selected.map((symbol) => {
+              const start = symbol.location.range.start;
+              return `${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1} · ${client.symbolKindToString(symbol.kind)} · ${symbol.name}`;
+            }),
+            ...(omitted > 0 ? [`... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`] : []),
+          ].join('\n');
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: {
+          outcome: selected.length > 0 ? 'ok' : 'empty',
+          provider: 'lsp',
+          symbols: selected,
+          shown: selected.length,
+          total: symbols.length,
+          omitted,
+          recovery: omitted > 0
+            ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
+            : null,
+          ...(resultFile ? { resultFile } : {}),
+        },
+      };
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error searching symbols: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };
@@ -142,6 +212,7 @@ const positionSchema = {
     query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
     line: { type: 'number', description: 'The line number (1-indexed)' },
     character: { type: 'number', description: 'The character position (1-indexed)' },
+    max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
   },
   required: ['file_path'],
 };
@@ -151,6 +222,7 @@ type PositionArgs = {
   query?: string;
   line?: number;
   character?: number;
+  max_results?: number;
 };
 
 export const prepareCallHierarchyTool: ToolDefinition = {
@@ -158,7 +230,7 @@ export const prepareCallHierarchyTool: ToolDefinition = {
   description: 'Get call hierarchy items by symbol query or 1-indexed position.',
   inputSchema: positionSchema,
   handler: async (args, client) => {
-    const { file_path, query, line, character } = args as PositionArgs;
+    const { file_path, query, line, character, max_results } = args as PositionArgs;
     const absolutePath = resolvePath(file_path);
     try {
       const resolution = await resolveToolPosition(
@@ -169,7 +241,11 @@ export const prepareCallHierarchyTool: ToolDefinition = {
       if (resolution.outcome !== 'resolved') {
         return positionResolutionResult(resolution, file_path);
       }
-      const items = await client.prepareCallHierarchy(absolutePath, resolution.position);
+      const allItems = await client.prepareCallHierarchy(absolutePath, resolution.position);
+      const items = allItems.slice(0, boundedResultLimit(max_results));
+      const itemsFile = allItems.length > items.length
+        ? spoolFullResult('prepare_call_hierarchy', { file: absolutePath, total: allItems.length, items: allItems })
+        : null;
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
       if (items.length === 0) {
@@ -181,9 +257,9 @@ export const prepareCallHierarchyTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'empty', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            items: [],
+            items: [], shown: 0, total: 0, omitted: 0,
           },
         };
       }
@@ -196,20 +272,25 @@ export const prepareCallHierarchyTool: ToolDefinition = {
                 const start = item.selectionRange.start;
                 return `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${uriToPath(item.uri)}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`;
               })
-              .join('\n')}`,
+              .join('\n')}${allItems.length > items.length ? `\n... ${allItems.length - items.length} omitted; complete result: ${itemsFile ?? '(spool unavailable)'}` : ''}`,
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: 'ok', provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           items,
+          shown: items.length,
+          total: allItems.length,
+          omitted: allItems.length - items.length,
+          recovery: allItems.length > items.length
+            ? `Read the complete result at ${itemsFile ?? '(spool unavailable)'} or narrow the selector.`
+            : null,
+          ...(itemsFile ? { resultFile: itemsFile } : {}),
         },
       };
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error preparing call hierarchy: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };
@@ -240,44 +321,64 @@ async function callHierarchyResult(
         },
       ],
       structuredContent: {
-        outcome: 'ok',
+        outcome: 'empty', provider: 'lsp',
         ...(resolvedFrom ? { resolvedFrom } : {}),
-        calls: [],
+        calls: [], shown: 0, total: 0, omitted: 0,
       },
     };
   }
-  const lines: string[] = [];
+  const limit = boundedResultLimit(args.max_results);
+  const selectedCalls: unknown[] = [];
+  const selectedLines: string[] = [];
+  const allCalls: unknown[] = [];
+  let total = 0;
   for (const item of items) {
-    if (direction === 'incoming') {
-      for (const call of await client.incomingCalls(item)) {
+    const itemCalls = direction === 'incoming'
+      ? await client.incomingCalls(item)
+      : await client.outgoingCalls(item);
+    for (const call of itemCalls) {
+      total += 1;
+      allCalls.push(call);
+      if (selectedCalls.length >= limit) continue;
+      selectedCalls.push(call);
+      if (direction === 'incoming' && 'from' in call) {
         const start = call.from.selectionRange.start;
-        lines.push(
-          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`
+        selectedLines.push(
+          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`,
         );
-      }
-    } else {
-      for (const call of await client.outgoingCalls(item)) {
+      } else if (direction === 'outgoing' && 'to' in call) {
         const start = call.to.selectionRange.start;
-        lines.push(
-          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`
+        selectedLines.push(
+          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`,
         );
       }
     }
   }
+  const omitted = total - selectedCalls.length;
+  const callsFile = omitted > 0
+    ? spoolFullResult(`get_${direction}_calls`, { file: absolutePath, direction, total, calls: allCalls })
+    : null;
   return {
     content: [
       {
         type: 'text' as const,
         text:
-          lines.length === 0
+          selectedLines.length === 0
             ? `${resolved ? `${resolved}\n\n` : ''}No ${direction} calls found`
-            : `${resolved ? `${resolved}\n\n` : ''}Found ${lines.length} ${direction} call(s):\n\n${lines.join('\n')}`,
+            : `${resolved ? `${resolved}\n\n` : ''}Found ${selectedLines.length}/${total} ${direction} call(s):\n\n${selectedLines.join('\n')}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${callsFile ?? '(spool unavailable)'}` : ''}`,
       },
     ],
     structuredContent: {
-      outcome: 'ok',
+      outcome: selectedCalls.length > 0 ? 'ok' : 'empty', provider: 'lsp',
       ...(resolvedFrom ? { resolvedFrom } : {}),
-      calls: lines,
+      calls: selectedCalls,
+      shown: selectedCalls.length,
+      total,
+      omitted,
+      recovery: omitted > 0
+        ? `Read the complete result at ${callsFile ?? '(spool unavailable)'} or narrow the selector.`
+        : null,
+      ...(callsFile ? { resultFile: callsFile } : {}),
     },
   };
 }
@@ -291,9 +392,7 @@ export const getIncomingCallsTool: ToolDefinition = {
       return await callHierarchyResult('incoming', args as PositionArgs, client);
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error finding incoming calls: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };
@@ -307,9 +406,7 @@ export const getOutgoingCallsTool: ToolDefinition = {
       return await callHierarchyResult('outgoing', args as PositionArgs, client);
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error finding outgoing calls: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };

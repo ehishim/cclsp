@@ -190,6 +190,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
       }
       const workspaceEdit = await client.renameSymbol(absolutePath, resolution.position, new_name);
       const changes = workspaceEdit?.changes ?? {};
+      const editCount = Object.values(changes).reduce((total, edits) => total + edits.length, 0);
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
       if (Object.keys(changes).length === 0) {
@@ -201,10 +202,9 @@ export const renameSymbolStrictTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'empty', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            applied: false,
-            editCount: 0,
+            applied: false, editCount: 0, shown: 0, total: 0, omitted: 0,
           },
         };
       }
@@ -227,10 +227,11 @@ export const renameSymbolStrictTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok',
+            outcome: 'ok', provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
             applied: false,
             edit: workspaceEdit,
+            shown: editCount, total: editCount, omitted: 0,
           },
         };
       }
@@ -244,17 +245,16 @@ export const renameSymbolStrictTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok',
+          outcome: 'ok', provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           applied: true,
           filesModified: editResult.filesModified,
+          shown: editCount, total: editCount, omitted: 0,
         },
       };
     } catch (error) {
       rethrowToolOutcome(error);
-      return textResult(
-        `Error renaming symbol: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw error;
     }
   },
 };
