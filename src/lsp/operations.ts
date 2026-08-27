@@ -788,12 +788,21 @@ export async function getDocumentSymbols(
   return [];
 }
 
-export async function findSymbolsByName(
-  serverState: ServerState,
+/**
+ * Matches already-resolved symbols by name and kind. It takes the symbols rather than a
+ * server because the tier that produced them is not its concern: a tree-sitter parse of one
+ * file needs no language server, and the kind fallback and position rules below must be the
+ * same either way.
+ */
+export async function matchSymbolsByName(
   filePath: string,
+  inputSymbols: Array<DocumentSymbol | SymbolInformation>,
   symbolName: string,
   symbolKind?: string
 ): Promise<{ matches: SymbolMatch[]; warning?: string }> {
+  // isDocumentSymbolArray narrows at runtime; this only reconciles a mixed-element array with
+  // the union-of-arrays spelling the branches below are written against.
+  const symbols = inputSymbols as DocumentSymbol[] | SymbolInformation[];
   logger.debug(
     `[DEBUG findSymbolsByName] Searching for symbol "${symbolName}" with kind "${symbolKind || 'any'}" in ${filePath}\n`
   );
@@ -806,10 +815,12 @@ export async function findSymbolsByName(
     effectiveSymbolKind = undefined;
   }
 
-  const symbols = await getDocumentSymbols(serverState, filePath);
+  // isDocumentSymbolArray below narrows this at runtime, which is what both branches rely on;
+  // the cast only reconciles a mixed-element array with the union-of-arrays spelling.
   const matches: SymbolMatch[] = [];
 
   logger.debug(`[DEBUG findSymbolsByName] Got ${symbols.length} symbols from documentSymbols\n`);
+
 
   if (isDocumentSymbolArray(symbols)) {
     logger.debug('[DEBUG findSymbolsByName] Processing DocumentSymbol[] (hierarchical format)\n');
@@ -922,6 +933,16 @@ export async function findSymbolsByName(
 
   const combinedWarning = [validationWarning, fallbackWarning].filter(Boolean).join(' ');
   return { matches, warning: combinedWarning || undefined };
+}
+
+export async function findSymbolsByName(
+  serverState: ServerState,
+  filePath: string,
+  symbolName: string,
+  symbolKind?: string
+): Promise<{ matches: SymbolMatch[]; warning?: string }> {
+  const symbols = await getDocumentSymbols(serverState, filePath);
+  return matchSymbolsByName(filePath, symbols, symbolName, symbolKind);
 }
 
 // Read a file and compute a content signature (SHA-1) in one pass. Returns null if

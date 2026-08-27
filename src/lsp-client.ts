@@ -26,6 +26,7 @@ import {
   findImplementation as opsFindImplementation,
   findReferences as opsFindReferences,
   findSymbolsByName as opsFindSymbolsByName,
+  matchSymbolsByName as opsMatchSymbolsByName,
   getCodeActions as opsGetCodeActions,
   getCompletions as opsGetCompletions,
   getDiagnostics as opsGetDiagnostics,
@@ -487,6 +488,15 @@ export class LSPClient {
     symbolName: string,
     symbolKind?: string
   ): Promise<{ matches: SymbolMatch[]; warning?: string }> {
+    // Resolve the file's symbols through the one owner of "an empty answer is not an answer",
+    // then let the operation do only the matching. find_references, find_definition and
+    // rename_symbol all arrive here by name, so placing the rule anywhere below this point
+    // would fix one caller and leave its siblings reporting a named file's own declarations
+    // absent. The operation keeps kind fallback and position resolution.
+    const provided = await this.getDocumentSymbolsWithProvider(filePath);
+    if (provided.outcome === 'ok') {
+      return opsMatchSymbolsByName(filePath, provided.value, symbolName, symbolKind);
+    }
     const serverState = await this.getServer(filePath);
     return opsFindSymbolsByName(serverState, filePath, symbolName, symbolKind);
   }

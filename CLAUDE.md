@@ -64,7 +64,7 @@ npm run prepublishOnly  # build + test + typecheck
 - Exposes structural patterns with `$NAME` single-node and `$$$NAME` variadic captures
 - Builds root-bound structural rewrite previews and candidate identities; `file-editor.ts` owns exact-byte atomic commit/rollback and `LSPClient` owns strict provider synchronization
 - Supplies explicitly syntax-only declaration, document-symbol, and query-position fallback when no configured LSP exists or the selected server does not support the required method
-- Preserves provider provenance: LSP success, including supported-empty, remains `lsp`; AST results are `tree-sitter`; unavailable results are `none`
+- Preserves provider provenance: an LSP answer that carries symbols remains `lsp`; AST results are `tree-sitter`; unavailable results are `none`. An LSP result of zero document symbols is not treated as an answer on its own, because a server that is still indexing returns exactly that without failing: Tree-sitter parses the one named file and settles it, and only replaces the empty list when it actually finds declarations. A file that genuinely declares nothing still answers empty as `lsp`.
 
 **Server Adapter System** (`src/lsp/adapters/`)
 
@@ -87,7 +87,7 @@ npm run prepublishOnly  # build + test + typecheck
 2. Main server resolves file path and extracts position
 3. `LSPClient` remains the provider-selection owner: `ast_search` and syntax-only `code_rewrite` candidate construction go to its root-bound AST provider; semantic tools prefer the appropriate language server
 4. `code_rewrite` defaults to preview; explicit apply recomputes the candidate under a lock, commits through the exact-byte file transaction, then synchronizes LSP documents/diagnostics and AST state or rolls all providers and disk back
-5. If an admitted declaration/document-symbol operation has no configured server or the method is unsupported, `LSPClient` may return a syntax-only Tree-sitter fallback with explicit limitations; supported-empty and other LSP failures never fall back
+5. If an admitted declaration/document-symbol operation has no configured server or the method is unsupported, `LSPClient` may return a syntax-only Tree-sitter fallback with explicit limitations. A zero-symbol document-symbol result is also settled by Tree-sitter, since a still-indexing server produces it without failing and every caller reads it as a fact about the file; resolution by name (`find_references`, `find_definition`, `rename_symbol`) goes through that same settled set, so no by-name caller inherits an unfinished index. Other LSP failures still never fall back.
 6. If an LSP server is needed and not running, spawns the language server process
 7. Sends the request to the selected provider and transforms the result back to MCP format with explicit provider provenance
 

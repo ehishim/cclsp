@@ -208,3 +208,33 @@ describe('a still-indexing server answering empty is not an answer', () => {
     });
   });
 });
+
+describe('by-name tools do not inherit a still-indexing empty', () => {
+  it('answers find_references for a declaration the server has not listed yet', async () => {
+    await withClient(async (root, client) => {
+      const file = join(root, 'byname.ts');
+      await writeFile(file, 'export function isUnder(a: string) {\n  return a;\n}\n');
+
+      // The server is up and answering; it simply has no symbols for this file yet.
+      const spy = jest.spyOn(client, 'getDocumentSymbols').mockResolvedValue([]);
+
+      const { matches } = await client.findSymbolsByName(file, 'isUnder');
+      expect(matches.map((match) => match.name)).toContain('isUnder');
+
+      spy.mockRestore();
+    });
+  });
+
+  it('still reports a genuinely undeclared name as no match', async () => {
+    await withClient(async (root, client) => {
+      const file = join(root, 'byname-absent.ts');
+      await writeFile(file, 'export function present() {\n  return 1;\n}\n');
+      const spy = jest.spyOn(client, 'getDocumentSymbols').mockResolvedValue([]);
+
+      const { matches } = await client.findSymbolsByName(file, 'neverDeclaredAnywhere');
+      expect(matches).toEqual([]);
+
+      spy.mockRestore();
+    });
+  });
+});
