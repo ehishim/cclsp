@@ -815,8 +815,6 @@ export async function matchSymbolsByName(
     effectiveSymbolKind = undefined;
   }
 
-  // isDocumentSymbolArray below narrows this at runtime, which is what both branches rely on;
-  // the cast only reconciles a mixed-element array with the union-of-arrays spelling.
   const matches: SymbolMatch[] = [];
 
   logger.debug(`[DEBUG findSymbolsByName] Got ${symbols.length} symbols from documentSymbols\n`);
