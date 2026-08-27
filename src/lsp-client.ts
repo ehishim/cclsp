@@ -498,7 +498,18 @@ export class LSPClient {
 
   async getDocumentSymbolsWithProvider(filePath: string): Promise<ProviderDocumentSymbols> {
     try {
-      return { outcome: 'ok', provider: 'lsp', value: await this.getDocumentSymbols(filePath) };
+      const symbols = await this.getDocumentSymbols(filePath);
+      // A server that is still indexing answers this successfully with zero symbols, so
+      // "did not throw" is not the same as "answered". Treating it as an answer is what let a
+      // caller-named file report its own declarations as absent: every consumer of this result
+      // reads empty as a fact about the file. Tree-sitter parses the one file directly and needs
+      // no server, so it can settle that question now; it only ever replaces an empty list, and
+      // when it is also empty the file genuinely declares nothing and the LSP answer stands.
+      if (symbols.length === 0) {
+        const parsed = await this.astProvider.documentSymbols(filePath);
+        if (parsed.outcome === 'ok' && parsed.value.length > 0) return parsed;
+      }
+      return { outcome: 'ok', provider: 'lsp', value: symbols };
     } catch (error) {
       if (!isAstFallbackEligible(error)) throw error;
       return preserveUnsupportedOrigin(error, await this.astProvider.documentSymbols(filePath));

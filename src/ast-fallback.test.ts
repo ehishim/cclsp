@@ -119,7 +119,12 @@ describe('honest AST fallback', () => {
     await withClient(async (root, client) => {
       client.getDocumentSymbols = jest.fn().mockResolvedValue([]);
       client.findSymbolsByName = jest.fn().mockResolvedValue({ matches: [] });
-      const file = join(root, 'sample.py');
+      // Deliberately a file that declares nothing. This guard exists so a true negative is never
+      // retyped into a gap, and that is only what an empty answer means when the file is in fact
+      // empty. The earlier fixture asserted this over sample.py, which declares Box and run, so it
+      // required a demonstrably wrong empty to be preserved as evidence about the code.
+      const file = join(root, 'empty.py');
+      await writeFile(file, '# nothing is declared in this file\n');
       await expect(client.getDocumentSymbolsWithProvider(file)).resolves.toEqual({
         outcome: 'ok',
         provider: 'lsp',
@@ -161,6 +166,45 @@ describe('honest AST fallback', () => {
       await expect(client.findReferences(file, { line: 1, character: 8 })).rejects.toThrow(
         'No LSP server configured'
       );
+    });
+  });
+});
+
+describe('a still-indexing server answering empty is not an answer', () => {
+  it('settles a caller-named file with tree-sitter instead of reporting its symbols absent', async () => {
+    await withClient(async (root, client) => {
+      const file = join(root, 'cold.ts');
+      await writeFile(file, 'export function isUnder(a: string, b: string) {\n  return a === b;\n}\n');
+
+      // The failure this guards: the server returns successfully with zero symbols while it is
+      // still indexing, so nothing throws and the fallback tier is never reached.
+      const spy = jest.spyOn(client, 'getDocumentSymbols').mockResolvedValue([]);
+
+      const symbols = await client.getDocumentSymbolsWithProvider(file);
+      expect(symbols.outcome).toBe('ok');
+      if (symbols.outcome === 'ok') {
+        expect(symbols.provider).toBe('tree-sitter');
+        expect(symbols.value.map((symbol) => symbol.name)).toContain('isUnder');
+      }
+
+      // And the caller-facing consequence: resolving by name must locate it, not refuse.
+      const resolved = await resolveToolPosition(file, { query: 'isUnder' }, client);
+      expect(resolved.outcome).not.toBe('not_found');
+
+      spy.mockRestore();
+    });
+  });
+
+  it('leaves a genuinely empty file reported empty by the server that answered', async () => {
+    await withClient(async (root, client) => {
+      const file = join(root, 'blank.ts');
+      await writeFile(file, '// no declarations here\n');
+      const spy = jest.spyOn(client, 'getDocumentSymbols').mockResolvedValue([]);
+
+      const symbols = await client.getDocumentSymbolsWithProvider(file);
+      expect(symbols).toMatchObject({ outcome: 'ok', provider: 'lsp', value: [] });
+
+      spy.mockRestore();
     });
   });
 });
