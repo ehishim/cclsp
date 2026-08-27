@@ -199,8 +199,9 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
         structuredContent: {
           // `empty` asserts the workspace genuinely has no such symbol. Only a
           // workspace confirmed SEARCHABLE may make that claim; otherwise zero
-          // rows means "not searchable yet", and reporting it as absence is how a
-          // caller concludes a symbol does not exist and stops looking.
+          // rows means "this provider is not answering yet". Even once it answers,
+          // a zero here is a SCOPED negative -- no match among the files it has
+          // loaded -- never proof the symbol is absent from the repository.
           outcome: selected.length > 0 ? 'ok' : readinessConfirmed ? 'empty' : 'stale',
           readinessConfirmed,
           provider: 'lsp',

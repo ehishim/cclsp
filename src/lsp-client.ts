@@ -615,7 +615,7 @@ export class LSPClient {
   /**
    * Search the workspace, and report whether the answer may be trusted as
    * COMPLETE. `readinessConfirmed: false` means the servers could not be shown to
-   * be searchable within the budget, so zero rows is "not searchable yet" rather
+   * be answering within the budget, so zero rows is "not answering yet" rather
    * than "no such symbol" — a distinction only this layer can still make.
    */
   async workspaceSymbol(

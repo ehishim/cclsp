@@ -166,7 +166,7 @@ describe('capability tool contracts', () => {
     expect(JSON.parse(readFileSync(spooled, 'utf8')).symbols).toHaveLength(3);
   });
 
-  it('reports zero rows as EMPTY only when the workspace is confirmed searchable', async () => {
+  it('reports zero rows as a SCOPED empty only when the provider is confirmed answering', async () => {
     // `empty` is an assertion that the workspace has no such symbol. It is the
     // answer that makes a caller stop looking, so it needs the stronger evidence.
     const result = await findWorkspaceSymbolsTool.handler(
@@ -183,9 +183,9 @@ describe('capability tool contracts', () => {
     expect(result.content[0]?.text).toContain('LOADED files only');
   });
 
-  it('reports zero rows as STALE while the workspace is not confirmed searchable', async () => {
+  it('reports zero rows as STALE while the provider is not confirmed answering', async () => {
     // The measured defect: an unindexed navto answers [] and it was typed as
-    // absence, so an existing symbol read as "does not exist" with exit 0.
+    // a negative, so an existing symbol read as "no match" with exit 0.
     const result = await findWorkspaceSymbolsTool.handler(
       { query: 'deriveUnifiedAgentState' },
       asClient({
