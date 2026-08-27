@@ -23,6 +23,12 @@ export interface RootEntry {
   pid: number | undefined;
   startedAt: number;
   lastUsed: number;
+  /**
+   * This root's language server could not serve a file BELOW it, so it is no
+   * longer offered as a covering root for nested paths. It stays usable for its
+   * own exact root, which is what its caller actually asked for.
+   */
+  coverageBroken?: boolean;
 }
 
 export interface ToolSchema {
@@ -119,10 +125,15 @@ export class RootPool {
     // Subroot reuse: if an already-warm root encloses this path, its language server
     // already covers these files — reuse it instead of spawning a second one. Pass
     // isolate to force a dedicated instance (e.g. a monorepo package with its own config).
+    //
+    // "Already covers these files" holds only while that server can actually serve
+    // them. A root registered ABOVE a package — which is what an Agent whose cwd is
+    // a Worktree top registers by default — may have no toolchain of its own, and
+    // handing it out then returns ITS failure for every nested request, for the
+    // daemon's lifetime, phrased as a fact about the language rather than about the
+    // root that was reused.
     if (!opts.isolate) {
-      const covering = this.list()
-        .filter((e) => isUnder(root, e.root))
-        .sort((a, b) => b.root.length - a.root.length)[0];
+      const covering = this.findCoveringRoot(root);
       if (covering) {
         covering.lastUsed = Date.now();
         return { entry: covering, reused: true };
@@ -232,6 +243,19 @@ export class RootPool {
     }
   }
 
+  /**
+   * The project root that OWNS `target`, discovered from the filesystem.
+   *
+   * `routeTarget`'s warm fast-path deliberately answers without this, reporting
+   * the covering root as both detected and serving. That is the right trade while
+   * the covering root works; it is exactly wrong once it has failed, because the
+   * caller then needs the root the target actually belongs to. Discovery is paid
+   * only on that failure path.
+   */
+  owningRoot(target: string): string | undefined {
+    return this.discover(resolve(target));
+  }
+
   private discover(target: string): string | undefined {
     const key = projectSearchDirectory(target);
     const cached = this.discoveryCache.get(key);
@@ -298,5 +322,22 @@ export class RootPool {
     return entry.client.callTool({ name, arguments: args }, undefined, {
       timeout: TOOL_TIMEOUT_MS,
     });
+  }
+
+  /**
+   * The most specific warm root that encloses `root` AND can still serve paths
+   * below it. A root retired by {@link markCoverageBroken} is skipped here and
+   * nowhere else, so it stays usable for its own exact root.
+   */
+  findCoveringRoot(root: string): RootEntry | undefined {
+    const normalized = normalizeRoot(root);
+    return this.list()
+      .filter((e) => isUnder(normalized, e.root) && !e.coverageBroken)
+      .sort((a, b) => b.root.length - a.root.length)[0];
+  }
+
+  /** Stop offering `entry` as a covering root for paths below it. */
+  markCoverageBroken(entry: RootEntry): void {
+    entry.coverageBroken = true;
   }
 }

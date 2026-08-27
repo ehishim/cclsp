@@ -105,3 +105,50 @@ describe('RootPool smart target routing', () => {
     expect(discover).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('RootPool covering-root health', () => {
+  it('stops offering a covering root that could not serve a path below it', async () => {
+    // A root registered ABOVE a package -- what an Agent whose cwd is a Worktree
+    // top registers by default -- may have no toolchain of its own. Handing it out
+    // returns ITS failure for every nested request, for the daemon's lifetime, and
+    // phrases it as a fact about the language rather than about the reused root.
+    const pool = new RootPool({ discoverProjectRoot: () => undefined });
+    const outer = fixture();
+    const nested = join(outer, 'orqestra');
+    mkdirSync(nested, { recursive: true });
+    const covering = seedWarm(pool, outer);
+
+    expect(pool.findCoveringRoot(nested)).toBe(covering);
+
+    pool.markCoverageBroken(covering);
+
+    expect(pool.findCoveringRoot(nested)).toBeUndefined();
+  });
+
+  it('keeps a retired covering root usable for its OWN exact root', async () => {
+    // Retirement is about coverage, not about the root its caller actually asked
+    // for: an exact-match request must still be served.
+    const pool = new RootPool({ discoverProjectRoot: () => undefined });
+    const outer = fixture();
+    const covering = seedWarm(pool, outer);
+    pool.markCoverageBroken(covering);
+
+    expect(await pool.ensure(outer)).toMatchObject({ entry: covering, reused: true });
+  });
+
+  it('falls back to the next healthy covering root rather than to none', async () => {
+    const pool = new RootPool({ discoverProjectRoot: () => undefined });
+    const outer = fixture();
+    const middle = join(outer, 'packages');
+    const nested = join(middle, 'app');
+    mkdirSync(nested, { recursive: true });
+    const outerEntry = seedWarm(pool, outer);
+    const middleEntry = seedWarm(pool, middle);
+
+    expect(pool.findCoveringRoot(nested)).toBe(middleEntry);
+
+    pool.markCoverageBroken(middleEntry);
+
+    expect(pool.findCoveringRoot(nested)).toBe(outerEntry);
+  });
+});

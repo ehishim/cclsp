@@ -2,9 +2,9 @@
 // calls to the right warm cclsp child, and evicts idle roots. Started detached by
 // the CLI on first use (see client.ts), or directly via `cclsp-hub --daemon`.
 
-import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { type Server, type Socket, createServer } from 'node:net';
-import { isAbsolute, resolve } from 'node:path';
+import { dirname, isAbsolute, resolve } from 'node:path';
 
 import {
   IDLE_DAEMON_MS,
@@ -13,7 +13,7 @@ import {
   RUNTIME_DIR,
   SOCKET_PATH,
 } from './config.js';
-import { type RootEntry, RootPool, normalizeRoot, type RoutedRoot, type ToolSchema } from './pool.js';
+import { RootPool, normalizeRoot, type RoutedRoot, type ToolSchema } from './pool.js';
 import { markColdIndexResult, normalizeToolResult } from './tool-result.js';
 import { type HubRequest, createLineReader, writeMessage } from './protocol.js';
 import { acquireDaemonLock } from './startup-lock.js';
@@ -93,7 +93,6 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   } else {
     route = await pool.routeTarget(pathArg);
   }
-  const entry: RootEntry = route.entry;
 
   // We have a live child, so its (cached) schema is available for coercion + checks.
   const schemas = await pool.describe();
@@ -111,17 +110,146 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   if (missing.length) {
     throw new Error(`missing required parameter(s) for ${name}: ${missing.join(', ')}`);
   }
-  const routed = withRoutingMetadata(await pool.callTool(entry, name, params), route);
+  const answer = await callThroughRoute(pool, route, name, params, pathArg, Boolean(explicitRoot));
+  const routed = withRoutingMetadata(answer, route);
   if (args.rawMcp === true) return routed;
   const defaultProvider = name === 'ast_search' || name === 'code_rewrite' ? 'tree-sitter' : 'lsp';
   const normalized = normalizeToolResult(routed, { defaultProvider });
-  return markColdIndexResult(normalized, name, Date.now() - entry.startedAt);
+  // Read the age from the root that actually SERVED this answer: a retry rebinds
+  // route.entry to a freshly spawned dedicated root, and the retired covering
+  // root's age would report a brand-new server as long warm.
+  return markColdIndexResult(normalized, name, Date.now() - route.entry.startedAt);
+}
+
+/**
+ * A language-server handshake failure, as opposed to a failure to answer this
+ * particular question. It says the server serving this path cannot serve it at
+ * all, which for a REUSED covering root is a fact about that root rather than
+ * about the request.
+ */
+function isServerInitFailure(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error ?? '');
+  return text.includes('initialize failed');
+}
+
+/**
+ * A tool failure arrives as an `isError` RESULT, not as a thrown error, so a
+ * recovery that only catches exceptions never sees it.
+ */
+function resultInitFailure(result: unknown): boolean {
+  if (!result || typeof result !== 'object') return false;
+  const envelope = result as { isError?: unknown; content?: unknown };
+  if (envelope.isError !== true) return false;
+  const content = Array.isArray(envelope.content) ? envelope.content : [];
+  const text = content
+    .map((part) => (part && typeof part === 'object' ? String((part as { text?: unknown }).text ?? '') : ''))
+    .join('\n');
+  return isServerInitFailure(text);
+}
+
+/**
+ * Call through the routed root, and recover from the one routing mistake the pool
+ * can make: serving a nested request from a warm COVERING root whose server
+ * cannot serve it. That covering root is retired from coverage and the requested
+ * path gets its own dedicated root, so the caller receives the answer it asked
+ * for instead of inheriting an unrelated root's failure.
+ *
+ * `callerPinnedRoot` disables that recovery entirely. An explicit --root is an
+ * exact override, so the root the caller NAMED is the one that must answer --
+ * even for a nested target it turns out not to own. Retiring it would silently
+ * redirect the call to a root the caller did not ask for, which is the same
+ * misattribution defect in the opposite direction.
+ */
+export async function callThroughRoute(
+  pool: Pick<RootPool, 'callTool' | 'markCoverageBroken' | 'ensure' | 'owningRoot'>,
+  route: RoutedRoot,
+  name: string,
+  params: Record<string, unknown>,
+  target?: string,
+  callerPinnedRoot = false,
+): Promise<any> {
+  const reusedRoot = route.entry.root;
+  const absoluteTarget = target ? normalizeRoot(target) : null;
+  let firstFailure: unknown;
+  try {
+    const result = await pool.callTool(route.entry, name, params);
+    if (callerPinnedRoot || !route.reused || !resultInitFailure(result)) return result;
+    firstFailure = result;
+  } catch (error) {
+    if (callerPinnedRoot || !route.reused || !isServerInitFailure(error)) throw error;
+    firstFailure = error;
+  }
+
+  {
+    // Only NOW ask which project owns the target. Whether this was covering reuse
+    // cannot be read off the route: `routeTarget`'s warm fast-path reports the
+    // covering root as the detected one, so comparing them is false on the DEFAULT
+    // no-explicit-root path — the very path an Agent takes. Discovery is the honest
+    // answer and is paid only here, on a failure that already cost a handshake.
+    const owning = absoluteTarget ? pool.owningRoot(absoluteTarget) : route.detectedRoot;
+    // The serving root IS the target's own project, so its failure is the answer:
+    // there is no narrower root to fall back to and nothing to retire.
+    if (!owning || owning === reusedRoot) {
+      if (firstFailure instanceof Error) throw firstFailure;
+      return firstFailure;
+    }
+    route.detectedRoot = owning;
+    pool.markCoverageBroken(route.entry);
+    const { entry: dedicated } = await pool.ensure(owning, { isolate: true });
+    route.entry = dedicated;
+    route.servingRoot = dedicated.root;
+    route.reused = false;
+    const context = `retried on a dedicated root for ${route.detectedRoot} after the covering root ${reusedRoot} could not serve it`;
+    try {
+      const retried = await pool.callTool(dedicated, name, params);
+      // The DEDICATED root's own failure is the one that describes this request;
+      // the covering root's is context. Reporting the retired root's message
+      // instead would misattribute the failure -- the defect this retry exists to
+      // stop -- so the dedicated result is returned and only annotated.
+      if (resultInitFailure(retried)) return annotateFailure(retried, context);
+      return retried;
+    } catch (retryError) {
+      const detail = retryError instanceof Error ? retryError.message : String(retryError);
+      throw new Error(detail.includes(context) ? detail : `${detail} (${context})`);
+    }
+  }
+}
+
+/** Keep the failing envelope intact and append why it was reached. */
+function annotateFailure(result: unknown, context: string): unknown {
+  if (!result || typeof result !== 'object') return result;
+  const envelope = result as { content?: unknown };
+  const content = Array.isArray(envelope.content) ? envelope.content : [];
+  const annotated = content.map((part, index) => (
+    index === 0 && part && typeof part === 'object' && typeof (part as { text?: unknown }).text === 'string'
+      ? { ...(part as Record<string, unknown>), text: `${(part as { text: string }).text} (${context})` }
+      : part
+  ));
+  return { ...(result as Record<string, unknown>), content: annotated.length > 0 ? annotated : content };
 }
 
 export async function runDaemon(): Promise<void> {
   mkdirSync(RUNTIME_DIR, { recursive: true });
+  // An overridden socket may live outside RUNTIME_DIR, and bind() will not create
+  // its parent.
+  mkdirSync(dirname(SOCKET_PATH), { recursive: true });
   const releaseLock = acquireDaemonLock(PID_PATH);
-  if (!releaseLock) return;
+  if (!releaseLock) {
+    // Refusing silently leaves the caller with only a client-side "timed out
+    // waiting for its socket", which names the socket rather than the lock that
+    // actually refused, and reads as a broken build rather than a live holder.
+    let holder = 'unknown';
+    try {
+      holder = readFileSync(PID_PATH, 'utf8').trim() || 'unknown';
+    } catch {
+      // The holder released the lock between the failed acquire and this read.
+    }
+    process.stderr.write(
+      `cclsp-hub daemon not started: startup lock ${PID_PATH} is held by pid ${holder}.\n` +
+        `That daemon serves ${SOCKET_PATH}. Shut it down, or set CCLSP_HUB_SOCKET to a different path to run an isolated daemon beside it.\n`,
+    );
+    return;
+  }
   let cleaned = false;
   const cleanupRuntime = () => {
     if (cleaned) return;

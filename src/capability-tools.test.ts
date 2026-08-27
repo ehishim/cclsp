@@ -153,7 +153,10 @@ describe('capability tool contracts', () => {
     }));
     const result = await findWorkspaceSymbolsTool.handler(
       { query: 'a', max_results: 2 },
-      asClient({ workspaceSymbol: jest.fn().mockResolvedValue(symbols), symbolKindToString: () => 'variable' }),
+      asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols, readinessConfirmed: true }),
+        symbolKindToString: () => 'variable',
+      }),
     );
     expect(result.structuredContent).toMatchObject({
       outcome: 'ok', provider: 'lsp', shown: 2, total: 3, omitted: 1,
@@ -161,6 +164,53 @@ describe('capability tool contracts', () => {
     const spooled = (result.structuredContent as any).resultFile as string;
     expect(result.content[0]?.text).toContain(spooled);
     expect(JSON.parse(readFileSync(spooled, 'utf8')).symbols).toHaveLength(3);
+  });
+
+  it('reports zero rows as EMPTY only when the workspace is confirmed searchable', async () => {
+    // `empty` is an assertion that the workspace has no such symbol. It is the
+    // answer that makes a caller stop looking, so it needs the stronger evidence.
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'nothing' },
+      asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols: [], readinessConfirmed: true }),
+        symbolKindToString: () => 'variable',
+      }),
+    );
+    expect(result.structuredContent).toMatchObject({ outcome: 'empty', shown: 0, total: 0 });
+    // Zero rows must never read as proof of absence: this searches loaded files,
+    // so the caller is routed to the tool that searches the repository.
+    expect((result.structuredContent as any).recovery).toContain('ast_search');
+    expect(result.content[0]?.text).toContain('LOADED files only');
+  });
+
+  it('reports zero rows as STALE while the workspace is not confirmed searchable', async () => {
+    // The measured defect: an unindexed navto answers [] and it was typed as
+    // absence, so an existing symbol read as "does not exist" with exit 0.
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'deriveUnifiedAgentState' },
+      asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols: [], readinessConfirmed: false }),
+        symbolKindToString: () => 'variable',
+      }),
+    );
+    expect(result.structuredContent).toMatchObject({ outcome: 'stale', shown: 0 });
+    expect((result.structuredContent as any).recovery).toContain('ast_search');
+  });
+
+  it('keeps rows found while unconfirmed, but does not call the answer complete', async () => {
+    const symbols = [{
+      name: 'found', kind: 13,
+      location: { uri: 'file:///workspace/src/found.ts', range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } } },
+    }];
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'found' },
+      asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols, readinessConfirmed: false }),
+        symbolKindToString: () => 'variable',
+      }),
+    );
+    expect(result.structuredContent).toMatchObject({ outcome: 'ok', shown: 1 });
+    expect((result.structuredContent as any).readinessConfirmed).toBe(false);
   });
 
   it('returns typed diagnostics including the source file for range normalization', async () => {

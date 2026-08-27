@@ -23,10 +23,19 @@ describe('AdapterRegistry', () => {
       expect(adapter?.name).toBe('pyright');
     });
 
-    it('should return undefined for unknown server', () => {
+    it('should return the typescript adapter for typescript-language-server', () => {
       const adapter = adapterRegistry.getAdapter({
         extensions: ['ts'],
         command: ['typescript-language-server', '--stdio'],
+      });
+
+      expect(adapter?.name).toBe('typescript');
+    });
+
+    it('should return undefined for unknown server', () => {
+      const adapter = adapterRegistry.getAdapter({
+        extensions: ['rs'],
+        command: ['rust-analyzer'],
       });
 
       expect(adapter).toBeUndefined();

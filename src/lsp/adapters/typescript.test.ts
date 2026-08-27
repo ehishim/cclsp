@@ -1,0 +1,69 @@
+import { describe, expect, test } from 'bun:test';
+import type { InitializeParams } from '../types.js';
+import { TypeScriptAdapter } from './typescript.js';
+
+function params(overrides: Partial<InitializeParams> = {}): InitializeParams {
+  return {
+    processId: 1,
+    clientInfo: { name: 'cclsp', version: '0.0.0' },
+    capabilities: { textDocument: { hover: {} }, workspace: { configuration: true } },
+    rootUri: 'file:///workspace/project',
+    workspaceFolders: [{ uri: 'file:///workspace/project', name: 'workspace' }],
+    ...overrides,
+  };
+}
+
+describe('TypeScriptAdapter', () => {
+  const adapter = new TypeScriptAdapter();
+
+  test('matches the typescript language server only', () => {
+    expect(adapter.matches({ command: ['typescript-language-server', '--stdio'] } as never)).toBe(
+      true
+    );
+    expect(adapter.matches({ command: ['gopls'] } as never)).toBe(false);
+    expect(adapter.matches({ command: ['intelephense', '--stdio'] } as never)).toBe(false);
+  });
+
+  test('declares callHierarchy so the server advertises the provider', () => {
+    // Without this the server correctly does not advertise callHierarchyProvider,
+    // and prepare/incoming/outgoing calls report as unsupported by the LANGUAGE.
+    const result = adapter.customizeInitializeParams(params());
+    const capabilities = result.capabilities as {
+      textDocument: { callHierarchy?: unknown; hover?: unknown };
+    };
+
+    expect(capabilities.textDocument.callHierarchy).toEqual({ dynamicRegistration: false });
+  });
+
+  test('preserves every capability it does not own', () => {
+    const result = adapter.customizeInitializeParams(params());
+    const capabilities = result.capabilities as {
+      textDocument: { hover?: unknown };
+      workspace?: unknown;
+    };
+
+    expect(capabilities.textDocument.hover).toEqual({});
+    expect(capabilities.workspace).toEqual({ configuration: true });
+  });
+
+  test('injects no initializationOptions of its own', () => {
+    // tsserver discovery is the server's job; supplying a path here would be a
+    // fix with no defect behind it.
+    expect(adapter.customizeInitializeParams(params()).initializationOptions).toBeUndefined();
+  });
+
+  test('preserves configured initializationOptions untouched', () => {
+    const result = adapter.customizeInitializeParams(
+      params({ initializationOptions: { tsserver: { path: '/explicit/tsserver.js' } } })
+    );
+
+    expect(result.initializationOptions).toEqual({ tsserver: { path: '/explicit/tsserver.js' } });
+  });
+
+  test('tolerates absent or non-object capabilities', () => {
+    const result = adapter.customizeInitializeParams(params({ capabilities: undefined }));
+    const capabilities = result.capabilities as { textDocument: { callHierarchy?: unknown } };
+
+    expect(capabilities.textDocument.callHierarchy).toEqual({ dynamicRegistration: false });
+  });
+});

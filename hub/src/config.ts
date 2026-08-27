@@ -23,7 +23,32 @@ function intEnv(name: string, def: number): number {
 
 export const RUNTIME_DIR = runtimeDir();
 export const SOCKET_PATH = process.env.CCLSP_HUB_SOCKET || join(RUNTIME_DIR, 'daemon.sock');
-export const PID_PATH = join(RUNTIME_DIR, 'daemon.pid');
+
+/**
+ * The startup lock belongs to the SOCKET, not to the machine: one daemon per
+ * socket. A lock at a fixed path while the socket is overridable means an
+ * isolated daemon contends for a lock it should never touch, loses, and exits —
+ * so `CCLSP_HUB_SOCKET` cannot produce a second instance while any daemon runs,
+ * and a candidate can then only be validated by deploying it over the shared
+ * install.
+ *
+ * The default socket keeps its historical lock filename so a daemon already
+ * running from an older build is still seen by a newer one; only an overridden
+ * socket gets a lock derived from it.
+ */
+export function resolveDaemonLockPath(
+  socketOverride: string | undefined,
+  runtimeDir: string,
+  socketPath: string,
+): string {
+  return socketOverride ? `${socketPath}.pid` : join(runtimeDir, 'daemon.pid');
+}
+
+export const PID_PATH = resolveDaemonLockPath(
+  process.env.CCLSP_HUB_SOCKET,
+  RUNTIME_DIR,
+  SOCKET_PATH,
+);
 
 // The built cclsp MCP server entry the daemon spawns (one child per root).
 export const CCLSP_ENTRY = process.env.CCLSP_HUB_ENTRY || '/workspace/cclsp/dist/index.js';

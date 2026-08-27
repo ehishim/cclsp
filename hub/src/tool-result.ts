@@ -119,9 +119,19 @@ export function markColdIndexResult(
   toolName: string,
   rootAgeMs: number,
 ): unknown {
-  if (!INDEX_DEPENDENT_TOOLS.has(toolName) || rootAgeMs >= COLD_INDEX_WINDOW_MS
-    || !result || typeof result !== 'object') return result;
+  if (!INDEX_DEPENDENT_TOOLS.has(toolName) || !result || typeof result !== 'object') return result;
   const normalized = result as Record<string, unknown>;
+  // A tool that REPORTS its own readiness has observed the thing this wall clock
+  // can only guess at, so the reported fact decides and the window never overrules
+  // it. The window survives only for tools that report nothing: a fixed few
+  // seconds cannot describe a real project graph load, which is why an answer
+  // served after it closed still read as complete.
+  const reported = normalized.readinessConfirmed;
+  if (typeof reported === 'boolean') {
+    if (reported) return result;
+  } else if (rootAgeMs >= COLD_INDEX_WINDOW_MS) {
+    return result;
+  }
   if (typeof normalized.outcome === 'string'
     && !['ok', 'empty'].includes(normalized.outcome)) return result;
   const recovery = normalized.outcome === 'empty'

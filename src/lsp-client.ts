@@ -105,7 +105,7 @@ export class LSPClient {
   private serverManager = new ServerManager();
   private astProvider: AstProvider;
   private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
-  private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<void>>();
+  private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<boolean>>();
   private rewriteApplyTail: Promise<void> = Promise.resolve();
 
   constructor(configPath?: string, root = process.cwd()) {
@@ -612,7 +612,15 @@ export class LSPClient {
     return opsHover(serverState, filePath, position);
   }
 
-  async workspaceSymbol(query: string): Promise<SymbolInformation[]> {
+  /**
+   * Search the workspace, and report whether the answer may be trusted as
+   * COMPLETE. `readinessConfirmed: false` means the servers could not be shown to
+   * be searchable within the budget, so zero rows is "not searchable yet" rather
+   * than "no such symbol" — a distinction only this layer can still make.
+   */
+  async workspaceSymbol(
+    query: string
+  ): Promise<{ symbols: SymbolInformation[]; readinessConfirmed: boolean }> {
     let servers = Array.from(this.serverManager.getRunningServers().values());
     if (servers.length === 0) {
       logger.debug('[workspaceSymbol] No LSP servers running; preloading now\n');
@@ -620,7 +628,7 @@ export class LSPClient {
       servers = Array.from(this.serverManager.getRunningServers().values());
       if (servers.length === 0) {
         logger.debug('[workspaceSymbol] No LSP servers available after preload\n');
-        return [];
+        return { symbols: [], readinessConfirmed: false };
       }
     }
 
@@ -630,40 +638,43 @@ export class LSPClient {
     const errors: unknown[] = [];
     const perServer = await Promise.all(
       servers.map(async (serverState) => {
-        if (!serverState) return [] as SymbolInformation[];
+        if (!serverState) return { symbols: [] as SymbolInformation[], confirmed: true };
         try {
-          await this.primeWorkspaceSymbolProject(serverState);
-          return await opsWorkspaceSymbol(serverState, query);
+          const confirmed = await this.primeWorkspaceSymbolProject(serverState);
+          return { symbols: await opsWorkspaceSymbol(serverState, query), confirmed };
         } catch (error) {
           errors.push(error);
           logger.debug(`[workspaceSymbol] Server failed for query "${query}": ${error}\n`);
-          return [] as SymbolInformation[];
+          return { symbols: [] as SymbolInformation[], confirmed: false };
         }
       })
     );
 
-    const results = perServer.flat();
+    const results = perServer.flatMap((entry) => entry.symbols);
+    // One unconfirmed server is enough to make the WORKSPACE answer incomplete.
+    const readinessConfirmed = perServer.every((entry) => entry.confirmed);
     if (results.length > 0) {
-      return results;
+      return { symbols: results, readinessConfirmed };
     }
 
     if (errors.length > 0) {
       throw errors[0];
     }
 
-    return [];
+    return { symbols: [], readinessConfirmed };
   }
 
-  private async primeWorkspaceSymbolProject(serverState: ServerState): Promise<void> {
+  /** Returns whether this server was confirmed able to answer workspace/symbol completely. */
+  private async primeWorkspaceSymbolProject(serverState: ServerState): Promise<boolean> {
     if (this.workspaceSymbolPrimedServers.has(serverState)) {
-      return;
+      return true;
     }
     // Coalesce concurrent workspace/symbol calls: only one priming pass runs per
-    // server; overlapping callers await the same in-flight promise.
+    // server; overlapping callers await the same in-flight promise and receive the
+    // same verdict, so a cold root costs one warm-up no matter how many Agents ask.
     const inFlight = this.workspaceSymbolPrimingInFlight.get(serverState);
     if (inFlight) {
-      await inFlight;
-      return;
+      return await inFlight;
     }
 
     const run = (async () => {
@@ -701,11 +712,12 @@ export class LSPClient {
       logger.debug(
         `[workspaceSymbol] Primed workspace symbols with ${seedFiles.length} seed file(s) (confirmed=${confirmed})\n`
       );
+      return confirmed;
     })();
 
     this.workspaceSymbolPrimingInFlight.set(serverState, run);
     try {
-      await run;
+      return await run;
     } finally {
       this.workspaceSymbolPrimingInFlight.delete(serverState);
     }
@@ -781,6 +793,15 @@ export class LSPClient {
             .catch(() => undefined)
         )
       );
+      // Settled seed diagnostics remain the best available evidence for a server
+      // that announces nothing about its own project load. It is weaker than it
+      // looks — it witnesses the seeds' own projects, not the whole workspace — so
+      // a server whose load IS observable (see TypeScriptAdapter) takes the
+      // indexing branch above instead, and is waited for rather than assumed.
+      // Do not "strengthen" this by probing a seed's own symbol: we just opened
+      // that file, so finding it proves only that, while a false negative here
+      // would report every absent symbol as merely unconfirmed.
+      return true;
     }
     return true;
   }

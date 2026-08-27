@@ -1235,7 +1235,7 @@ describe('LSPClient', () => {
 
       const result = await client.workspaceSymbol('test');
 
-      expect(result).toEqual(mockSymbols);
+      expect(result.symbols).toEqual(mockSymbols);
       expect(mockDocumentManager.acquire).toHaveBeenCalledWith(seedPath);
       const seedLease = await mockDocumentManager.acquire.mock.results[0]?.value;
       expect(seedLease?.release).toHaveBeenCalledTimes(
@@ -1255,7 +1255,10 @@ describe('LSPClient', () => {
       // serverManager starts with an empty servers map by default
       const result = await client.workspaceSymbol('test');
 
-      expect(result).toEqual([]);
+      expect(result.symbols).toEqual([]);
+      // No server could be shown searchable, so zero rows is not an assertion of
+      // absence.
+      expect(result.readinessConfirmed).toBe(false);
       expect(preloadSpy).toHaveBeenCalledWith(false);
 
       preloadSpy.mockRestore();
@@ -1291,7 +1294,7 @@ describe('LSPClient', () => {
 
       const result = await client.workspaceSymbol('test');
 
-      expect(result).toEqual([]);
+      expect(result.symbols).toEqual([]);
       expect(mockDocumentManager.acquire).toHaveBeenCalledWith(seedPath);
       const seedLease = await mockDocumentManager.acquire.mock.results[0]?.value;
       expect(seedLease?.release).toHaveBeenCalledTimes(

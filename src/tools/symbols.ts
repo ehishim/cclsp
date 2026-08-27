@@ -153,9 +153,20 @@ export const getDocumentSymbolsTool: ToolDefinition = {
   },
 };
 
+/**
+ * A language server answers `workspace/symbol` from the files it has LOADED, not
+ * from the repository: measured on typescript-language-server 5.3.0, a symbol in
+ * an unopened file returns nothing, and the identical query returns it once that
+ * file is opened. So zero rows here is never evidence that a symbol does not
+ * exist, and the caller has to be told which tool can actually answer that.
+ */
+const NO_MATCH_RECOVERY =
+  'Not absence: only loaded files were searched. Repository-wide: ast_search. Or open the file with get_document_symbols, then repeat.';
+
 export const findWorkspaceSymbolsTool: ToolDefinition = {
   name: 'find_workspace_symbols',
-  description: 'Search for symbols across the workspace by name with bounded rows and totals.',
+  description:
+    'Search symbols among the files the language server has LOADED, with bounded rows and totals. Not a repository-wide search: use ast_search for that.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -167,14 +178,14 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
   handler: async (args, client) => {
     const { query, max_results } = args as { query: string; max_results?: number };
     try {
-      const symbols = await client.workspaceSymbol(query);
+      const { symbols, readinessConfirmed } = await client.workspaceSymbol(query);
       const selected = symbols.slice(0, boundedResultLimit(max_results));
       const omitted = symbols.length - selected.length;
       const resultFile = omitted > 0
         ? spoolFullResult('find_workspace_symbols', { query, total: symbols.length, symbols })
         : null;
       const text = selected.length === 0
-        ? `Workspace symbols (0/0) matching "${query}"`
+        ? `Workspace symbols (0/0) matching "${query}" · searched LOADED files only`
         : [
             `Workspace symbols (${selected.length}/${symbols.length}) matching "${query}" · provider lsp`,
             ...selected.map((symbol) => {
@@ -186,7 +197,12 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
-          outcome: selected.length > 0 ? 'ok' : 'empty',
+          // `empty` asserts the workspace genuinely has no such symbol. Only a
+          // workspace confirmed SEARCHABLE may make that claim; otherwise zero
+          // rows means "not searchable yet", and reporting it as absence is how a
+          // caller concludes a symbol does not exist and stops looking.
+          outcome: selected.length > 0 ? 'ok' : readinessConfirmed ? 'empty' : 'stale',
+          readinessConfirmed,
           provider: 'lsp',
           symbols: selected,
           shown: selected.length,
@@ -194,7 +210,11 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
           omitted,
           recovery: omitted > 0
             ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
-            : null,
+            : selected.length === 0
+              ? NO_MATCH_RECOVERY
+              : readinessConfirmed
+                ? null
+                : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
           ...(resultFile ? { resultFile } : {}),
         },
       };
