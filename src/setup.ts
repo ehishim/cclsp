@@ -19,6 +19,26 @@ const DETAILED_INSTALL_GUIDES = {
       'Verify installation with: typescript-language-server --version',
     ],
   },
+  css: {
+    title: 'CSS/SCSS/LESS Language Server',
+    commands: ['npm install -g vscode-langservers-extracted'],
+    notes: [
+      'Provides vscode-css-language-server for CSS, SCSS, and LESS',
+      'Verify installation with: command -v vscode-css-language-server',
+    ],
+  },
+  markdown: {
+    title: 'Markdown Language Server (Marksman)',
+    commands: [
+      '# Download the binary for your platform from:',
+      '# https://github.com/artempyanykh/marksman/releases',
+      '# Make it executable and install it on PATH as marksman',
+    ],
+    notes: [
+      'Marksman provides workspace-aware Markdown links, headings, references, and rename',
+      'Verify installation with: marksman --version',
+    ],
+  },
   python: {
     title: 'Python Language Server (pylsp)',
     commands: [
@@ -120,6 +140,7 @@ const DETAILED_INSTALL_GUIDES = {
 // Installation commands for automatic installation
 const AUTO_INSTALL_COMMANDS = {
   typescript: ['npm', 'install', '-g', 'typescript-language-server', 'typescript'],
+  css: ['npm', 'install', '-g', 'vscode-langservers-extracted'],
   python: ['pip', 'install', 'python-lsp-server[all]'],
   go: ['go', 'install', 'golang.org/x/tools/gopls@latest'],
   rust: [

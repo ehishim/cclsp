@@ -112,7 +112,9 @@ describe('capability-gated operations', () => {
     const sendRequest = jest.fn().mockResolvedValueOnce(null);
     const state = server({ renameProvider: { prepareProvider: true } }, sendRequest);
     await expect(
-      renameSymbol(state, TEST_FILE, { line: 0, character: 13 }, 'renamed')
+      renameSymbol(state, TEST_FILE, { line: 0, character: 13 }, 'renamed', {
+        allowUnpreparedPreview: true,
+      })
     ).rejects.toMatchObject({
       outcome: {
         outcome: 'rejected',
@@ -139,6 +141,104 @@ describe('capability-gated operations', () => {
       },
     });
     expect(sendRequest).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows unprepared rename only when explicitly requested for preview', async () => {
+    const edit = {
+      changes: {
+        'file:///fixture.css': [
+          {
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            newText: '.renamed',
+          },
+        ],
+      },
+    };
+    const refusedRequest = jest.fn();
+    await expect(
+      renameSymbol(
+        server({ renameProvider: true }, refusedRequest),
+        TEST_FILE,
+        { line: 0, character: 0 },
+        '.renamed'
+      )
+    ).rejects.toMatchObject({
+      outcome: {
+        outcome: 'unsupported',
+        code: 'LSP_METHOD_UNSUPPORTED',
+        method: 'textDocument/prepareRename',
+      },
+    });
+    expect(refusedRequest).not.toHaveBeenCalled();
+
+    const previewRequest = jest.fn().mockResolvedValue(edit);
+    const result = await renameSymbol(
+      server({ renameProvider: true }, previewRequest),
+      TEST_FILE,
+      { line: 0, character: 0 },
+      '.renamed',
+      { allowUnpreparedPreview: true }
+    );
+    expect(result).toEqual({ ...edit, prepared: false });
+    expect(previewRequest.mock.calls.map((call) => call[0])).toEqual(['textDocument/rename']);
+  });
+
+  it('normalizes both WorkspaceEdit shapes and removes zero-edit files', async () => {
+    const sendRequest = jest
+      .fn()
+      .mockResolvedValueOnce({
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 5 },
+      })
+      .mockResolvedValueOnce({
+        changes: {
+          'file:///empty-from-changes.md': [],
+          'file:///changed-from-changes.md': [
+            {
+              range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+              newText: 'next',
+            },
+          ],
+        },
+        documentChanges: [
+          {
+            textDocument: { uri: 'file:///empty-from-document-changes.md', version: null },
+            edits: [],
+          },
+          {
+            textDocument: { uri: 'file:///changed-from-document-changes.md', version: 1 },
+            edits: [
+              {
+                range: { start: { line: 2, character: 0 }, end: { line: 2, character: 4 } },
+                newText: 'next',
+              },
+            ],
+          },
+        ],
+      });
+
+    const result = await renameSymbol(
+      server({ renameProvider: { prepareProvider: true } }, sendRequest),
+      TEST_FILE,
+      { line: 0, character: 0 },
+      'next'
+    );
+
+    expect(result.prepared).toBe(true);
+    expect(result.changes).toEqual({
+      'file:///changed-from-changes.md': [
+        {
+          range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+          newText: 'next',
+        },
+      ],
+      'file:///changed-from-document-changes.md': [
+        {
+          range: { start: { line: 2, character: 0 }, end: { line: 2, character: 4 } },
+          newText: 'next',
+        },
+      ],
+    });
   });
 
   it('resolves completion items only when the server declares resolveProvider', async () => {
@@ -290,7 +390,7 @@ describe('capability-gated operations', () => {
       { line: 0, character: 13 },
       'renamed'
     );
-    expect(result).toEqual(edit);
+    expect(result).toEqual({ ...edit, prepared: true });
     expect(sendRequest.mock.calls.map((call) => call[0])).toEqual([
       'textDocument/prepareRename',
       'textDocument/rename',

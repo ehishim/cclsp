@@ -262,7 +262,7 @@ function formatDiagnosticsForFile(
 const LSP_EXTENSIONS = new Set([
   'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'rs', 'c', 'cpp', 'h', 'hpp',
   'java', 'cs', 'php', 'rb', 'swift', 'kt', 'scala', 'dart', 'lua',
-  'vue', 'svelte',
+  'vue', 'svelte', 'css', 'scss', 'less', 'md', 'markdown',
 ]);
 
 async function scanFilesRecursive(

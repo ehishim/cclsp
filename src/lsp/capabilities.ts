@@ -85,16 +85,18 @@ export function requireMethodSupport(serverState: ServerState, method: string): 
   });
 }
 
-export function requirePrepareRenameSupport(serverState: ServerState): void {
+export function supportsPrepareRename(serverState: ServerState): boolean {
   const provider = getPath(serverState.serverCapabilities, ['renameProvider']);
-  if (
+  return Boolean(
     provider &&
-    typeof provider === 'object' &&
-    !Array.isArray(provider) &&
-    (provider as Record<string, unknown>).prepareProvider === true
-  ) {
-    return;
-  }
+      typeof provider === 'object' &&
+      !Array.isArray(provider) &&
+      (provider as Record<string, unknown>).prepareProvider === true
+  );
+}
+
+export function requirePrepareRenameSupport(serverState: ServerState): void {
+  if (supportsPrepareRename(serverState)) return;
   throw new LspToolOutcomeError({
     outcome: 'unsupported',
     code: 'LSP_METHOD_UNSUPPORTED',

@@ -8,6 +8,7 @@ import {
   requireMethodSupport,
   requirePrepareRenameSupport,
   supportsMethod,
+  supportsPrepareRename,
 } from './capabilities.js';
 import type {
   CallHierarchyIncomingCall,
@@ -378,22 +379,59 @@ export async function findReferences(
   return [];
 }
 
+export type RenameOperationResult = WorkspaceEditResult & { prepared: boolean };
+
+export interface RenameOperationOptions {
+  allowUnpreparedPreview?: boolean;
+}
+
+function normalizeRenameWorkspaceEdit(result: unknown, prepared: boolean): RenameOperationResult {
+  const changes: NonNullable<WorkspaceEditResult['changes']> = {};
+  if (result && typeof result === 'object' && 'changes' in result) {
+    const raw = (result as WorkspaceEditResult).changes;
+    for (const [uri, edits] of Object.entries(raw ?? {})) {
+      if (edits.length > 0) changes[uri] = [...edits];
+    }
+  }
+  if (result && typeof result === 'object' && 'documentChanges' in result) {
+    const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
+    for (const row of documentChanges ?? []) {
+      if (!row || typeof row !== 'object' || !('textDocument' in row) || !('edits' in row)) {
+        continue;
+      }
+      const change = row as {
+        textDocument: { uri?: unknown };
+        edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
+      };
+      const uri = change.textDocument?.uri;
+      if (typeof uri !== 'string' || !Array.isArray(change.edits) || change.edits.length === 0) {
+        continue;
+      }
+      changes[uri] = [...(changes[uri] ?? []), ...change.edits];
+    }
+  }
+  return { changes, prepared };
+}
+
 export async function renameSymbol(
   serverState: ServerState,
   filePath: string,
   position: Position,
-  newName: string
-): Promise<{
-  changes?: Record<string, Array<{ range: { start: Position; end: Position }; newText: string }>>;
-}> {
+  newName: string,
+  options: RenameOperationOptions = {}
+): Promise<RenameOperationResult> {
   logger.debug(
     `[DEBUG renameSymbol] Requesting rename for ${filePath} at ${position.line}:${position.character} to "${newName}"\n`
   );
 
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/rename');
-  requirePrepareRenameSupport(serverState);
+  const prepareSupported = supportsPrepareRename(serverState);
+  if (!prepareSupported && options.allowUnpreparedPreview !== true) {
+    requirePrepareRenameSupport(serverState);
+  }
 
+  let prepared = false;
   const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
     if (justOpened) {
       logger.debug(
@@ -402,23 +440,26 @@ export async function renameSymbol(
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
 
-    const prepareMethod = 'textDocument/prepareRename';
-    const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
-    let prepared: unknown;
-    try {
-      prepared = await serverState.transport.sendRequest(
-        prepareMethod,
-        {
-          textDocument: { uri: pathToUri(filePath) },
-          position,
-        },
-        prepareTimeout
-      );
-    } catch (error) {
-      rejectRename(serverState, error instanceof Error ? error.message : String(error));
-    }
-    if (!prepared) {
-      rejectRename(serverState, 'the language server declined this position');
+    if (prepareSupported) {
+      const prepareMethod = 'textDocument/prepareRename';
+      const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
+      let prepareResult: unknown;
+      try {
+        prepareResult = await serverState.transport.sendRequest(
+          prepareMethod,
+          {
+            textDocument: { uri: pathToUri(filePath) },
+            position,
+          },
+          prepareTimeout
+        );
+      } catch (error) {
+        rejectRename(serverState, error instanceof Error ? error.message : String(error));
+      }
+      if (!prepareResult) {
+        rejectRename(serverState, 'the language server declined this position');
+      }
+      prepared = true;
     }
 
     logger.debug('[DEBUG renameSymbol] Sending textDocument/rename request\n');
@@ -435,62 +476,11 @@ export async function renameSymbol(
     );
   });
 
+  const normalized = normalizeRenameWorkspaceEdit(result, prepared);
   logger.debug(
-    `[DEBUG renameSymbol] Result type: ${typeof result}, hasChanges: ${result && typeof result === 'object' && 'changes' in result}, hasDocumentChanges: ${result && typeof result === 'object' && 'documentChanges' in result}\n`
+    `[DEBUG renameSymbol] Normalized ${Object.keys(normalized.changes ?? {}).length} changed file(s), prepared=${prepared}\n`
   );
-
-  if (result && typeof result === 'object') {
-    if ('changes' in result) {
-      const workspaceEdit = result as {
-        changes: Record<
-          string,
-          Array<{ range: { start: Position; end: Position }; newText: string }>
-        >;
-      };
-      const changeCount = Object.keys(workspaceEdit.changes || {}).length;
-      logger.debug(`[DEBUG renameSymbol] WorkspaceEdit has changes for ${changeCount} files\n`);
-      return workspaceEdit;
-    }
-
-    if ('documentChanges' in result) {
-      const workspaceEdit = result as {
-        documentChanges?: Array<{
-          textDocument: { uri: string; version?: number };
-          edits: Array<{
-            range: { start: Position; end: Position };
-            newText: string;
-          }>;
-        }>;
-      };
-
-      logger.debug(
-        `[DEBUG renameSymbol] WorkspaceEdit has documentChanges with ${workspaceEdit.documentChanges?.length || 0} entries\n`
-      );
-
-      const changes: Record<
-        string,
-        Array<{ range: { start: Position; end: Position }; newText: string }>
-      > = {};
-
-      if (workspaceEdit.documentChanges) {
-        for (const change of workspaceEdit.documentChanges) {
-          if (change.textDocument && change.edits) {
-            const uri = change.textDocument.uri;
-            if (!changes[uri]) {
-              changes[uri] = [];
-            }
-            changes[uri].push(...change.edits);
-            logger.debug(`[DEBUG renameSymbol] Added ${change.edits.length} edits for ${uri}\n`);
-          }
-        }
-      }
-
-      return { changes };
-    }
-  }
-
-  logger.debug('[DEBUG renameSymbol] No rename changes available\n');
-  return {};
+  return normalized;
 }
 
 export interface CompletionItemResult {

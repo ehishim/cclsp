@@ -51,6 +51,8 @@ import type {
   CodeActionResult,
   CompletionItemResult,
   CompletionResult,
+  RenameOperationOptions,
+  RenameOperationResult,
   SignatureHelpResult,
   WorkspaceEditResult,
 } from './lsp/operations.js';
@@ -505,12 +507,11 @@ export class LSPClient {
   async renameSymbol(
     filePath: string,
     position: Position,
-    newName: string
-  ): Promise<{
-    changes?: Record<string, Array<{ range: { start: Position; end: Position }; newText: string }>>;
-  }> {
+    newName: string,
+    options: RenameOperationOptions = {}
+  ): Promise<RenameOperationResult> {
     const serverState = await this.getServer(filePath);
-    return opsRenameSymbol(serverState, filePath, position, newName);
+    return opsRenameSymbol(serverState, filePath, position, newName, options);
   }
 
   private locationKey(location: Location): string {

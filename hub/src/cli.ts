@@ -90,7 +90,10 @@ export function parse(argv: string[]): Parsed {
       flags.set(key, value);
       return;
     }
-    flags.set(key, Array.isArray(existing) ? [...existing, String(value)] : [String(existing), String(value)]);
+    flags.set(
+      key,
+      Array.isArray(existing) ? [...existing, String(value)] : [String(existing), String(value)]
+    );
   };
   let command: string | undefined;
   for (let i = 0; i < argv.length; i++) {
@@ -136,7 +139,9 @@ function asJson(v: unknown): string {
 }
 
 function printToolResult(result: unknown, json: boolean): void {
-  const isError = Boolean(result && typeof result === 'object' && (result as { isError?: unknown }).isError === true);
+  const isError = Boolean(
+    result && typeof result === 'object' && (result as { isError?: unknown }).isError === true
+  );
   const text = toolResultText(result) || asJson(result);
   if (json) out(asJson(result));
   else if (isError) err(text);
@@ -174,8 +179,8 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd
                           [--max-results N] [--root R]   (repeat --pattern: each reports its own count)
   code_rewrite            --pattern P --replacement R --language L [--path P] [--root R]
                           [--dry-run=false --candidate-id ID]
-  find_definition         --file F --symbol-name NAME [--symbol-kind K]
-  find_references         --file F --symbol-name NAME [--symbol-kind K] [--include-declaration]
+  find_definition         --file F (--symbol-name NAME [--symbol-kind K] | --line N --character C)
+  find_references         --file F (--symbol-name NAME [--symbol-kind K] | --line N --character C) [--include-declaration]
   find_implementation     --file F (--query Q | --line N --character C)
   get_hover               --file F (--query Q | --line N --character C)
   get_document_symbols    --file F

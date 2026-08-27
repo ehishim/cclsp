@@ -15,12 +15,74 @@ import {
   resolvedFromMetadata,
   resolvedFromText,
 } from './position-resolver.js';
-import type { ToolDefinition } from './registry.js';
+import type { ToolDefinition, ToolResult } from './registry.js';
+
+type NavigationSelector =
+  | { outcome: 'name'; symbolName: string; symbolKind?: string }
+  | { outcome: 'position'; line: number; character: number }
+  | { outcome: 'invalid'; reason: string };
+
+function selectNavigationArgs(args: {
+  symbol_name?: unknown;
+  symbol_kind?: unknown;
+  line?: unknown;
+  character?: unknown;
+}): NavigationSelector {
+  const namePresent = args.symbol_name !== undefined;
+  const linePresent = args.line !== undefined;
+  const characterPresent = args.character !== undefined;
+
+  if (linePresent !== characterPresent) {
+    return { outcome: 'invalid', reason: 'line and character must be provided together' };
+  }
+  if (namePresent === linePresent) {
+    return {
+      outcome: 'invalid',
+      reason: 'provide exactly one selector: symbol_name or line/character',
+    };
+  }
+  if (namePresent) {
+    if (typeof args.symbol_name !== 'string' || args.symbol_name.trim().length === 0) {
+      return { outcome: 'invalid', reason: 'symbol_name must not be empty' };
+    }
+    if (args.symbol_kind !== undefined && typeof args.symbol_kind !== 'string') {
+      return { outcome: 'invalid', reason: 'symbol_kind must be a string' };
+    }
+    return {
+      outcome: 'name',
+      symbolName: args.symbol_name.trim(),
+      ...(typeof args.symbol_kind === 'string' ? { symbolKind: args.symbol_kind } : {}),
+    };
+  }
+  if (args.symbol_kind !== undefined) {
+    return { outcome: 'invalid', reason: 'symbol_kind is only valid with symbol_name' };
+  }
+  if (
+    !Number.isInteger(args.line) ||
+    !Number.isInteger(args.character) ||
+    (args.line as number) < 1 ||
+    (args.character as number) < 1
+  ) {
+    return { outcome: 'invalid', reason: 'line and character must be positive integers' };
+  }
+  return {
+    outcome: 'position',
+    line: args.line as number,
+    character: args.character as number,
+  };
+}
+
+function invalidNavigationSelector(
+  selector: { outcome: 'invalid'; reason: string },
+  file: string
+): ToolResult {
+  return positionResolutionResult(selector, file);
+}
 
 export const findDefinitionTool: ToolDefinition = {
   name: 'find_definition',
   description:
-    'Find the definition of a symbol by name and kind in a file. Returns definitions for all matching symbols.',
+    'Find definitions by symbol name (all exact semantic matches) or one exact 1-indexed position.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -34,31 +96,89 @@ export const findDefinitionTool: ToolDefinition = {
       },
       symbol_kind: {
         type: 'string',
-        description: 'The kind of symbol (function, class, variable, method, etc.)',
+        description: 'The kind of symbol; valid only with symbol_name',
+      },
+      line: {
+        type: 'number',
+        description: 'Exact line (1-indexed); requires character and excludes symbol_name',
+      },
+      character: {
+        type: 'number',
+        description: 'Exact character (1-indexed); requires line and excludes symbol_name',
       },
       max_results: {
         type: 'number',
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
     },
-    required: ['file_path', 'symbol_name'],
+    required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, symbol_name, symbol_kind } = args as {
+    const { file_path, symbol_name, symbol_kind, line, character } = args as {
       file_path: string;
-      symbol_name: string;
+      symbol_name?: string;
       symbol_kind?: string;
+      line?: number;
+      character?: number;
       max_results?: number;
     };
     const maxResults = boundedResultLimit((args as { max_results?: number }).max_results);
     const absolutePath = resolvePath(file_path);
+    const selector = selectNavigationArgs({ symbol_name, symbol_kind, line, character });
+    if (selector.outcome === 'invalid') return invalidNavigationSelector(selector, file_path);
 
+    if (selector.outcome === 'position') {
+      try {
+        const resolution = await resolveToolPosition(
+          absolutePath,
+          { line: selector.line, character: selector.character },
+          client
+        );
+        if (resolution.outcome !== 'resolved') {
+          return positionResolutionResult(resolution, file_path);
+        }
+        const locations = await client.findDefinition(absolutePath, resolution.position);
+        const selected = locations.slice(0, maxResults);
+        const omitted = locations.length - selected.length;
+        const resultFile =
+          omitted > 0
+            ? spoolFullResult('find_definition', {
+                file: absolutePath,
+                position: resolution.position,
+                total: locations.length,
+                locations,
+              })
+            : null;
+        const text =
+          selected.length > 0
+            ? `Found ${selected.length}/${locations.length} definition(s) at ${selector.line}:${selector.character} (lsp):\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            : `No definitions found at ${file_path}:${selector.line}:${selector.character} (lsp).`;
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: {
+            outcome: selected.length > 0 ? 'ok' : 'empty',
+            provider: 'lsp',
+            locations: selected,
+            shown: selected.length,
+            total: locations.length,
+            omitted,
+            recovery:
+              omitted > 0
+                ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the definition query.`
+                : null,
+            ...(resultFile ? { resultFile } : {}),
+          },
+        };
+      } catch (error) {
+        rethrowToolOutcome(error);
+        throw error;
+      }
+    }
+
+    const symbolName = selector.symbolName;
+    const symbolKind = selector.symbolKind;
     try {
-      const result = await client.findDefinitionsWithProvider(
-        absolutePath,
-        symbol_name,
-        symbol_kind
-      );
+      const result = await client.findDefinitionsWithProvider(absolutePath, symbolName, symbolKind);
       if (result.outcome !== 'ok') {
         return {
           content: [{ type: 'text', text: `${result.code}: ${result.reason}` }],
@@ -72,16 +192,16 @@ export const findDefinitionTool: ToolDefinition = {
         omitted > 0
           ? spoolFullResult('find_definition', {
               file: absolutePath,
-              symbol: symbol_name,
+              symbol: symbolName,
               total: result.value.length,
               locations: result.value,
             })
           : null;
       const text =
         selected.length > 0
-          ? `Found ${selected.length}/${result.value.length} definition(s) for "${symbol_name}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+          ? `Found ${selected.length}/${result.value.length} definition(s) for "${symbolName}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
           : result.provider === 'lsp' && result.matchedSymbols === 0
-            ? `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}.`
+            ? `No symbols found with name "${symbolName}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${file_path}.`
             : `Found ${result.provider === 'lsp' ? (result.matchedSymbols ?? 0) : 0} symbol(s) but no definitions could be retrieved (${result.provider}).`;
       return {
         content: [
@@ -128,7 +248,7 @@ export const findDefinitionTool: ToolDefinition = {
 export const findReferencesTool: ToolDefinition = {
   name: 'find_references',
   description:
-    'Find all references to a symbol across the entire workspace. Returns references for all matching symbols.',
+    'Find workspace references by symbol name (all exact semantic matches) or one exact 1-indexed position.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -142,7 +262,15 @@ export const findReferencesTool: ToolDefinition = {
       },
       symbol_kind: {
         type: 'string',
-        description: 'The kind of symbol (function, class, variable, method, etc.)',
+        description: 'The kind of symbol; valid only with symbol_name',
+      },
+      line: {
+        type: 'number',
+        description: 'Exact line (1-indexed); requires character and excludes symbol_name',
+      },
+      character: {
+        type: 'number',
+        description: 'Exact character (1-indexed); requires line and excludes symbol_name',
       },
       include_declaration: {
         type: 'boolean',
@@ -154,31 +282,91 @@ export const findReferencesTool: ToolDefinition = {
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
     },
-    required: ['file_path', 'symbol_name'],
+    required: ['file_path'],
   },
   handler: async (args, client) => {
     const {
       file_path,
       symbol_name,
       symbol_kind,
+      line,
+      character,
       include_declaration = true,
       max_results,
     } = args as {
       file_path: string;
-      symbol_name: string;
+      symbol_name?: string;
       symbol_kind?: string;
+      line?: number;
+      character?: number;
       include_declaration?: boolean;
       max_results?: number;
     };
     const maxResults = boundedResultLimit(max_results);
     const absolutePath = resolvePath(file_path);
+    const selector = selectNavigationArgs({ symbol_name, symbol_kind, line, character });
+    if (selector.outcome === 'invalid') return invalidNavigationSelector(selector, file_path);
 
-    const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
+    if (selector.outcome === 'position') {
+      try {
+        const resolution = await resolveToolPosition(
+          absolutePath,
+          { line: selector.line, character: selector.character },
+          client
+        );
+        if (resolution.outcome !== 'resolved') {
+          return positionResolutionResult(resolution, file_path);
+        }
+        const locations = await client.findReferences(
+          absolutePath,
+          resolution.position,
+          include_declaration
+        );
+        const selected = locations.slice(0, maxResults);
+        const omitted = locations.length - selected.length;
+        const resultFile =
+          omitted > 0
+            ? spoolFullResult('find_references', {
+                file: absolutePath,
+                position: resolution.position,
+                total: locations.length,
+                locations,
+              })
+            : null;
+        const text =
+          selected.length > 0
+            ? `References (${selected.length}/${locations.length}) at ${selector.line}:${selector.character}:\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            : `No references found at ${file_path}:${selector.line}:${selector.character} (lsp).`;
+        return {
+          content: [{ type: 'text', text }],
+          structuredContent: {
+            outcome: selected.length > 0 ? 'ok' : 'empty',
+            provider: 'lsp',
+            locations: selected,
+            shown: selected.length,
+            total: locations.length,
+            omitted,
+            recovery:
+              omitted > 0
+                ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the reference query.`
+                : null,
+            ...(resultFile ? { resultFile } : {}),
+          },
+        };
+      } catch (error) {
+        rethrowToolOutcome(error);
+        throw error;
+      }
+    }
+
+    const symbolName = selector.symbolName;
+    const symbolKind = selector.symbolKind;
+    const result = await client.findSymbolsByName(absolutePath, symbolName, symbolKind);
     const { matches: symbolMatches, warning, incomplete } = result;
     if (symbolMatches.length === 0) {
       const text = withWarning(
         warning,
-        `No symbols found with name "${symbol_name}"${symbol_kind ? ` and kind "${symbol_kind}"` : ''} in ${file_path}.`
+        `No symbols found with name "${symbolName}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${file_path}.`
       );
       return {
         content: [{ type: 'text', text }],
@@ -225,7 +413,7 @@ export const findReferencesTool: ToolDefinition = {
       omitted > 0
         ? spoolFullResult('find_references', {
             file: absolutePath,
-            symbol: symbol_name,
+            symbol: symbolName,
             total,
             locations: unique,
           })
@@ -234,7 +422,7 @@ export const findReferencesTool: ToolDefinition = {
       selected.length > 0
         ? withWarning(
             warning,
-            `References (${selected.length}/${total}) for "${symbol_name}":\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            `References (${selected.length}/${total}) for "${symbolName}":\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
           )
         : withWarning(
             warning,

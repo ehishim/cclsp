@@ -25,6 +25,26 @@ export const LANGUAGE_SERVERS: LanguageServerConfig[] = [
     installRequired: false,
   },
   {
+    name: 'css',
+    displayName: 'CSS/SCSS/LESS',
+    extensions: ['css', 'scss', 'less'],
+    command: ['vscode-css-language-server', '--stdio'],
+    installInstructions: 'npm install -g vscode-langservers-extracted',
+    description: 'VS Code language server for CSS, SCSS, and LESS',
+    installRequired: true,
+  },
+  {
+    name: 'markdown',
+    displayName: 'Markdown',
+    extensions: ['md', 'markdown'],
+    command: ['marksman', 'server'],
+    installInstructions:
+      'Install Marksman from https://github.com/artempyanykh/marksman/releases and add it to PATH',
+    rootDir: '..',
+    description: 'Marksman language server for Markdown links, headings, and workspace references',
+    installRequired: true,
+  },
+  {
     name: 'python',
     displayName: 'Python',
     extensions: ['py', 'pyi'],

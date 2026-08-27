@@ -1,21 +1,35 @@
 import { beforeEach, describe, expect, it, jest } from 'bun:test';
-import { resolve } from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
-import { getDiagnosticsTool } from './tools/diagnostics.js';
+import { getDiagnosticsBatchTool, getDiagnosticsTool } from './tools/diagnostics.js';
 import type { Diagnostic } from './types.js';
 
 type MockLSPClient = {
   getDiagnostics: ReturnType<typeof jest.fn>;
+  getDiagnosticsBatch: ReturnType<typeof jest.fn>;
 };
 
 function createMockClient(): MockLSPClient {
   return {
     getDiagnostics: jest.fn(),
+    getDiagnosticsBatch: jest.fn(),
   };
 }
 
 function callHandler(args: { file_path: string }, mock: MockLSPClient) {
   return getDiagnosticsTool.handler(args as Record<string, unknown>, mock as unknown as LSPClient);
+}
+
+function callBatchHandler(
+  args: { path: string; pattern?: string; max_files?: number },
+  mock: MockLSPClient
+) {
+  return getDiagnosticsBatchTool.handler(
+    args as Record<string, unknown>,
+    mock as unknown as LSPClient
+  );
 }
 
 describe('get_diagnostics MCP tool', () => {
@@ -171,5 +185,44 @@ describe('get_diagnostics MCP tool', () => {
     const result = await callHandler({ file_path: 'test.ts' }, mockClient);
 
     expect(result.content[0]?.text).toContain('Location: Line 1, Column 1 to Line 1, Column 1');
+  });
+
+  it('should scan CSS and Markdown extensions while preserving pattern and file bounds', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'cclsp-diagnostics-'));
+    const admitted = ['styles.css', 'theme.scss', 'mixins.less', 'guide.md', 'notes.markdown'];
+
+    try {
+      await Promise.all([
+        ...admitted.map((name) => writeFile(join(directory, name), '')),
+        writeFile(join(directory, 'ignored.txt'), ''),
+      ]);
+      mockClient.getDiagnosticsBatch.mockImplementation(async (filePaths: string[]) =>
+        filePaths.map((filePath) => ({ filePath, diagnostics: [] }))
+      );
+
+      await callBatchHandler({ path: directory }, mockClient);
+      const allFiles = mockClient.getDiagnosticsBatch.mock.calls[0]?.[0] as string[];
+      expect(allFiles.map((filePath) => filePath.slice(directory.length + 1)).sort()).toEqual(
+        admitted.toSorted()
+      );
+
+      mockClient.getDiagnosticsBatch.mockClear();
+      await callBatchHandler({ path: directory, pattern: '\\.(?:md|markdown)$' }, mockClient);
+      const markdownFiles = mockClient.getDiagnosticsBatch.mock.calls[0]?.[0] as string[];
+      expect(markdownFiles.map((filePath) => filePath.slice(directory.length + 1)).sort()).toEqual([
+        'guide.md',
+        'notes.markdown',
+      ]);
+
+      mockClient.getDiagnosticsBatch.mockClear();
+      await callBatchHandler({ path: directory, max_files: 2 }, mockClient);
+      const boundedFiles = mockClient.getDiagnosticsBatch.mock.calls[0]?.[0] as string[];
+      expect(boundedFiles).toHaveLength(2);
+      expect(
+        boundedFiles.every((filePath) => admitted.includes(filePath.slice(directory.length + 1)))
+      ).toBe(true);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

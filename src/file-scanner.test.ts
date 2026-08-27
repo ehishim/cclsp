@@ -143,6 +143,13 @@ describe('file-scanner', () => {
       expect(recommended).not.toContain('rust'); // rs extension not in set
     });
 
+    it('should recommend CSS and Markdown servers from css/scss/less/md/markdown extensions', () => {
+      const extensions = new Set(['css', 'scss', 'less', 'md', 'markdown']);
+      const recommended = getRecommendedLanguageServers(extensions, LANGUAGE_SERVERS);
+
+      expect(recommended).toEqual(['css', 'markdown']);
+    });
+
     it('should return empty array for unknown extensions', () => {
       const extensions = new Set(['unknown', 'fake']);
       const recommended = getRecommendedLanguageServers(extensions, LANGUAGE_SERVERS);

@@ -1,6 +1,9 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { LANGUAGE_SERVERS, generateConfig } from './language-servers.js';
-import { buildMCPArgs, generateMCPCommand } from './setup.js';
+import { buildMCPArgs, generateMCPCommand, main } from './setup.js';
 
 // Type for generated config
 interface GeneratedConfig {
@@ -37,6 +40,28 @@ describe('LANGUAGE_SERVERS', () => {
     expect(pyServer).toBeDefined();
     expect(pyServer?.displayName).toBe('Python');
     expect(pyServer?.extensions).toContain('py');
+  });
+
+  test('should register executable CSS and Marksman rows', () => {
+    const css = LANGUAGE_SERVERS.find((server) => server.name === 'css');
+    expect(css).toMatchObject({
+      extensions: ['css', 'scss', 'less'],
+      command: ['vscode-css-language-server', '--stdio'],
+      installInstructions: 'npm install -g vscode-langservers-extracted',
+      installRequired: true,
+    });
+
+    const markdown = LANGUAGE_SERVERS.find((server) => server.name === 'markdown');
+    expect(markdown).toMatchObject({
+      extensions: ['md', 'markdown'],
+      command: ['marksman', 'server'],
+      rootDir: '..',
+      installRequired: true,
+    });
+    expect(markdown?.installInstructions).toContain(
+      'https://github.com/artempyanykh/marksman/releases'
+    );
+    expect(markdown?.installInstructions).toContain('PATH');
   });
 
   test('should have required properties for each server', () => {
@@ -118,6 +143,24 @@ describe('generateConfig', () => {
     expect(serverNames).toContain('go');
   });
 
+  test('should preserve CSS and Markdown registry order and root scopes', () => {
+    const config = generateConfig(['css', 'markdown']) as GeneratedConfig;
+    expect(config.servers).toEqual([
+      {
+        extensions: ['css', 'scss', 'less'],
+        command: ['vscode-css-language-server', '--stdio'],
+        rootDir: '.',
+        maxOpenDocuments: 100,
+      },
+      {
+        extensions: ['md', 'markdown'],
+        command: ['marksman', 'server'],
+        rootDir: '..',
+        maxOpenDocuments: 100,
+      },
+    ]);
+  });
+
   test('should include restartInterval for Python server', () => {
     const config = generateConfig(['python']);
     expect(config).toHaveProperty('servers');
@@ -193,7 +236,8 @@ describe('generateConfig', () => {
 
 describe('setup CLI integration', () => {
   beforeEach(() => {
-    mockPrompt.mockClear();
+    mockPrompt.mockReset();
+    mockPrompt.mockResolvedValue({});
   });
 
   test('should handle language selection workflow', async () => {
@@ -211,6 +255,44 @@ describe('setup CLI integration', () => {
 
     expect(configJson).toContain('typescript-language-server');
     expect(configJson).toContain('pylsp');
+  });
+
+  test('should render CSS and Marksman guides and offer automatic install only for CSS', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-setup-css-markdown-'));
+    const configPath = join(root, 'cclsp.json');
+    const lines: string[] = [];
+    const originalLog = console.log;
+    const originalClear = console.clear;
+    console.log = (...args: unknown[]) => lines.push(args.map(String).join(' '));
+    console.clear = () => undefined;
+    mockPrompt
+      .mockResolvedValueOnce({ selectedLanguages: ['css', 'markdown'] })
+      .mockResolvedValueOnce({ configPath })
+      .mockResolvedValueOnce({ shouldProceed: true })
+      .mockResolvedValueOnce({ viewConfig: false })
+      .mockResolvedValueOnce({ showDetailedGuides: true })
+      .mockResolvedValueOnce({ shouldInstall: false })
+      .mockResolvedValueOnce({ shouldAddToMCP: false });
+
+    try {
+      await main();
+      const output = lines.join('\n');
+      expect(output).toContain('CSS/SCSS/LESS Language Server');
+      expect(output).toContain('npm install -g vscode-langservers-extracted');
+      expect(output).toContain('Markdown Language Server (Marksman)');
+      expect(output).toContain('https://github.com/artempyanykh/marksman/releases');
+      const promptCalls = mockPrompt.mock.calls as unknown as Array<[Array<{ message?: unknown }>]>;
+      const promptMessages = promptCalls.map((call) => String(call[0][0]?.message ?? ''));
+      const installPrompt = promptMessages.find((message) =>
+        message.startsWith('Do you want to install LSPs now?')
+      );
+      expect(installPrompt).toContain('CSS/SCSS/LESS');
+      expect(installPrompt).not.toContain('Markdown');
+    } finally {
+      console.log = originalLog;
+      console.clear = originalClear;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('should generate correct file content', () => {

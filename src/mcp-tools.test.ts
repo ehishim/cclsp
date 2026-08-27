@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
 import { findDefinitionTool, findReferencesTool } from './tools/navigation.js';
-import { renameSymbolTool } from './tools/refactoring.js';
+import { renameSymbolStrictTool, renameSymbolTool } from './tools/refactoring.js';
 import { pathToUri, uriToPath } from './utils.js';
 
 // Platform-neutral absolute paths for test fixtures
@@ -275,6 +275,28 @@ describe('MCP Tool Handlers', () => {
 
       expect(result.content[0]?.text).toContain('no definitions could be retrieved');
     });
+
+    it('should use one exact position without symbol lookup', async () => {
+      mockClient.findDefinition.mockResolvedValue([
+        {
+          uri: pathToUri(SRC_IMPL),
+          range: { start: { line: 8, character: 2 }, end: { line: 8, character: 9 } },
+        },
+      ]);
+
+      const result = await findDefinitionTool.handler(
+        { file_path: 'test.ts', line: 4, character: 7 },
+        asClient(mockClient)
+      );
+
+      expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_IMPL))}:9:3`);
+      expect(mockClient.findDefinition).toHaveBeenCalledWith(resolve('test.ts'), {
+        line: 3,
+        character: 6,
+      });
+      expect(mockClient.findDefinitionsWithProvider).not.toHaveBeenCalled();
+      expect(mockClient.findSymbolsByName).not.toHaveBeenCalled();
+    });
   });
 
   describe('find_references', () => {
@@ -426,6 +448,65 @@ describe('MCP Tool Handlers', () => {
       expect(result.content[0]?.text).toContain('No symbols found with name "nonExistent"');
       expect(mockClient.findReferences).not.toHaveBeenCalled();
     });
+
+    it('should use one exact position without symbol lookup', async () => {
+      mockClient.findReferences.mockResolvedValue([
+        {
+          uri: pathToUri(SRC_OTHER),
+          range: { start: { line: 5, character: 1 }, end: { line: 5, character: 8 } },
+        },
+      ]);
+
+      const result = await findReferencesTool.handler(
+        {
+          file_path: 'test.ts',
+          line: 2,
+          character: 3,
+          include_declaration: false,
+        },
+        asClient(mockClient)
+      );
+
+      expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_OTHER))}:6:2`);
+      expect(mockClient.findReferences).toHaveBeenCalledWith(
+        resolve('test.ts'),
+        { line: 1, character: 2 },
+        false
+      );
+      expect(mockClient.findSymbolsByName).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('navigation selectors', () => {
+    it('should reject mixed, missing, incomplete, and position-kind selectors before provider calls', async () => {
+      const invalidSelectors = [
+        {},
+        { line: 1 },
+        { character: 1 },
+        { symbol_name: 'Target', line: 1, character: 1 },
+        { line: 1, character: 1, symbol_kind: 'class' },
+        { symbol_name: '   ' },
+      ];
+
+      for (const selector of invalidSelectors) {
+        for (const tool of [findDefinitionTool, findReferencesTool]) {
+          jest.clearAllMocks();
+          const result = await tool.handler(
+            { file_path: 'test.ts', ...selector },
+            asClient(mockClient)
+          );
+          expect(result.isError).toBe(true);
+          expect(result.structuredContent).toMatchObject({
+            outcome: 'rejected',
+            code: 'LSP_POSITION_INVALID',
+          });
+          expect(mockClient.findDefinitionsWithProvider).not.toHaveBeenCalled();
+          expect(mockClient.findSymbolsByName).not.toHaveBeenCalled();
+          expect(mockClient.findDefinition).not.toHaveBeenCalled();
+          expect(mockClient.findReferences).not.toHaveBeenCalled();
+        }
+      }
+    });
   });
 
   describe('rename_symbol', () => {
@@ -445,6 +526,7 @@ describe('MCP Tool Handlers', () => {
       });
 
       mockClient.renameSymbol.mockResolvedValue({
+        prepared: true,
         changes: {
           [pathToUri(SRC_TEST)]: [
             {
@@ -569,7 +651,7 @@ describe('MCP Tool Handlers', () => {
         ],
       });
 
-      mockClient.renameSymbol.mockResolvedValue({});
+      mockClient.renameSymbol.mockResolvedValue({ prepared: true, changes: {} });
 
       const result = await renameSymbolTool.handler(
         {
@@ -626,6 +708,76 @@ describe('MCP Tool Handlers', () => {
       );
 
       expect(result.content[0]?.text).toContain('Invalid symbol kind "xyz"');
+    });
+  });
+
+  describe('rename_symbol_strict', () => {
+    it('marks an unprepared dry-run partial without applying', async () => {
+      mockClient.renameSymbol.mockResolvedValue({
+        prepared: false,
+        changes: {
+          [pathToUri(SRC_TEST)]: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+              newText: 'renamed',
+            },
+          ],
+        },
+      });
+
+      const result = await renameSymbolStrictTool.handler(
+        {
+          file_path: 'test.ts',
+          line: 1,
+          character: 1,
+          new_name: 'renamed',
+          dry_run: true,
+        },
+        asClient(mockClient)
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        outcome: 'partial',
+        code: 'LSP_RENAME_UNPREPARED_PREVIEW',
+        partial: true,
+        prepared: false,
+        applied: false,
+        editCount: 1,
+        shown: 1,
+        total: 1,
+      });
+      expect(result.content[0]?.text).toContain('may be document-scoped or incomplete');
+      expect(mockClient.renameSymbol).toHaveBeenCalledWith(
+        resolve('test.ts'),
+        { line: 0, character: 0 },
+        'renamed',
+        { allowUnpreparedPreview: true }
+      );
+      expect(mockClient.syncFileContent).not.toHaveBeenCalled();
+    });
+
+    it('does not opt strict apply into unprepared preview', async () => {
+      mockClient.renameSymbol.mockRejectedValue(new Error('prepareRename is required'));
+
+      await expect(
+        renameSymbolStrictTool.handler(
+          {
+            file_path: 'test.ts',
+            line: 1,
+            character: 1,
+            new_name: 'renamed',
+            dry_run: false,
+          },
+          asClient(mockClient)
+        )
+      ).rejects.toThrow('prepareRename is required');
+      expect(mockClient.renameSymbol).toHaveBeenCalledWith(
+        resolve('test.ts'),
+        { line: 0, character: 0 },
+        'renamed',
+        { allowUnpreparedPreview: false }
+      );
     });
   });
 });

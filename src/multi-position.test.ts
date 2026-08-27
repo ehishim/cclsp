@@ -104,10 +104,12 @@ describe('Position-based Tool Handlers', () => {
     it('should handle errors from findImplementation', async () => {
       mockClient.findImplementation.mockRejectedValue(new Error('Server unavailable'));
 
-      await expect(findImplementationTool.handler(
-        { file_path: 'test.ts', line: 1, character: 1 },
-        asClient(mockClient)
-      )).rejects.toThrow('Server unavailable');
+      await expect(
+        findImplementationTool.handler(
+          { file_path: 'test.ts', line: 1, character: 1 },
+          asClient(mockClient)
+        )
+      ).rejects.toThrow('Server unavailable');
     });
 
     it('should handle line 1, character 1 correctly (converts to 0, 0)', async () => {
@@ -128,6 +130,7 @@ describe('Position-based Tool Handlers', () => {
   describe('rename_symbol_strict', () => {
     it('should convert 1-indexed input to 0-indexed LSP position', async () => {
       mockClient.renameSymbol.mockResolvedValue({
+        prepared: true,
         changes: {
           [pathToUri(SRC_TEST)]: [
             {
@@ -155,12 +158,14 @@ describe('Position-based Tool Handlers', () => {
       expect(mockClient.renameSymbol).toHaveBeenCalledWith(
         resolve('test.ts'),
         { line: 4, character: 9 },
-        'newName'
+        'newName',
+        { allowUnpreparedPreview: true }
       );
     });
 
     it('should show preview in dry_run mode', async () => {
       mockClient.renameSymbol.mockResolvedValue({
+        prepared: true,
         changes: {
           [pathToUri(SRC_TEST)]: [
             {
@@ -191,7 +196,7 @@ describe('Position-based Tool Handlers', () => {
     });
 
     it('should return message when no rename edits available', async () => {
-      mockClient.renameSymbol.mockResolvedValue({});
+      mockClient.renameSymbol.mockResolvedValue({ prepared: true, changes: {} });
 
       const result = await renameSymbolStrictTool.handler(
         { file_path: 'test.ts', line: 5, character: 10, new_name: 'newName' },
@@ -206,14 +211,17 @@ describe('Position-based Tool Handlers', () => {
     it('should handle renameSymbol throwing an error', async () => {
       mockClient.renameSymbol.mockRejectedValue(new Error('LSP error'));
 
-      await expect(renameSymbolStrictTool.handler(
-        { file_path: 'test.ts', line: 5, character: 10, new_name: 'newName' },
-        asClient(mockClient)
-      )).rejects.toThrow('LSP error');
+      await expect(
+        renameSymbolStrictTool.handler(
+          { file_path: 'test.ts', line: 5, character: 10, new_name: 'newName' },
+          asClient(mockClient)
+        )
+      ).rejects.toThrow('LSP error');
     });
 
     it('should show changes across multiple files in dry_run', async () => {
       mockClient.renameSymbol.mockResolvedValue({
+        prepared: true,
         changes: {
           [pathToUri(SRC_FILE1)]: [
             {

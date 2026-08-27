@@ -219,11 +219,54 @@ export const renameSymbolStrictTool: ToolDefinition = {
       if (resolution.outcome !== 'resolved') {
         return positionResolutionResult(resolution, file_path);
       }
-      const workspaceEdit = await client.renameSymbol(absolutePath, resolution.position, new_name);
-      const changes = workspaceEdit?.changes ?? {};
+      const workspaceEdit = await client.renameSymbol(absolutePath, resolution.position, new_name, {
+        allowUnpreparedPreview: dry_run,
+      });
+      const changes = workspaceEdit.changes ?? {};
       const editCount = Object.values(changes).reduce((total, edits) => total + edits.length, 0);
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
+      const preview: string[] = [];
+      for (const [uri, edits] of Object.entries(changes)) {
+        preview.push(`File: ${uriToPath(uri)}`);
+        for (const edit of edits) {
+          const { start, end } = edit.range;
+          preview.push(
+            `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
+          );
+        }
+      }
+      if (dry_run && !workspaceEdit.prepared) {
+        const warning =
+          'The language server does not support textDocument/prepareRename. This preview may be document-scoped or incomplete; applying through cclsp remains refused.';
+        const recovery =
+          'Inspect the explicit edit set and independently prove its intended scope before applying edits through another authorized write path.';
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${resolved ? `${resolved}\n\n` : ''}${warning}\n\n[DRY RUN — PARTIAL] The server returned ${editCount} edit(s) for line ${resolution.position.line + 1}, character ${resolution.position.character + 1}:${preview.length > 0 ? `\n${preview.join('\n')}` : ' none.'}\n\nRecovery: ${recovery}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'partial',
+            code: 'LSP_RENAME_UNPREPARED_PREVIEW',
+            partial: true,
+            provider: 'lsp',
+            ...(resolvedFrom ? { resolvedFrom } : {}),
+            prepared: false,
+            applied: false,
+            edit: workspaceEdit,
+            editCount,
+            shown: editCount,
+            total: editCount,
+            omitted: 0,
+            warning,
+            recovery,
+          },
+          isError: true,
+        };
+      }
       if (Object.keys(changes).length === 0) {
         return {
           content: [
@@ -236,6 +279,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
             outcome: 'empty',
             provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
+            prepared: workspaceEdit.prepared,
             applied: false,
             editCount: 0,
             shown: 0,
@@ -243,16 +287,6 @@ export const renameSymbolStrictTool: ToolDefinition = {
             omitted: 0,
           },
         };
-      }
-      const preview: string[] = [];
-      for (const [uri, edits] of Object.entries(changes)) {
-        preview.push(`File: ${uriToPath(uri)}`);
-        for (const edit of edits) {
-          const { start, end } = edit.range;
-          preview.push(
-            `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
-          );
-        }
       }
       if (dry_run) {
         return {
@@ -266,6 +300,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
             outcome: 'ok',
             provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
+            prepared: true,
             applied: false,
             edit: workspaceEdit,
             shown: editCount,

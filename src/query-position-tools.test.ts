@@ -42,7 +42,7 @@ function createClient(): LSPClient {
     resolveCompletionItem: jest.fn((_: string, item: unknown) => Promise.resolve(item)),
     getSignatureHelp: jest.fn().mockResolvedValue(null),
     getCodeActions: jest.fn().mockResolvedValue([]),
-    renameSymbol: jest.fn().mockResolvedValue({}),
+    renameSymbol: jest.fn().mockResolvedValue({ prepared: true, changes: {} }),
     prepareCallHierarchy: jest.fn().mockResolvedValue([]),
     incomingCalls: jest.fn().mockResolvedValue([]),
     outgoingCalls: jest.fn().mockResolvedValue([]),

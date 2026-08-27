@@ -52,10 +52,12 @@ describe('cclsp-hub semantic ergonomics', () => {
         outcome: 'ok',
         provider: 'lsp',
         file: '/workspace/app/src/a.ts',
-        symbols: [{
-          name: 'answer',
-          range: { start: { line: 3, character: 1 }, end: { line: 5, character: 2 } },
-        }],
+        symbols: [
+          {
+            name: 'answer',
+            range: { start: { line: 3, character: 1 }, end: { line: 5, character: 2 } },
+          },
+        ],
       },
     };
     expect(normalizeToolJson(envelope)).toMatchObject({
@@ -64,20 +66,31 @@ describe('cclsp-hub semantic ergonomics', () => {
       shown: 1,
       total: 1,
       omitted: 0,
-      ranges: [{
-        path: '/workspace/app/src/a.ts',
-        startLine: 4,
-        startCharacter: 2,
-        endLine: 6,
-        endCharacter: 3,
-      }],
+      ranges: [
+        {
+          path: '/workspace/app/src/a.ts',
+          startLine: 4,
+          startCharacter: 2,
+          endLine: 6,
+          endCharacter: 3,
+        },
+      ],
     });
   });
 
   it('marks cold workspace-index emptiness stale without delaying direct file tools', () => {
-    const empty = { outcome: 'empty', provider: 'lsp', shown: 0, total: 0, omitted: 0, text: 'No symbols.' };
+    const empty = {
+      outcome: 'empty',
+      provider: 'lsp',
+      shown: 0,
+      total: 0,
+      omitted: 0,
+      text: 'No symbols.',
+    };
     expect(markColdIndexResult(empty, 'find_workspace_symbols', 100)).toMatchObject({
-      outcome: 'stale', code: 'HUB_ROOT_INDEXING', recovery: expect.stringContaining('Retry'),
+      outcome: 'stale',
+      code: 'HUB_ROOT_INDEXING',
+      recovery: expect.stringContaining('Retry'),
     });
     expect(markColdIndexResult(empty, 'find_workspace_symbols', 6_000)).toBe(empty);
     expect(markColdIndexResult(empty, 'get_document_symbols', 100)).toBe(empty);
@@ -85,10 +98,20 @@ describe('cclsp-hub semantic ergonomics', () => {
 
   it('marks a cold-index answer stale even when it found rows, because it may be partial', () => {
     const partial = {
-      outcome: 'ok', provider: 'lsp', shown: 1, total: 1, omitted: 0, text: 'References (1/1)',
+      outcome: 'ok',
+      provider: 'lsp',
+      shown: 1,
+      total: 1,
+      omitted: 0,
+      text: 'References (1/1)',
     };
     const marked = markColdIndexResult(partial, 'find_references', 100) as Record<string, unknown>;
-    expect(marked).toMatchObject({ outcome: 'stale', code: 'HUB_ROOT_INDEXING', shown: 1, total: 1 });
+    expect(marked).toMatchObject({
+      outcome: 'stale',
+      code: 'HUB_ROOT_INDEXING',
+      shown: 1,
+      total: 1,
+    });
     expect(marked.recovery).toContain('may be partial');
     expect(marked.text).toContain('References (1/1)');
 
@@ -134,6 +157,12 @@ describe('cclsp-hub semantic ergonomics', () => {
     expect(output).toContain('code-rewrite');
     expect(output).toContain('--dry-run=false --candidate-id ID');
     expect(output).toContain('use rename_symbol_strict for semantic symbol renames');
+    expect(output).toContain(
+      'find_definition         --file F (--symbol-name NAME [--symbol-kind K] | --line N --character C)'
+    );
+    expect(output).toContain(
+      'find_references         --file F (--symbol-name NAME [--symbol-kind K] | --line N --character C) [--include-declaration]'
+    );
     expect(output).toContain('--query Q | --line N --character C');
     expect(output).toContain('--resolve-limit N');
     expect(output).toContain('--synthetic-trigger');
