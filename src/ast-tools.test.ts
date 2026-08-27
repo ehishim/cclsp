@@ -44,6 +44,7 @@ describe('ast_search tool', () => {
       partial: false,
       parseFailureCount: 0,
       failedFiles: [],
+      perPattern: [{ pattern: 'const $NAME = $VALUE', matches: 1 }],
     });
     const result = await astSearchTool.handler(
       { pattern: 'const $NAME = $VALUE', language: 'typescript' },

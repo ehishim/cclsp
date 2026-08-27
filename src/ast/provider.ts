@@ -25,6 +25,8 @@ import {
   type AstRewriteErrorCode,
   type AstRewriteInput,
   type AstRewriteRejected,
+  AST_MAX_PATTERNS,
+  type AstPatternReport,
   type AstSearchInput,
   type AstSearchOutcome,
   type CompiledPattern,
@@ -74,6 +76,21 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
   } finally {
     await handle.close();
   }
+}
+
+/**
+ * A structural zero and a regex habit that happens to parse are the same output.
+ * `a|b` is a valid bitwise-or expression, so it is never refused as malformed,
+ * matches nothing, and reads as absence. Naming the parsed node kind separates
+ * the two: `binary_expression` reveals the mistake, while a bare `identifier`
+ * that is simply not there stays a plain, unaccused true negative.
+ */
+function zeroMatchNote(nodeKind: string, patternCount: number): string | undefined {
+  if (nodeKind === 'identifier') return undefined;
+  const parsed = `parsed as ${nodeKind} and matched structurally; regex syntax is not interpreted here`;
+  return patternCount > 1
+    ? `${parsed}. Each name is already its own --pattern, so alternation is never needed`
+    : `${parsed}. To search several names, pass --pattern once per name`;
 }
 
 function rejected(
@@ -198,15 +215,43 @@ export class AstProvider {
         : rejected('none', 'AST_PATH_INVALID', message.replace(/^AST_PATH_INVALID:/, ''));
     }
 
-    let compiled: CompiledPattern;
-    try {
-      compiled = await this.compiler.compile(input.pattern, input.language);
-    } catch (error) {
+    const requestedPatterns = Array.isArray(input.pattern) ? input.pattern : [input.pattern];
+    if (requestedPatterns.length === 0) {
+      return rejected('none', 'AST_ARGUMENT_INVALID', 'at least one pattern is required');
+    }
+    if (requestedPatterns.length > AST_MAX_PATTERNS) {
       return rejected(
-        'tree-sitter',
-        'AST_PATTERN_INVALID',
-        error instanceof Error ? error.message.replace(/^AST_PATTERN_INVALID:/, '') : String(error)
+        'none',
+        'AST_ARGUMENT_INVALID',
+        `at most ${AST_MAX_PATTERNS} patterns may be searched in one call`
       );
+    }
+
+    const compiledPatterns: CompiledPattern[] = [];
+    for (let patternIndex = 0; patternIndex < requestedPatterns.length; patternIndex++) {
+      const raw = requestedPatterns[patternIndex];
+      if (typeof raw !== 'string') {
+        for (const done of compiledPatterns) done.tree.delete();
+        return rejected('none', 'AST_ARGUMENT_INVALID', 'every pattern must be a string');
+      }
+      try {
+        compiledPatterns.push(await this.compiler.compile(raw, input.language));
+      } catch (error) {
+        for (const done of compiledPatterns) done.tree.delete();
+        const reason =
+          error instanceof Error
+            ? error.message.replace(/^AST_PATTERN_INVALID:/, '')
+            : String(error);
+        // With several patterns supplied, a bare reason cannot be acted on: the
+        // caller cannot tell which of them the parser refused.
+        return rejected(
+          'tree-sitter',
+          'AST_PATTERN_INVALID',
+          requestedPatterns.length === 1
+            ? reason
+            : `pattern ${patternIndex + 1} of ${requestedPatterns.length} (${raw}): ${reason}`
+        );
+      }
     }
 
     try {
@@ -253,6 +298,7 @@ export class AstProvider {
       }
 
       const matches = [];
+      const perPatternCounts: number[] = new Array(compiledPatterns.length).fill(0);
       const failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' }> = [];
       let parseFailureCount = 0;
       let filesScanned = 0;
@@ -292,22 +338,48 @@ export class AstProvider {
           continue;
         }
         filesScanned++;
-        const remaining = Math.max(1, boundedMaxResults - matches.length + 1);
-        const fileMatches = this.searchEngine.search(
-          parsed.tree,
-          parsed.source,
-          compiled,
-          file.absolutePath,
-          remaining
-        );
-        matches.push(...fileMatches);
-        if (matches.length > boundedMaxResults) {
-          truncated = true;
-          matches.length = boundedMaxResults;
+        for (let patternIndex = 0; patternIndex < compiledPatterns.length; patternIndex++) {
+          const compiled = compiledPatterns[patternIndex];
+          if (!compiled) continue;
+          const alreadyFound = perPatternCounts[patternIndex] ?? 0;
+          // Each pattern carries its own budget. Sharing one would let a prolific
+          // pattern exhaust the cap and leave a later one reported as absent,
+          // manufacturing the false zero this search exists to make impossible.
+          if (alreadyFound > boundedMaxResults) continue;
+          const remaining = Math.max(1, boundedMaxResults - alreadyFound + 1);
+          const fileMatches = this.searchEngine.search(
+            parsed.tree,
+            parsed.source,
+            compiled,
+            file.absolutePath,
+            remaining
+          );
+          if (fileMatches.length === 0) continue;
+          perPatternCounts[patternIndex] = alreadyFound + fileMatches.length;
+          const storable = Math.max(0, boundedMaxResults - matches.length);
+          if (fileMatches.length > storable) truncated = true;
+          if (storable > 0) matches.push(...fileMatches.slice(0, storable));
+        }
+        // Stopping early is only safe once every pattern has proven itself
+        // present: a pattern still at zero must be scanned to exhaustion, or its
+        // zero would report the end of the budget rather than the end of the code.
+        if (matches.length >= boundedMaxResults && perPatternCounts.every((count) => count > 0)) {
           break;
         }
         if ((indexInCandidates + 1) % 16 === 0) await yieldToEventLoop();
       }
+
+      const perPattern: AstPatternReport[] = requestedPatterns.map((raw, patternIndex) => {
+        const found = Math.min(perPatternCounts[patternIndex] ?? 0, boundedMaxResults);
+        const compiled = compiledPatterns[patternIndex];
+        const note =
+          found === 0 && compiled && compiled.metavariables.length === 0
+            ? zeroMatchNote(compiled.node.type, requestedPatterns.length)
+            : undefined;
+        return note !== undefined
+          ? { pattern: String(raw), matches: found, note }
+          : { pattern: String(raw), matches: found };
+      });
 
       return {
         outcome: 'ok',
@@ -322,9 +394,10 @@ export class AstProvider {
         partial: parseFailureCount > 0,
         parseFailureCount,
         failedFiles,
+        perPattern,
       };
     } finally {
-      compiled.tree.delete();
+      for (const compiled of compiledPatterns) compiled.tree.delete();
     }
   }
 

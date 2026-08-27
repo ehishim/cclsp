@@ -422,3 +422,90 @@ describe('AstProvider', () => {
     );
   });
 });
+
+describe('a structural zero must say which kind of zero it is', () => {
+  const PROJECT = {
+    'a.ts': 'export function isUnder(x: string) { return x; }\n',
+    'b.ts': 'export function normalizeRoot(p: string) { return p; }\nconst r = normalizeRoot("x");\n',
+  };
+
+  it('marks an alternation-shaped pattern with the node kind it was actually parsed as', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const result = await provider.search({
+        pattern: 'isUnder|normalizeRoot',
+        language: 'typescript',
+      });
+      if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+      expect(result.matches).toHaveLength(0);
+      expect(result.perPattern).toHaveLength(1);
+      const only = result.perPattern[0];
+      expect(only?.matches).toBe(0);
+      // The whole point: the caller can see their "alternation" became one expression.
+      expect(only?.note).toContain('binary_expression');
+      expect(only?.note).toContain('--pattern');
+    });
+  });
+
+  it('leaves a genuinely absent name as a plain zero, with no note to explain away', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const result = await provider.search({
+        pattern: 'zzzNeverDeclaredZZZ',
+        language: 'typescript',
+      });
+      if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+      expect(result.matches).toHaveLength(0);
+      expect(result.perPattern[0]?.matches).toBe(0);
+      expect(result.perPattern[0]?.note).toBeUndefined();
+    });
+  });
+
+  it('attributes each count to its own pattern and names the one that found nothing', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const result = await provider.search({
+        pattern: ['isUnder', 'normalizeRoot', 'zzzNeverDeclaredZZZ'],
+        language: 'typescript',
+      });
+      if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+      expect(result.perPattern.map((row) => [row.pattern, row.matches])).toEqual([
+        ['isUnder', 1],
+        ['normalizeRoot', 2],
+        ['zzzNeverDeclaredZZZ', 0],
+      ]);
+      expect(result.matches).toHaveLength(3);
+    });
+  });
+
+  it('refuses an unparseable pattern by naming which of several it was', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const result = await provider.search({
+        pattern: ['isUnder', 'export function $NAME'],
+        language: 'typescript',
+      });
+      if (result.outcome !== 'rejected') throw new Error('expected rejection');
+      expect(result.code).toBe('AST_PATTERN_INVALID');
+      expect(result.reason).toContain('pattern 2 of 2');
+    });
+  });
+
+  it('never reports a pattern absent because an earlier pattern spent the budget', async () => {
+    await withProject(
+      {
+        // Ordered so the prolific pattern is scanned to exhaustion first.
+        'aaa-many.ts': `${'const alpha = 1;\n'.repeat(30)}`,
+        'zzz-one.ts': 'const omega = 1;\n',
+      },
+      async (_root, provider) => {
+        const result = await provider.search({
+          pattern: ['alpha', 'omega'],
+          language: 'typescript',
+          maxResults: 2,
+        });
+        if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+        expect(result.truncated).toBe(true);
+        // A zero here would be the budget running out, reported as absence.
+        expect(result.perPattern[1]?.pattern).toBe('omega');
+        expect(result.perPattern[1]?.matches).toBeGreaterThan(0);
+      }
+    );
+  });
+});

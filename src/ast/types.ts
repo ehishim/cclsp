@@ -11,6 +11,7 @@ export const AST_TREE_CACHE_FILES = 128;
 export const AST_TREE_CACHE_BYTES = 64 * 1024 * 1024;
 export const AST_MAX_PATTERN_NODES = 256;
 export const AST_MAX_METAVARIABLES = 32;
+export const AST_MAX_PATTERNS = 10;
 export const AST_MAX_FAILED_FILES = 20;
 export const AST_FALLBACK_DEFINITION_RESULTS = 100;
 export const AST_REWRITE_MAX_CHANGES = 100;
@@ -66,8 +67,21 @@ export interface ExactStructuralMatch {
   captures: ExactAstCapture[];
 }
 
-export interface AstSearchInput {
+export interface AstPatternReport {
   pattern: string;
+  matches: number;
+  /**
+   * Present only when this pattern contributed nothing. A structural zero and a
+   * regex habit that happens to parse are otherwise indistinguishable, so the
+   * note carries the parsed node kind: a caller who wrote `a|b` sees it was read
+   * as a binary expression, while a genuinely absent name reads as an identifier.
+   */
+  note?: string;
+}
+
+export interface AstSearchInput {
+  /** One pattern, or several asked in a single scan. Never alternation syntax. */
+  pattern: string | string[];
   language: string;
   path?: string;
   maxResults?: number;
@@ -86,6 +100,8 @@ export interface AstSearchOk {
   partial: boolean;
   parseFailureCount: number;
   failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' }>;
+  /** One row per requested pattern, in request order, so a zero among several is attributable. */
+  perPattern: AstPatternReport[];
 }
 
 export type AstErrorCode =

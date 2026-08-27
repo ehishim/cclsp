@@ -1,6 +1,26 @@
-import type { AstSearchOutcome } from '../ast/types.js';
+import type { AstPatternReport, AstSearchOutcome } from '../ast/types.js';
 import { codeRewriteTool } from './code-rewrite.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
+
+function renderPatternRow(report: AstPatternReport): string {
+  const count = `${report.pattern}: ${report.matches} match(es)`;
+  return report.note ? `  ${count} — ${report.note}` : `  ${count}`;
+}
+
+/**
+ * A single pattern keeps its existing shape, because the header already carries
+ * its count and repeating it would be noise. Several patterns always break the
+ * total down: an aggregate would hide which pattern found nothing, which is the
+ * same false absence one call would then hide once per pattern.
+ */
+function renderPatternBreakdown(perPattern: AstPatternReport[] | undefined): string {
+  // An older daemon answering a newer client sends no breakdown at all. Losing
+  // the per-pattern rows is acceptable; throwing away the matches with them is not.
+  if (!Array.isArray(perPattern) || perPattern.length === 0) return '';
+  if (perPattern.length > 1) return perPattern.map(renderPatternRow).join('\n');
+  const only = perPattern[0];
+  return only?.note ? renderPatternRow(only) : '';
+}
 
 function renderText(result: AstSearchOutcome): string {
   if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
@@ -9,8 +29,10 @@ function renderText(result: AstSearchOutcome): string {
     `${result.matches.length} match(es) across ${result.filesScanned} parsed file(s)`,
     `truncated=${result.truncated} indexCapped=${result.indexCapped} partial=${result.partial}`,
   ].join(' — ');
-  if (result.matches.length === 0) return header;
-  return `${header}\n\n${result.matches
+  const breakdown = renderPatternBreakdown(result.perPattern);
+  const summary = breakdown ? `${header}\n${breakdown}` : header;
+  if (result.matches.length === 0) return summary;
+  return `${summary}\n\n${result.matches
     .map((match) => {
       const start = match.range.start;
       const captures = match.captures
@@ -40,8 +62,10 @@ export const astSearchTool: ToolDefinition = {
     type: 'object',
     properties: {
       pattern: {
-        type: 'string',
-        description: 'Structural pattern with $NAME and $$$NAME metavariables',
+        type: ['string', 'array'],
+        items: { type: 'string' },
+        description:
+          'Structural pattern with $NAME and $$$NAME metavariables. Pass an array (or repeat --pattern) to search several patterns in one scan; each reports its own count. Regex syntax is never interpreted, so alternation is expressed as separate patterns, not as "a|b".',
       },
       language: {
         type: 'string',
@@ -61,7 +85,7 @@ export const astSearchTool: ToolDefinition = {
   },
   handler: async (args, client) => {
     const { pattern, language, path, max_results } = args as {
-      pattern: string;
+      pattern: string | string[];
       language: string;
       path?: string;
       max_results?: number;

@@ -51,6 +51,11 @@ const FLAG_ALIASES: Record<string, string> = {
 
 // Flags that are always boolean — they must never consume the following token
 // (e.g. `--json diagnostics` is the json flag + the diagnostics command).
+// Repeating one of these accumulates instead of overwriting. Deliberately not a
+// comma split: a structural pattern legitimately contains commas (`f($A, $B)`),
+// so splitting on them would silently corrupt the pattern it claims to accept.
+const KNOWN_MULTI = new Set(['pattern']);
+
 const KNOWN_BOOLEAN = new Set([
   'json',
   'raw-mcp',
@@ -66,7 +71,7 @@ const KNOWN_BOOLEAN = new Set([
 interface Parsed {
   command?: string;
   positionals: string[];
-  flags: Map<string, string | boolean>;
+  flags: Map<string, string | boolean | string[]>;
 }
 
 interface RootSummary {
@@ -78,7 +83,15 @@ interface RootSummary {
 
 export function parse(argv: string[]): Parsed {
   const positionals: string[] = [];
-  const flags = new Map<string, string | boolean>();
+  const flags = new Map<string, string | boolean | string[]>();
+  const setFlag = (key: string, value: string | boolean): void => {
+    const existing = flags.get(key);
+    if (existing === undefined || !KNOWN_MULTI.has(key)) {
+      flags.set(key, value);
+      return;
+    }
+    flags.set(key, Array.isArray(existing) ? [...existing, String(value)] : [String(existing), String(value)]);
+  };
   let command: string | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -91,16 +104,16 @@ export function parse(argv: string[]): Parsed {
       const body = a.slice(2);
       const eq = body.indexOf('=');
       if (eq !== -1) {
-        flags.set(body.slice(0, eq), body.slice(eq + 1));
+        setFlag(body.slice(0, eq), body.slice(eq + 1));
       } else if (KNOWN_BOOLEAN.has(body)) {
-        flags.set(body, true);
+        setFlag(body, true);
       } else {
         const next = argv[i + 1];
         if (next !== undefined && !next.startsWith('--')) {
-          flags.set(body, next);
+          setFlag(body, next);
           i++;
         } else {
-          flags.set(body, true);
+          setFlag(body, true);
         }
       }
     } else if (command === undefined) {
@@ -157,7 +170,8 @@ ROOTS & DAEMON
   describe                List the available cclsp tools
 
 CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd)
-  ast_search              --pattern P --language L [--path P] [--max-results N] [--root R]
+  ast_search              --pattern P [--pattern P2 ...] --language L [--path P]
+                          [--max-results N] [--root R]   (repeat --pattern: each reports its own count)
   code_rewrite            --pattern P --replacement R --language L [--path P] [--root R]
                           [--dry-run=false --candidate-id ID]
   find_definition         --file F --symbol-name NAME [--symbol-kind K]

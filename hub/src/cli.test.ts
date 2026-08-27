@@ -127,7 +127,8 @@ describe('cclsp-hub semantic ergonomics', () => {
       process.stdout.write = originalWrite;
     }
     expect(output).toContain('ast_search');
-    expect(output).toContain('--pattern P --language L');
+    expect(output).toContain('--pattern P [--pattern P2 ...] --language L');
+    expect(output).toContain('repeat --pattern: each reports its own count');
     expect(output).toContain('ast-search');
     expect(output).toContain('code_rewrite');
     expect(output).toContain('code-rewrite');
