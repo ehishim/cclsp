@@ -469,6 +469,20 @@ describe('a structural zero must say which kind of zero it is', () => {
     });
   }
 
+  it('catches the parenthesised regex-group spelling, which hides the operator one level down', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const grouped = await provider.search({ pattern: '(zzzAbsentOne|zzzAbsentTwo)', language: 'typescript' });
+      if (grouped.outcome !== 'ok') throw new Error('expected ok');
+      expect(grouped.perPattern[0]?.matches).toBe(0);
+      expect(grouped.perPattern[0]?.note).toContain('bitwise or');
+      // ...and the wrapper must not become a new excuse to warn on a true negative.
+      const innocent = await provider.search({ pattern: '(zzzAbsentAloneXYZ)', language: 'typescript' });
+      if (innocent.outcome !== 'ok') throw new Error('expected ok');
+      expect(innocent.perPattern[0]?.matches).toBe(0);
+      expect(innocent.perPattern[0]?.note).toBeUndefined();
+    });
+  });
+
   it('names which or-operator was actually applied, since | and || are not the same thing', async () => {
     await withProject(PROJECT, async (_root, provider) => {
       const bitwise = await provider.search({ pattern: 'isUnder|normalizeRoot', language: 'typescript' });

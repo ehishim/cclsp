@@ -90,8 +90,24 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
  * Tree-sitter names anonymous operator tokens by their own text, so matching the
  * operator child works across the grammars without a per-language table.
  */
+/**
+ * `(a|b)` is arguably the MORE idiomatic regex-group spelling, and it hides the
+ * operator one level down inside a parenthesised wrapper. Matching on the outermost
+ * node alone therefore missed exactly the shape a regex habit reaches for first.
+ * Matched structurally rather than by grammar name so this holds across languages.
+ */
+function unwrapGrouping(node: Parser.SyntaxNode): Parser.SyntaxNode {
+  let current = node;
+  while (current.type.includes('parenthes') && current.namedChildren.length === 1) {
+    const inner = current.namedChildren[0];
+    if (!inner) break;
+    current = inner;
+  }
+  return current;
+}
+
 function alternationOperator(node: Parser.SyntaxNode): string | undefined {
-  return node.children.find((child) => child.type === '|' || child.type === '||')?.type;
+  return unwrapGrouping(node).children.find((child) => child.type === '|' || child.type === '||')?.type;
 }
 
 function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | undefined {
@@ -100,7 +116,7 @@ function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | 
   // Name the operator that was actually applied. `|` is bitwise and `||` is logical,
   // and a note that misreports which one is the same class of untrue answer this
   // whole change exists to remove.
-  const parsed = `parsed as ${node.type} joined by \`${operator}\` (${operator === '||' ? 'logical' : 'bitwise'} or), not as alternation; regex syntax is not interpreted here`;
+  const parsed = `parsed as ${unwrapGrouping(node).type} joined by \`${operator}\` (${operator === '||' ? 'logical' : 'bitwise'} or), not as alternation; regex syntax is not interpreted here`;
   return patternCount > 1
     ? `${parsed}. Each name is already its own --pattern, so alternation is never needed`
     : `${parsed}. To search several names, pass --pattern once per name`;
