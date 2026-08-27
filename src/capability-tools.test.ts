@@ -167,8 +167,9 @@ describe('capability tool contracts', () => {
   });
 
   it('reports zero rows as a SCOPED empty only when the provider is confirmed answering', async () => {
-    // `empty` is an assertion that the workspace has no such symbol. It is the
-    // answer that makes a caller stop looking, so it needs the stronger evidence.
+    // `empty` claims only that nothing matched among the files this provider
+    // loaded. It must still be reportable -- retyping every negative as `stale`
+    // would leave no way to answer "not here" at all.
     const result = await findWorkspaceSymbolsTool.handler(
       { query: 'nothing' },
       asClient({
