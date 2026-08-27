@@ -46,6 +46,16 @@ export interface AstCapture {
   variadic: boolean;
 }
 
+export interface AstQueryOccurrence {
+  range: AstRange;
+  importBinding: boolean;
+}
+
+export interface AstQueryOccurrences {
+  occurrences: AstQueryOccurrence[];
+  truncated: boolean;
+}
+
 export interface AstMatch {
   file: string;
   range: AstRange;
@@ -247,6 +257,7 @@ export type ProviderValue<T> =
       warning?: string;
       matchedSymbols?: number;
       matchedDescriptions?: string[];
+      incomplete?: boolean;
     }
   | {
       outcome: 'ok';

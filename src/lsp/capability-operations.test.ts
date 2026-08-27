@@ -6,6 +6,7 @@ import { LspToolOutcomeError } from './capabilities.js';
 import { DiagnosticsCache } from './diagnostics.js';
 import { DocumentManager } from './document-manager.js';
 import {
+  findTypeDefinition,
   getCompletions,
   getDiagnosticsBatch,
   getDocumentSymbols,
@@ -56,6 +57,41 @@ describe('capability-gated operations', () => {
     await expect(getDocumentSymbols(state, TEST_FILE)).rejects.toBeInstanceOf(LspToolOutcomeError);
     expect(sendRequest).not.toHaveBeenCalled();
     expect(state.documentManager.ensureOpen).not.toHaveBeenCalled();
+  });
+
+  it('normalizes type-definition links to their semantic target', async () => {
+    const sendRequest = jest.fn().mockResolvedValue([
+      {
+        targetUri: 'file:///workspace/owner.ts',
+        targetRange: { start: { line: 9, character: 0 }, end: { line: 12, character: 1 } },
+        targetSelectionRange: {
+          start: { line: 10, character: 17 },
+          end: { line: 10, character: 40 },
+        },
+      },
+    ]);
+    const state = server({ typeDefinitionProvider: true }, sendRequest);
+    state.documentManager.acquire = jest.fn().mockResolvedValue({
+      justOpened: false,
+      release: jest.fn(),
+    });
+
+    const result = await findTypeDefinition(state, TEST_FILE, { line: 0, character: 7 });
+
+    expect(result).toEqual([
+      {
+        uri: 'file:///workspace/owner.ts',
+        range: { start: { line: 10, character: 17 }, end: { line: 10, character: 40 } },
+      },
+    ]);
+    expect(sendRequest).toHaveBeenCalledWith(
+      'textDocument/typeDefinition',
+      {
+        textDocument: { uri: expect.stringContaining('cclsp-capability-') },
+        position: { line: 0, character: 7 },
+      },
+      30000
+    );
   });
 
   it('preserves a supported empty documentSymbol result', async () => {

@@ -1,5 +1,6 @@
 import { existsSync, renameSync } from 'node:fs';
 import { applyWorkspaceEdit } from '../file-editor.js';
+import type { LSPClient } from '../lsp-client.js';
 import { pathToUri, uriToPath } from '../utils.js';
 import { resolvePath, rethrowToolOutcome, textResult, withWarning } from './helpers.js';
 import {
@@ -9,6 +10,15 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
+
+function matchKindText(
+  match: { kind: number; resolutionSource?: string },
+  client: LSPClient
+): string {
+  return match.resolutionSource === 'query-occurrence'
+    ? 'query occurrence; semantic kind resolved by LSP'
+    : client.symbolKindToString(match.kind);
+}
 
 export const renameSymbolTool: ToolDefinition = {
   name: 'rename_symbol',
@@ -57,7 +67,28 @@ export const renameSymbolTool: ToolDefinition = {
     const absolutePath = resolvePath(file_path);
 
     const result = await client.findSymbolsByName(absolutePath, symbol_name, symbol_kind);
-    const { matches: symbolMatches, warning } = result;
+    const { matches: symbolMatches, warning, incomplete } = result;
+
+    if (incomplete) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: withWarning(
+              warning,
+              `Refusing rename for "${symbol_name}": the bounded by-name query may omit another semantic target. Use rename_symbol_strict with an exact line and character.`
+            ),
+          },
+        ],
+        structuredContent: {
+          outcome: 'rejected',
+          code: 'LSP_SYMBOL_QUERY_INCOMPLETE',
+          query: symbol_name,
+          recovery: 'Use rename_symbol_strict with an exact line and character.',
+        },
+        isError: true,
+      };
+    }
 
     if (symbolMatches.length === 0) {
       return textResult(
@@ -72,7 +103,7 @@ export const renameSymbolTool: ToolDefinition = {
       const candidatesList = symbolMatches
         .map(
           (match) =>
-            `- ${match.name} (${client.symbolKindToString(match.kind)}) at line ${match.position.line + 1}, character ${match.position.character + 1}`
+            `- ${match.name} (${matchKindText(match, client)}) at line ${match.position.line + 1}, character ${match.position.character + 1}`
         )
         .join('\n');
 
@@ -116,7 +147,7 @@ export const renameSymbolTool: ToolDefinition = {
           return textResult(
             withWarning(
               warning,
-              `Successfully renamed ${match.name} (${client.symbolKindToString(match.kind)}) to "${new_name}".\n\nModified files:\n${editResult.filesModified.map((f) => `- ${f}`).join('\n')}`
+              `Successfully renamed ${match.name} (${matchKindText(match, client)}) to "${new_name}".\n\nModified files:\n${editResult.filesModified.map((f) => `- ${f}`).join('\n')}`
             )
           );
         }
@@ -124,14 +155,14 @@ export const renameSymbolTool: ToolDefinition = {
         return textResult(
           withWarning(
             warning,
-            `[DRY RUN] Would rename ${match.name} (${client.symbolKindToString(match.kind)}) to "${new_name}":\n${changes.join('\n')}`
+            `[DRY RUN] Would rename ${match.name} (${matchKindText(match, client)}) to "${new_name}":\n${changes.join('\n')}`
           )
         );
       }
       return textResult(
         withWarning(
           warning,
-          `No rename edits available for ${match.name} (${client.symbolKindToString(match.kind)}). The symbol may not be renameable or the language server doesn't support renaming this type of symbol.`
+          `No rename edits available for ${match.name} (${matchKindText(match, client)}). The symbol may not be renameable or the language server doesn't support renaming this type of symbol.`
         )
       );
     } catch (error) {
@@ -202,9 +233,14 @@ export const renameSymbolStrictTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'empty', provider: 'lsp',
+            outcome: 'empty',
+            provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            applied: false, editCount: 0, shown: 0, total: 0, omitted: 0,
+            applied: false,
+            editCount: 0,
+            shown: 0,
+            total: 0,
+            omitted: 0,
           },
         };
       }
@@ -227,11 +263,14 @@ export const renameSymbolStrictTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'ok', provider: 'lsp',
+            outcome: 'ok',
+            provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
             applied: false,
             edit: workspaceEdit,
-            shown: editCount, total: editCount, omitted: 0,
+            shown: editCount,
+            total: editCount,
+            omitted: 0,
           },
         };
       }
@@ -245,11 +284,14 @@ export const renameSymbolStrictTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok', provider: 'lsp',
+          outcome: 'ok',
+          provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           applied: true,
           filesModified: editResult.filesModified,
-          shown: editCount, total: editCount, omitted: 0,
+          shown: editCount,
+          total: editCount,
+          omitted: 0,
         },
       };
     } catch (error) {

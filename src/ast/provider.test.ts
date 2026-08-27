@@ -53,6 +53,49 @@ describe('AstProvider', () => {
     });
   }
 
+  it('prioritizes import bindings over earlier equal-text properties for query resolution', async () => {
+    await withProject(
+      {
+        'caller.ts': [
+          'const bag = { ImportedAlias: 1 };',
+          'import type { ImportedAlias } from "./owner.js";',
+          'export let current: ImportedAlias;',
+        ].join('\n'),
+      },
+      async (root, provider) => {
+        const result = await provider.queryOccurrences(
+          join(root, 'caller.ts'),
+          'ImportedAlias',
+          32
+        );
+        expect(result).toEqual({
+          occurrences: [
+            {
+              range: {
+                start: { line: 1, character: 14 },
+                end: { line: 1, character: 27 },
+              },
+              importBinding: true,
+            },
+          ],
+          truncated: false,
+        });
+      }
+    );
+  });
+
+  it('reports truncation instead of presenting a capped occurrence set as complete', async () => {
+    const source = Array.from({ length: 33 }, (_, index) => `obj.RepeatedAlias; // ${index}`).join(
+      '\n'
+    );
+    await withProject({ 'uses.ts': source }, async (root, provider) => {
+      const result = await provider.queryOccurrences(join(root, 'uses.ts'), 'RepeatedAlias', 32);
+      expect(result.occurrences).toHaveLength(32);
+      expect(result.truncated).toBe(true);
+      expect(result.occurrences.every((occurrence) => !occurrence.importBinding)).toBe(true);
+    });
+  });
+
   const DECLARATION_SMOKES = [
     ['typescript', 'sample.ts', 'class Box { run() {} }', ['Box', 'Box.run']],
     ['tsx', 'sample.tsx', 'class Box { run() { return <div />; } }', ['Box', 'Box.run']],
@@ -426,7 +469,8 @@ describe('AstProvider', () => {
 describe('a structural zero must say which kind of zero it is', () => {
   const PROJECT = {
     'a.ts': 'export function isUnder(x: string) { return x; }\n',
-    'b.ts': 'export function normalizeRoot(p: string) { return p; }\nconst r = normalizeRoot("x");\n',
+    'b.ts':
+      'export function normalizeRoot(p: string) { return p; }\nconst r = normalizeRoot("x");\n',
   };
 
   it('marks an alternation-shaped pattern with the node kind it was actually parsed as', async () => {
@@ -471,12 +515,18 @@ describe('a structural zero must say which kind of zero it is', () => {
 
   it('catches the parenthesised regex-group spelling, which hides the operator one level down', async () => {
     await withProject(PROJECT, async (_root, provider) => {
-      const grouped = await provider.search({ pattern: '(zzzAbsentOne|zzzAbsentTwo)', language: 'typescript' });
+      const grouped = await provider.search({
+        pattern: '(zzzAbsentOne|zzzAbsentTwo)',
+        language: 'typescript',
+      });
       if (grouped.outcome !== 'ok') throw new Error('expected ok');
       expect(grouped.perPattern[0]?.matches).toBe(0);
       expect(grouped.perPattern[0]?.note).toContain('bitwise or');
       // ...and the wrapper must not become a new excuse to warn on a true negative.
-      const innocent = await provider.search({ pattern: '(zzzAbsentAloneXYZ)', language: 'typescript' });
+      const innocent = await provider.search({
+        pattern: '(zzzAbsentAloneXYZ)',
+        language: 'typescript',
+      });
       if (innocent.outcome !== 'ok') throw new Error('expected ok');
       expect(innocent.perPattern[0]?.matches).toBe(0);
       expect(innocent.perPattern[0]?.note).toBeUndefined();
@@ -485,8 +535,14 @@ describe('a structural zero must say which kind of zero it is', () => {
 
   it('names which or-operator was actually applied, since | and || are not the same thing', async () => {
     await withProject(PROJECT, async (_root, provider) => {
-      const bitwise = await provider.search({ pattern: 'isUnder|normalizeRoot', language: 'typescript' });
-      const logical = await provider.search({ pattern: 'isUnder||normalizeRoot', language: 'typescript' });
+      const bitwise = await provider.search({
+        pattern: 'isUnder|normalizeRoot',
+        language: 'typescript',
+      });
+      const logical = await provider.search({
+        pattern: 'isUnder||normalizeRoot',
+        language: 'typescript',
+      });
       if (bitwise.outcome !== 'ok' || logical.outcome !== 'ok') throw new Error('expected ok');
       expect(bitwise.perPattern[0]?.note).toContain('bitwise or');
       expect(logical.perPattern[0]?.note).toContain('logical or');

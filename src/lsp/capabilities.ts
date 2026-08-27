@@ -32,6 +32,7 @@ export class LspToolOutcomeError extends Error {
 
 const METHOD_CAPABILITY_PATHS: Record<string, string[]> = {
   'textDocument/definition': ['definitionProvider'],
+  'textDocument/typeDefinition': ['typeDefinitionProvider'],
   'textDocument/references': ['referencesProvider'],
   'textDocument/rename': ['renameProvider'],
   'textDocument/documentSymbol': ['documentSymbolProvider'],

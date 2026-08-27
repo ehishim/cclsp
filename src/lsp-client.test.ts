@@ -64,6 +64,23 @@ const MOCK_IMPL2_TS = join(tmpdir(), 'impl2.ts');
 const MOCK_CALLER1_TS = join(tmpdir(), 'caller1.ts');
 const MOCK_CALLEE1_TS = join(tmpdir(), 'callee1.ts');
 
+function queryOccurrences(
+  name: string,
+  matches: Array<{ line: number; character: number; importBinding?: boolean }>,
+  truncated = false
+) {
+  return {
+    occurrences: matches.map((match) => ({
+      range: {
+        start: { line: match.line, character: match.character },
+        end: { line: match.line, character: match.character + name.length },
+      },
+      importBinding: match.importBinding ?? false,
+    })),
+    truncated,
+  };
+}
+
 const MOCK_SERVER_CAPABILITIES = {
   definitionProvider: true,
   referencesProvider: true,
@@ -525,6 +542,226 @@ describe('LSPClient', () => {
 
       getDocumentSymbolsSpy.mockRestore();
       getServerSpy.mockRestore();
+    });
+
+    it('groups a property and a later import as different semantic candidates', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [
+          {
+            name: 'ImportedAlias',
+            kind: 7,
+            range: { start: { line: 0, character: 12 }, end: { line: 0, character: 28 } },
+            selectionRange: { start: { line: 0, character: 14 }, end: { line: 0, character: 27 } },
+          },
+        ],
+      });
+      const findOccurrences = jest
+        .fn()
+        .mockResolvedValue(
+          queryOccurrences('ImportedAlias', [{ line: 1, character: 14, importBinding: true }])
+        );
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+      const definition = spyOn(client, 'findDefinition').mockImplementation(
+        async (_file, position) => [
+          position.line === 0
+            ? {
+                uri: pathToUri(MOCK_TEST_TS),
+                range: {
+                  start: position,
+                  end: { ...position, character: position.character + 13 },
+                },
+              }
+            : {
+                uri: pathToUri(MOCK_TEST_TS),
+                range: { start: { line: 1, character: 14 }, end: { line: 1, character: 27 } },
+              },
+        ]
+      );
+      const typeDefinition = spyOn(client, 'findTypeDefinition').mockImplementation(
+        async (_file, position) =>
+          position.line === 0
+            ? []
+            : [
+                {
+                  uri: pathToUri(MOCK_IMPL_TS),
+                  range: { start: { line: 10, character: 17 }, end: { line: 10, character: 30 } },
+                },
+              ]
+      );
+
+      const result = await client.findSymbolsByName(MOCK_TEST_TS, 'ImportedAlias');
+
+      expect(result.matches).toHaveLength(2);
+      expect(result.matches.map((match) => match.position.line)).toEqual([0, 1]);
+      expect(result.matches[1]?.definitionLocations).toEqual([
+        expect.objectContaining({ uri: pathToUri(MOCK_IMPL_TS) }),
+      ]);
+      expect(typeDefinition).toHaveBeenCalledTimes(1);
+      expect(typeDefinition).toHaveBeenCalledWith(MOCK_TEST_TS, { line: 1, character: 14 });
+      expect(findOccurrences).toHaveBeenCalledWith(MOCK_TEST_TS, 'ImportedAlias', 32);
+      typeDefinition.mockRestore();
+      definition.mockRestore();
+      symbolsSpy.mockRestore();
+    });
+
+    it('reports when bounded use-only occurrences may omit another semantic target', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [],
+      });
+      const findOccurrences = jest.fn().mockResolvedValue(
+        queryOccurrences(
+          'RepeatedAlias',
+          [
+            { line: 0, character: 7 },
+            { line: 1, character: 7 },
+          ],
+          true
+        )
+      );
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+      const definition = spyOn(client, 'findDefinition').mockImplementation(
+        async (_file, position) => [
+          {
+            uri: pathToUri(position.line === 0 ? MOCK_IMPL1_TS : MOCK_IMPL2_TS),
+            range: { start: { line: 3, character: 4 }, end: { line: 3, character: 17 } },
+          },
+        ]
+      );
+
+      const result = await client.findSymbolsByName(MOCK_TEST_TS, 'RepeatedAlias');
+
+      expect(result.matches).toHaveLength(2);
+      expect(result.incomplete).toBe(true);
+      expect(result.warning).toContain('exceeded the 32 result bound');
+      expect(result.warning).toContain('use an exact position');
+      expect(result.warning).toContain('at least 2 visible semantic symbols');
+      expect(result.warning).toContain('may contain more');
+      definition.mockRestore();
+      symbolsSpy.mockRestore();
+    });
+
+    it('does not request typeDefinition for an ordinary remote definition', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [],
+      });
+      const findOccurrences = jest
+        .fn()
+        .mockResolvedValue(queryOccurrences('ImportedAlias', [{ line: 2, character: 20 }]));
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+      const definition = spyOn(client, 'findDefinition').mockResolvedValue([
+        {
+          uri: pathToUri(MOCK_IMPL_TS),
+          range: { start: { line: 10, character: 17 }, end: { line: 10, character: 30 } },
+        },
+      ]);
+      const typeDefinition = spyOn(client, 'findTypeDefinition');
+
+      const result = await client.findDefinitionsWithProvider(MOCK_TEST_TS, 'ImportedAlias');
+
+      expect(typeDefinition).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [{ uri: pathToUri(MOCK_IMPL_TS) }],
+      });
+      typeDefinition.mockRestore();
+      definition.mockRestore();
+      symbolsSpy.mockRestore();
+    });
+
+    it('preserves an alias definition when typeDefinition is unsupported', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [],
+      });
+      const findOccurrences = jest
+        .fn()
+        .mockResolvedValue(
+          queryOccurrences('ImportedAlias', [{ line: 1, character: 14, importBinding: true }])
+        );
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+      const aliasLocation = {
+        uri: pathToUri(MOCK_TEST_TS),
+        range: { start: { line: 1, character: 14 }, end: { line: 1, character: 27 } },
+      };
+      const definition = spyOn(client, 'findDefinition').mockResolvedValue([aliasLocation]);
+      const typeDefinition = spyOn(client, 'findTypeDefinition').mockResolvedValue([]);
+
+      const result = await client.findDefinitionsWithProvider(MOCK_TEST_TS, 'ImportedAlias');
+
+      expect(result).toMatchObject({ outcome: 'ok', provider: 'lsp', value: [aliasLocation] });
+      typeDefinition.mockRestore();
+      definition.mockRestore();
+      symbolsSpy.mockRestore();
+    });
+
+    it('should not reinterpret an expression-shaped query as a symbol occurrence', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [],
+      });
+      const findOccurrences = jest.fn();
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+
+      const result = await client.findSymbolsByName(MOCK_TEST_TS, 'alpha|omega');
+
+      expect(result.matches).toHaveLength(0);
+      expect(findOccurrences).not.toHaveBeenCalled();
+      symbolsSpy.mockRestore();
+    });
+
+    it('should preserve honest absence when neither declarations nor syntax contain the query', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const symbolsSpy = spyOn(client, 'getDocumentSymbolsWithProvider').mockResolvedValue({
+        outcome: 'ok',
+        provider: 'lsp',
+        value: [],
+      });
+      const findOccurrences = jest.fn().mockResolvedValue(queryOccurrences('ReallyAbsent', []));
+      (
+        client as unknown as { astProvider: { queryOccurrences: typeof findOccurrences } }
+      ).astProvider = {
+        queryOccurrences: findOccurrences,
+      };
+
+      const result = await client.findSymbolsByName(MOCK_TEST_TS, 'ReallyAbsent');
+
+      expect(result.matches).toHaveLength(0);
+      expect(result.warning).toBeUndefined();
+      symbolsSpy.mockRestore();
     });
 
     it('should return empty results when no symbols found even with fallback', async () => {

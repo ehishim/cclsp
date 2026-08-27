@@ -42,7 +42,11 @@ function createMockClient(): MockLSPClient {
   };
   mock.findDefinitionsWithProvider.mockImplementation(
     async (filePath: string, symbolName: string, symbolKind?: string) => {
-      const { matches, warning } = await mock.findSymbolsByName(filePath, symbolName, symbolKind);
+      const { matches, warning, incomplete } = await mock.findSymbolsByName(
+        filePath,
+        symbolName,
+        symbolKind
+      );
       const locations = [];
       for (const match of matches) {
         locations.push(...(await mock.findDefinition(filePath, match.position)));
@@ -52,6 +56,7 @@ function createMockClient(): MockLSPClient {
         provider: 'lsp',
         value: locations,
         warning,
+        incomplete,
         matchedSymbols: matches.length,
         matchedDescriptions: matches.map(
           (match: { name: string; kind: number }) =>
@@ -212,6 +217,40 @@ describe('MCP Tool Handlers', () => {
       expect(result.content[0]?.text).toContain(`${uriToPath(pathToUri(SRC_TEST))}:1:1`);
     });
 
+    it('marks a truncated by-name definition result partial and non-successful', async () => {
+      mockClient.findSymbolsByName.mockResolvedValue({
+        matches: [
+          {
+            name: 'RepeatedAlias',
+            kind: 13,
+            position: { line: 0, character: 7 },
+            range: { start: { line: 0, character: 7 }, end: { line: 0, character: 20 } },
+          },
+        ],
+        incomplete: true,
+        warning: 'Syntax occurrences exceeded the 32 result bound.',
+      });
+      mockClient.findDefinition.mockResolvedValue([
+        {
+          uri: pathToUri(SRC_TEST),
+          range: { start: { line: 0, character: 7 }, end: { line: 0, character: 20 } },
+        },
+      ]);
+
+      const result = await findDefinitionTool.handler(
+        { file_path: 'test.ts', symbol_name: 'RepeatedAlias' },
+        asClient(mockClient)
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        outcome: 'partial',
+        code: 'LSP_SYMBOL_QUERY_INCOMPLETE',
+        partial: true,
+      });
+      expect(result.content[0]?.text).toContain('exceeded the 32 result bound');
+    });
+
     it('should handle findDefinition returning empty array', async () => {
       mockClient.findSymbolsByName.mockResolvedValue({
         matches: [
@@ -343,6 +382,39 @@ describe('MCP Tool Handlers', () => {
       );
     });
 
+    it('marks truncated by-name references partial and non-successful', async () => {
+      mockClient.findSymbolsByName.mockResolvedValue({
+        matches: [
+          {
+            name: 'RepeatedAlias',
+            kind: 13,
+            position: { line: 0, character: 7 },
+            range: { start: { line: 0, character: 7 }, end: { line: 0, character: 20 } },
+          },
+        ],
+        incomplete: true,
+        warning: 'Syntax occurrences exceeded the 32 result bound.',
+      });
+      mockClient.findReferences.mockResolvedValue([
+        {
+          uri: pathToUri(SRC_TEST),
+          range: { start: { line: 0, character: 7 }, end: { line: 0, character: 20 } },
+        },
+      ]);
+
+      const result = await findReferencesTool.handler(
+        { file_path: 'test.ts', symbol_name: 'RepeatedAlias' },
+        asClient(mockClient)
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        outcome: 'partial',
+        code: 'LSP_SYMBOL_QUERY_INCOMPLETE',
+        partial: true,
+      });
+    });
+
     it('should return no-symbols message when no matches found', async () => {
       mockClient.findSymbolsByName.mockResolvedValue({ matches: [] });
 
@@ -434,6 +506,35 @@ describe('MCP Tool Handlers', () => {
       expect(result.content[0]?.text).toContain('rename_symbol_strict');
       expect(result.content[0]?.text).toContain('function');
       expect(result.content[0]?.text).toContain('variable');
+      expect(mockClient.renameSymbol).not.toHaveBeenCalled();
+    });
+
+    it('refuses by-name rename when bounded occurrence discovery is incomplete', async () => {
+      mockClient.findSymbolsByName.mockResolvedValue({
+        matches: [
+          {
+            name: 'RepeatedAlias',
+            kind: 13,
+            position: { line: 0, character: 7 },
+            range: { start: { line: 0, character: 7 }, end: { line: 0, character: 20 } },
+            resolutionSource: 'query-occurrence',
+          },
+        ],
+        incomplete: true,
+        warning: 'Syntax occurrences exceeded the 32 result bound.',
+      });
+
+      const result = await renameSymbolTool.handler(
+        { file_path: 'test.ts', symbol_name: 'RepeatedAlias', new_name: 'renamed' },
+        asClient(mockClient)
+      );
+
+      expect(result.isError).toBe(true);
+      expect(result.structuredContent).toMatchObject({
+        outcome: 'rejected',
+        code: 'LSP_SYMBOL_QUERY_INCOMPLETE',
+      });
+      expect(result.content[0]?.text).toContain('rename_symbol_strict');
       expect(mockClient.renameSymbol).not.toHaveBeenCalled();
     });
 

@@ -233,6 +233,33 @@ async function withFreshDocument<T>(
   }
 }
 
+function normalizeDefinitionLocations(result: unknown): Location[] {
+  const rows = Array.isArray(result)
+    ? result
+    : result && typeof result === 'object'
+      ? [result]
+      : [];
+  const locations: Location[] = [];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    if ('uri' in row && 'range' in row) {
+      const location = row as LSPLocation;
+      locations.push({ uri: location.uri, range: location.range });
+      continue;
+    }
+    if ('targetUri' in row && ('targetSelectionRange' in row || 'targetRange' in row)) {
+      const link = row as {
+        targetUri: string;
+        targetSelectionRange?: Location['range'];
+        targetRange?: Location['range'];
+      };
+      const range = link.targetSelectionRange ?? link.targetRange;
+      if (range) locations.push({ uri: link.targetUri, range });
+    }
+  }
+  return locations;
+}
+
 export async function findDefinition(
   serverState: ServerState,
   filePath: string,
@@ -270,28 +297,29 @@ export async function findDefinition(
     `[DEBUG findDefinition] Result type: ${typeof result}, isArray: ${Array.isArray(result)}\n`
   );
 
-  if (Array.isArray(result)) {
-    logger.debug(`[DEBUG findDefinition] Array result with ${result.length} locations\n`);
-    if (result.length > 0) {
-      logger.debug(
-        `[DEBUG findDefinition] First location: ${JSON.stringify(result[0], null, 2)}\n`
-      );
-    }
-    return result.map((loc: LSPLocation) => ({
-      uri: loc.uri,
-      range: loc.range,
-    }));
-  }
-  if (result && typeof result === 'object' && 'uri' in result) {
-    logger.debug(
-      `[DEBUG findDefinition] Single location result: ${JSON.stringify(result, null, 2)}\n`
-    );
-    const location = result as LSPLocation;
-    return [{ uri: location.uri, range: location.range }];
-  }
+  const locations = normalizeDefinitionLocations(result);
+  logger.debug(`[DEBUG findDefinition] Normalized ${locations.length} location(s)\n`);
+  return locations;
+}
 
-  logger.debug('[DEBUG findDefinition] No definition found or unexpected result format\n');
-  return [];
+export async function findTypeDefinition(
+  serverState: ServerState,
+  filePath: string,
+  position: Position
+): Promise<Location[]> {
+  await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/typeDefinition');
+  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
+    if (justOpened) await new Promise((resolve) => setTimeout(resolve, 200));
+    const method = 'textDocument/typeDefinition';
+    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
+    return serverState.transport.sendRequest(
+      method,
+      { textDocument: { uri: pathToUri(filePath) }, position },
+      timeout
+    );
+  });
+  return normalizeDefinitionLocations(result);
 }
 
 export async function findReferences(
@@ -818,7 +846,6 @@ export async function matchSymbolsByName(
   const matches: SymbolMatch[] = [];
 
   logger.debug(`[DEBUG findSymbolsByName] Got ${symbols.length} symbols from documentSymbols\n`);
-
 
   if (isDocumentSymbolArray(symbols)) {
     logger.debug('[DEBUG findSymbolsByName] Processing DocumentSymbol[] (hierarchical format)\n');

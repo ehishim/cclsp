@@ -122,6 +122,12 @@ export interface SymbolInformation {
 export interface SymbolMatch {
   name: string;
   kind: SymbolKind;
+  /** Query occurrences are syntax-located entry points whose semantic kind is left to the LSP. */
+  resolutionSource?: 'document-symbol' | 'query-occurrence';
+  /** Semantic target locations already resolved while grouping use-only occurrences. */
+  definitionLocations?: Location[];
+  /** True when the syntax occurrence is a local binding inside an import/use declaration. */
+  importBinding?: boolean;
   position: Position;
   range: {
     start: Position;

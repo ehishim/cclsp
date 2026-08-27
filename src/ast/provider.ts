@@ -11,22 +11,25 @@ import { GrammarRegistry } from './grammar-registry.js';
 import { PatternCompiler } from './pattern-compiler.js';
 import { RewriteBuildError, RewriteEngine, type RewriteSourceFile } from './rewrite-engine.js';
 import { SearchEngine } from './search-engine.js';
+import { SourceLocator } from './source-locator.js';
 import {
   AST_DEFAULT_RESULTS,
   AST_FALLBACK_DEFINITION_RESULTS,
   AST_LANGUAGES,
   AST_MAX_FAILED_FILES,
   AST_MAX_FILE_BYTES,
+  AST_MAX_PATTERNS,
   AST_MAX_RESULTS,
   AST_REWRITE_GENERATED_SCAN_CHARACTERS,
   AST_REWRITE_MAX_CHANGES,
   type AstLanguage,
+  type AstPatternReport,
+  type AstQueryOccurrence,
+  type AstQueryOccurrences,
   type AstRejected,
   type AstRewriteErrorCode,
   type AstRewriteInput,
   type AstRewriteRejected,
-  AST_MAX_PATTERNS,
-  type AstPatternReport,
   type AstSearchInput,
   type AstSearchOutcome,
   type CompiledPattern,
@@ -107,7 +110,8 @@ function unwrapGrouping(node: Parser.SyntaxNode): Parser.SyntaxNode {
 }
 
 function alternationOperator(node: Parser.SyntaxNode): string | undefined {
-  return unwrapGrouping(node).children.find((child) => child.type === '|' || child.type === '||')?.type;
+  return unwrapGrouping(node).children.find((child) => child.type === '|' || child.type === '||')
+    ?.type;
 }
 
 function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | undefined {
@@ -681,6 +685,74 @@ export class AstProvider {
         code: error instanceof OversizedFileError ? 'AST_FILE_OVERSIZED' : 'AST_PARSE_FAILED',
         reason: String(error),
       };
+    }
+  }
+
+  async queryOccurrences(
+    file: string,
+    name: string,
+    maxResults: number
+  ): Promise<AstQueryOccurrences> {
+    const index = await this.indexPromise;
+    let canonical: string;
+    try {
+      canonical = await index.resolveSearchPath(file);
+    } catch {
+      return { occurrences: [], truncated: false };
+    }
+    const language = languageForPath(canonical);
+    if (!language) return { occurrences: [], truncated: false };
+    const fileStat = await stat(canonical);
+    if (fileStat.size > AST_MAX_FILE_BYTES) return { occurrences: [], truncated: false };
+    try {
+      const parsed = await this.getFreshTree(
+        index,
+        {
+          absolutePath: canonical,
+          relativePath: canonical,
+          language,
+          bytes: fileStat.size,
+          mtimeMs: fileStat.mtimeMs,
+        },
+        language
+      );
+      if (parsed.tree.rootNode.hasError) return { occurrences: [], truncated: false };
+      const locator = new SourceLocator(parsed.source);
+      const imports: AstQueryOccurrence[] = [];
+      const other: AstQueryOccurrence[] = [];
+      let otherTruncated = false;
+      const visit = (node: Parser.SyntaxNode, importBinding: boolean): void => {
+        const isImportBinding =
+          importBinding ||
+          node.type.includes('import') ||
+          node.type === 'use_declaration' ||
+          node.type === 'use_clause';
+        if (
+          node.isNamed &&
+          node.namedChildCount === 0 &&
+          locator.text(node.startIndex, node.endIndex) === name
+        ) {
+          const occurrence = { range: locator.range(node), importBinding: isImportBinding };
+          if (isImportBinding) {
+            imports.push(occurrence);
+          } else if (other.length < maxResults) {
+            other.push(occurrence);
+          } else {
+            otherTruncated = true;
+          }
+        }
+        for (const child of node.namedChildren) visit(child, isImportBinding);
+      };
+      visit(parsed.tree.rootNode, false);
+      if (imports.length > 0) {
+        return {
+          occurrences: imports.slice(0, maxResults),
+          truncated: imports.length > maxResults,
+        };
+      }
+      return { occurrences: other, truncated: otherTruncated };
+    } catch {
+      return { occurrences: [], truncated: false };
     }
   }
 

@@ -26,7 +26,7 @@ import {
   findImplementation as opsFindImplementation,
   findReferences as opsFindReferences,
   findSymbolsByName as opsFindSymbolsByName,
-  matchSymbolsByName as opsMatchSymbolsByName,
+  findTypeDefinition as opsFindTypeDefinition,
   getCodeActions as opsGetCodeActions,
   getCompletions as opsGetCompletions,
   getDiagnostics as opsGetDiagnostics,
@@ -35,6 +35,7 @@ import {
   getSignatureHelp as opsGetSignatureHelp,
   hover as opsHover,
   incomingCalls as opsIncomingCalls,
+  matchSymbolsByName as opsMatchSymbolsByName,
   outgoingCalls as opsOutgoingCalls,
   prepareCallHierarchy as opsPrepareCallHierarchy,
   renameSymbol as opsRenameSymbol,
@@ -42,6 +43,7 @@ import {
   resolveCompletionItem as opsResolveCompletionItem,
   willRenameFiles as opsWillRenameFiles,
   workspaceSymbol as opsWorkspaceSymbol,
+  stringToSymbolKind,
   symbolKindToString,
 } from './lsp/operations.js';
 import type {
@@ -53,6 +55,7 @@ import type {
   WorkspaceEditResult,
 } from './lsp/operations.js';
 import { ServerManager } from './lsp/server-manager.js';
+import { SymbolKind } from './lsp/types.js';
 import type {
   CallHierarchyIncomingCall,
   CallHierarchyItem,
@@ -67,8 +70,15 @@ import type {
   SymbolInformation,
   SymbolMatch,
 } from './lsp/types.js';
-import type { SymbolKind } from './lsp/types.js';
 import { pathToUri, uriToPath } from './utils.js';
+
+const MAX_QUERY_OCCURRENCES = 32;
+
+export interface SymbolQueryMatchResult {
+  matches: SymbolMatch[];
+  warning?: string;
+  incomplete?: boolean;
+}
 
 class NoConfiguredLanguageServerError extends Error {
   constructor(readonly filePath: string) {
@@ -422,19 +432,44 @@ export class LSPClient {
     return opsFindDefinition(serverState, filePath, position);
   }
 
+  async findTypeDefinition(filePath: string, position: Position): Promise<Location[]> {
+    const serverState = await this.getServer(filePath);
+    if (!supportsMethod(serverState, 'textDocument/typeDefinition')) return [];
+    return opsFindTypeDefinition(serverState, filePath, position);
+  }
+
   async findDefinitionsWithProvider(
     filePath: string,
     symbolName: string,
     symbolKind?: string
   ): Promise<ProviderDefinitions> {
     try {
-      const { matches, warning } = await this.findSymbolsByName(filePath, symbolName, symbolKind);
+      const { matches, warning, incomplete } = await this.findSymbolsByName(
+        filePath,
+        symbolName,
+        symbolKind
+      );
       if (matches.length === 0) {
-        return { outcome: 'ok', provider: 'lsp', value: [], warning, matchedSymbols: 0 };
+        return {
+          outcome: 'ok',
+          provider: 'lsp',
+          value: [],
+          warning,
+          matchedSymbols: 0,
+          incomplete,
+        };
       }
       const locations: Location[] = [];
+      const seenLocations = new Set<string>();
       for (const match of matches) {
-        locations.push(...(await this.findDefinition(filePath, match.position)));
+        const resolved =
+          match.definitionLocations ?? (await this.findDefinition(filePath, match.position));
+        for (const location of resolved) {
+          const key = this.locationKey(location);
+          if (seenLocations.has(key)) continue;
+          seenLocations.add(key);
+          locations.push(location);
+        }
       }
       return {
         outcome: 'ok',
@@ -442,8 +477,11 @@ export class LSPClient {
         value: locations,
         warning,
         matchedSymbols: matches.length,
-        matchedDescriptions: matches.map(
-          (match) => `${match.name} (${this.symbolKindToString(match.kind)})`
+        incomplete,
+        matchedDescriptions: matches.map((match) =>
+          match.resolutionSource === 'query-occurrence'
+            ? `${match.name} (query occurrence; semantic kind resolved by LSP)`
+            : `${match.name} (${this.symbolKindToString(match.kind)})`
         ),
       };
     } catch (error) {
@@ -475,6 +513,27 @@ export class LSPClient {
     return opsRenameSymbol(serverState, filePath, position, newName);
   }
 
+  private locationKey(location: Location): string {
+    const { start, end } = location.range;
+    return `${normalize(uriToPath(location.uri))}\u0000${start.line}\u0000${start.character}\u0000${end.line}\u0000${end.character}`;
+  }
+
+  private locationContainsPosition(
+    location: Location,
+    filePath: string,
+    position: Position
+  ): boolean {
+    if (normalize(uriToPath(location.uri)) !== normalize(filePath)) return false;
+    const { start, end } = location.range;
+    const afterStart =
+      position.line > start.line ||
+      (position.line === start.line && position.character >= start.character);
+    const beforeEnd =
+      position.line < end.line ||
+      (position.line === end.line && position.character <= end.character);
+    return afterStart && beforeEnd;
+  }
+
   symbolKindToString(kind: SymbolKind): string {
     return symbolKindToString(kind);
   }
@@ -487,7 +546,7 @@ export class LSPClient {
     filePath: string,
     symbolName: string,
     symbolKind?: string
-  ): Promise<{ matches: SymbolMatch[]; warning?: string }> {
+  ): Promise<SymbolQueryMatchResult> {
     // Resolve the file's symbols through the one owner of "an empty answer is not an answer",
     // then let the operation do only the matching. find_references, find_definition and
     // rename_symbol all arrive here by name, so placing the rule anywhere below this point
@@ -495,10 +554,110 @@ export class LSPClient {
     // absent. The operation keeps kind fallback and position resolution.
     const provided = await this.getDocumentSymbolsWithProvider(filePath);
     if (provided.outcome === 'ok') {
-      return opsMatchSymbolsByName(filePath, provided.value, symbolName, symbolKind);
+      const matched = await opsMatchSymbolsByName(filePath, provided.value, symbolName, symbolKind);
+
+      // Imports and other use-only names are deliberately absent from documentSymbol. A local
+      // declaration with the same text does not prove there is no import, so combine document
+      // matches with import bindings. With no document match, use the bounded occurrence set.
+      // Tree-sitter selects positions only; LSP definition targets own semantic identity.
+      const syntax = await this.findQueryOccurrences(filePath, symbolName, symbolKind);
+      const syntaxMatches =
+        matched.matches.length > 0
+          ? syntax.matches.filter((match) => match.importBinding)
+          : syntax.matches;
+      if (syntaxMatches.length === 0) return matched;
+      const grouped = await this.groupQueryOccurrences(filePath, [
+        ...matched.matches,
+        ...syntaxMatches,
+      ]);
+      const ambiguityWarning =
+        grouped.length > 1
+          ? syntax.truncated
+            ? `Found at least ${grouped.length} visible semantic symbols with the exact name "${symbolName}"; omitted occurrences may contain more.`
+            : `Found ${grouped.length} semantic symbols with the exact name "${symbolName}"; results include every target.`
+          : undefined;
+      return {
+        matches: grouped,
+        incomplete: syntax.truncated,
+        warning:
+          [
+            matched.warning,
+            symbolKind
+              ? 'Symbol kind could not be pre-filtered for use-only occurrences.'
+              : undefined,
+            syntax.truncated
+              ? `Syntax occurrences exceeded the ${MAX_QUERY_OCCURRENCES} result bound; use an exact position to inspect omitted targets.`
+              : undefined,
+            ambiguityWarning,
+          ]
+            .filter(Boolean)
+            .join(' ') || undefined,
+      };
     }
     const serverState = await this.getServer(filePath);
     return opsFindSymbolsByName(serverState, filePath, symbolName, symbolKind);
+  }
+
+  private async findQueryOccurrences(
+    filePath: string,
+    symbolName: string,
+    symbolKind?: string
+  ): Promise<{ matches: SymbolMatch[]; truncated: boolean }> {
+    // A by-name fallback selects identifier occurrences, never an arbitrary expression that
+    // merely parses (for example `a|b`). Qualified/fuzzy names remain document-symbol queries.
+    if (!/^[\p{ID_Start}_$][\p{ID_Continue}$]*$/u.test(symbolName)) {
+      return { matches: [], truncated: false };
+    }
+    const found = await this.astProvider.queryOccurrences(
+      filePath,
+      symbolName,
+      MAX_QUERY_OCCURRENCES
+    );
+    return {
+      matches: found.occurrences.map((occurrence) => ({
+        name: symbolName,
+        kind: (symbolKind ? stringToSymbolKind(symbolKind) : null) ?? SymbolKind.Variable,
+        resolutionSource: 'query-occurrence' as const,
+        importBinding: occurrence.importBinding,
+        position: occurrence.range.start,
+        range: occurrence.range,
+        detail: 'syntax-located query occurrence; semantic identity is resolved by LSP',
+      })),
+      truncated: found.truncated,
+    };
+  }
+
+  private async groupQueryOccurrences(
+    filePath: string,
+    occurrences: SymbolMatch[]
+  ): Promise<SymbolMatch[]> {
+    const grouped = new Map<string, SymbolMatch>();
+    for (const occurrence of occurrences) {
+      let definitions = await this.findDefinition(filePath, occurrence.position);
+      if (
+        occurrence.importBinding &&
+        definitions.length > 0 &&
+        definitions.every((location) =>
+          occurrences.some((candidate) =>
+            this.locationContainsPosition(location, filePath, candidate.position)
+          )
+        )
+      ) {
+        const typeDefinitions = await this.findTypeDefinition(filePath, occurrence.position);
+        if (typeDefinitions.length > 0) definitions = typeDefinitions;
+      }
+      const definitionKey =
+        definitions.length > 0
+          ? definitions
+              .map((location) => this.locationKey(location))
+              .sort()
+              .join('\u0001')
+          : `unresolved\u0000${occurrence.position.line}\u0000${occurrence.position.character}`;
+      if (!grouped.has(definitionKey)) {
+        grouped.set(definitionKey, { ...occurrence, definitionLocations: definitions });
+      }
+    }
+    return [...grouped.values()];
   }
 
   async getDocumentSymbols(filePath: string): Promise<DocumentSymbol[] | SymbolInformation[]> {

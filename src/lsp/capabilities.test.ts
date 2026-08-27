@@ -19,9 +19,11 @@ describe('server capability negotiation', () => {
   it('distinguishes provider objects and false or missing providers', () => {
     const server = state({
       documentSymbolProvider: {},
+      typeDefinitionProvider: true,
       referencesProvider: false,
     });
     expect(supportsMethod(server, 'textDocument/documentSymbol')).toBe(true);
+    expect(supportsMethod(server, 'textDocument/typeDefinition')).toBe(true);
     expect(supportsMethod(server, 'textDocument/references')).toBe(false);
     expect(supportsMethod(server, 'textDocument/hover')).toBe(false);
   });
