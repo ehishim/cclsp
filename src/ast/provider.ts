@@ -81,13 +81,22 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
 /**
  * A structural zero and a regex habit that happens to parse are the same output.
  * `a|b` is a valid bitwise-or expression, so it is never refused as malformed,
- * matches nothing, and reads as absence. Naming the parsed node kind separates
- * the two: `binary_expression` reveals the mistake, while a bare `identifier`
- * that is simply not there stays a plain, unaccused true negative.
+ * matches nothing, and reads as absence.
+ *
+ * The note is therefore scoped to the alternation shape itself, not to "anything
+ * that is not a plain name": a search for `class Foo {}` or `f(x)` that finds
+ * nothing is an ordinary true negative, and telling it that regex is not
+ * interpreted would invent a second spurious-warning class in place of the first.
+ * Tree-sitter names anonymous operator tokens by their own text, so matching the
+ * operator child works across the grammars without a per-language table.
  */
-function zeroMatchNote(nodeKind: string, patternCount: number): string | undefined {
-  if (nodeKind === 'identifier') return undefined;
-  const parsed = `parsed as ${nodeKind} and matched structurally; regex syntax is not interpreted here`;
+function looksLikeAlternation(node: Parser.SyntaxNode): boolean {
+  return node.children.some((child) => child.type === '|' || child.type === '||');
+}
+
+function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | undefined {
+  if (!looksLikeAlternation(node)) return undefined;
+  const parsed = `parsed as ${node.type} joined by a bitwise-or operator, not as alternation; regex syntax is not interpreted here`;
   return patternCount > 1
     ? `${parsed}. Each name is already its own --pattern, so alternation is never needed`
     : `${parsed}. To search several names, pass --pattern once per name`;
@@ -374,7 +383,7 @@ export class AstProvider {
         const compiled = compiledPatterns[patternIndex];
         const note =
           found === 0 && compiled && compiled.metavariables.length === 0
-            ? zeroMatchNote(compiled.node.type, requestedPatterns.length)
+            ? zeroMatchNote(compiled.node, requestedPatterns.length)
             : undefined;
         return note !== undefined
           ? { pattern: String(raw), matches: found, note }

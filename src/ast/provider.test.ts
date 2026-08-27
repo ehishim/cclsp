@@ -446,18 +446,28 @@ describe('a structural zero must say which kind of zero it is', () => {
     });
   });
 
-  it('leaves a genuinely absent name as a plain zero, with no note to explain away', async () => {
-    await withProject(PROJECT, async (_root, provider) => {
-      const result = await provider.search({
-        pattern: 'zzzNeverDeclaredZZZ',
-        language: 'typescript',
+  // Every one of these is a true negative that has nothing to do with a regex habit.
+  // The first version of this fix noted all of them, because it keyed on "not an
+  // identifier" rather than on the alternation shape, trading one spurious-warning
+  // class for a wider one. An identifier-only control never exercised that.
+  const TRUE_NEGATIVES: Array<[string, string]> = [
+    ['bare name', 'zzzNeverDeclaredZZZ'],
+    ['call expression', 'console.log("definitely_not_present_xyz")'],
+    ['class declaration', 'class DefinitelyNotPresentClassXYZ {}'],
+    ['ordinary addition', 'reallyNotHereAAA + reallyNotHereBBB'],
+  ];
+
+  for (const [shape, pattern] of TRUE_NEGATIVES) {
+    it(`leaves a genuine absence (${shape}) as a plain zero, with no note to explain away`, async () => {
+      await withProject(PROJECT, async (_root, provider) => {
+        const result = await provider.search({ pattern, language: 'typescript' });
+        if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+        expect(result.matches).toHaveLength(0);
+        expect(result.perPattern[0]?.matches).toBe(0);
+        expect(result.perPattern[0]?.note).toBeUndefined();
       });
-      if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
-      expect(result.matches).toHaveLength(0);
-      expect(result.perPattern[0]?.matches).toBe(0);
-      expect(result.perPattern[0]?.note).toBeUndefined();
     });
-  });
+  }
 
   it('attributes each count to its own pattern and names the one that found nothing', async () => {
     await withProject(PROJECT, async (_root, provider) => {
