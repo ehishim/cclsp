@@ -469,6 +469,16 @@ describe('a structural zero must say which kind of zero it is', () => {
     });
   }
 
+  it('names which or-operator was actually applied, since | and || are not the same thing', async () => {
+    await withProject(PROJECT, async (_root, provider) => {
+      const bitwise = await provider.search({ pattern: 'isUnder|normalizeRoot', language: 'typescript' });
+      const logical = await provider.search({ pattern: 'isUnder||normalizeRoot', language: 'typescript' });
+      if (bitwise.outcome !== 'ok' || logical.outcome !== 'ok') throw new Error('expected ok');
+      expect(bitwise.perPattern[0]?.note).toContain('bitwise or');
+      expect(logical.perPattern[0]?.note).toContain('logical or');
+    });
+  });
+
   it('attributes each count to its own pattern and names the one that found nothing', async () => {
     await withProject(PROJECT, async (_root, provider) => {
       const result = await provider.search({

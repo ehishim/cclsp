@@ -90,13 +90,17 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
  * Tree-sitter names anonymous operator tokens by their own text, so matching the
  * operator child works across the grammars without a per-language table.
  */
-function looksLikeAlternation(node: Parser.SyntaxNode): boolean {
-  return node.children.some((child) => child.type === '|' || child.type === '||');
+function alternationOperator(node: Parser.SyntaxNode): string | undefined {
+  return node.children.find((child) => child.type === '|' || child.type === '||')?.type;
 }
 
 function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | undefined {
-  if (!looksLikeAlternation(node)) return undefined;
-  const parsed = `parsed as ${node.type} joined by a bitwise-or operator, not as alternation; regex syntax is not interpreted here`;
+  const operator = alternationOperator(node);
+  if (operator === undefined) return undefined;
+  // Name the operator that was actually applied. `|` is bitwise and `||` is logical,
+  // and a note that misreports which one is the same class of untrue answer this
+  // whole change exists to remove.
+  const parsed = `parsed as ${node.type} joined by \`${operator}\` (${operator === '||' ? 'logical' : 'bitwise'} or), not as alternation; regex syntax is not interpreted here`;
   return patternCount > 1
     ? `${parsed}. Each name is already its own --pattern, so alternation is never needed`
     : `${parsed}. To search several names, pass --pattern once per name`;
