@@ -167,8 +167,12 @@ export function normalizeToolResult(
   if (text) normalized.text = text;
   if (!Array.isArray(normalized.ranges) && ranges.length > 0) normalized.ranges = ranges;
   if (typeof normalized.shown !== 'number') normalized.shown = cardinality;
-  if (typeof normalized.total !== 'number') normalized.total = cardinality;
-  if (typeof normalized.omitted !== 'number') normalized.omitted = Math.max(0, Number(normalized.total) - Number(normalized.shown));
+  if (normalized.outcome !== 'partial' && typeof normalized.total !== 'number') {
+    normalized.total = cardinality;
+  }
+  if (typeof normalized.total === 'number' && typeof normalized.omitted !== 'number') {
+    normalized.omitted = Math.max(0, normalized.total - Number(normalized.shown));
+  }
   if (envelope.isError === true) normalized.isError = true;
   return normalized;
 }

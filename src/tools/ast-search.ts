@@ -3,7 +3,12 @@ import { codeRewriteTool } from './code-rewrite.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
 
 function renderPatternRow(report: AstPatternReport): string {
-  const count = `${report.pattern}: ${report.matches} match(es)`;
+  const count =
+    report.completeness === 'unknown'
+      ? `${report.pattern}: unknown — scan incomplete`
+      : report.completeness === 'lower-bound'
+        ? `${report.pattern}: at least ${report.matches} match(es) — scan incomplete`
+        : `${report.pattern}: ${report.matches} match(es)`;
   return report.note ? `  ${count} — ${report.note}` : `  ${count}`;
 }
 
@@ -22,17 +27,8 @@ function renderPatternBreakdown(perPattern: AstPatternReport[] | undefined): str
   return only?.note ? renderPatternRow(only) : '';
 }
 
-function renderText(result: AstSearchOutcome): string {
-  if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
-  const header = [
-    `AST search (${result.provider}, ${result.language})`,
-    `${result.matches.length} match(es) across ${result.filesScanned} parsed file(s)`,
-    `truncated=${result.truncated} indexCapped=${result.indexCapped} partial=${result.partial}`,
-  ].join(' — ');
-  const breakdown = renderPatternBreakdown(result.perPattern);
-  const summary = breakdown ? `${header}\n${breakdown}` : header;
-  if (result.matches.length === 0) return summary;
-  return `${summary}\n\n${result.matches
+function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'partial' }>): string {
+  return result.matches
     .map((match) => {
       const start = match.range.start;
       const captures = match.captures
@@ -43,14 +39,43 @@ function renderText(result: AstSearchOutcome): string {
         .join('\n');
       return `${match.file}:${start.line + 1}:${start.character + 1}\n${match.text}${captures ? `\n${captures}` : ''}`;
     })
-    .join('\n\n')}`;
+    .join('\n\n');
+}
+
+function renderText(result: AstSearchOutcome): string {
+  if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
+  if (result.outcome === 'partial') {
+    const header = `${result.code}: AST search (${result.provider}, ${result.language}) could not establish absence because ${result.parseFailureCount} file(s) failed to parse after ${result.filesScanned} file(s) parsed.`;
+    const breakdown = result.perPattern.map(renderPatternRow).join('\n');
+    const failedFiles = result.failedFiles
+      .map((failure) => `  ${failure.file}: ${failure.code}`)
+      .join('\n');
+    const summary = [
+      header,
+      breakdown,
+      `Failed files (${result.failedFiles.length}/${result.parseFailureCount} shown):`,
+      failedFiles,
+      `Recovery: ${result.recovery}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+    return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result)}`;
+  }
+  const header = [
+    `AST search (${result.provider}, ${result.language})`,
+    `${result.matches.length} match(es) across ${result.filesScanned} parsed file(s)`,
+    `truncated=${result.truncated} indexCapped=${result.indexCapped} partial=${result.partial}`,
+  ].join(' — ');
+  const breakdown = renderPatternBreakdown(result.perPattern);
+  const summary = breakdown ? `${header}\n${breakdown}` : header;
+  return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result)}`;
 }
 
 function toolResult(result: AstSearchOutcome): ToolResult {
   return {
     content: [{ type: 'text', text: renderText(result) }],
     structuredContent: { ...result },
-    ...(result.outcome === 'rejected' ? { isError: true } : {}),
+    ...(result.outcome !== 'ok' ? { isError: true } : {}),
   };
 }
 
@@ -65,7 +90,7 @@ export const astSearchTool: ToolDefinition = {
         type: ['string', 'array'],
         items: { type: 'string' },
         description:
-          'Structural pattern with $NAME and $$$NAME metavariables. Pass an array (or repeat --pattern) to search several patterns in one scan; each reports its own count. Regex syntax is never interpreted, so alternation is expressed as separate patterns, not as "a|b".',
+          'Structural pattern with $NAME and $$$NAME metavariables. Pass an array (or repeat --pattern) to search several patterns in one scan; complete scans report exact counts, while an unproven zero in a partial scan reports unknown. Regex syntax is never interpreted, so alternation is expressed as separate patterns, not as "a|b".',
       },
       language: {
         type: 'string',

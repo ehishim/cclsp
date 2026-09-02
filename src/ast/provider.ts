@@ -402,21 +402,32 @@ export class AstProvider {
         if ((indexInCandidates + 1) % 16 === 0) await yieldToEventLoop();
       }
 
-      const perPattern: AstPatternReport[] = requestedPatterns.map((raw, patternIndex) => {
-        const found = Math.min(perPatternCounts[patternIndex] ?? 0, boundedMaxResults);
-        const compiled = compiledPatterns[patternIndex];
-        const note =
-          found === 0 && compiled && compiled.metavariables.length === 0
-            ? zeroMatchNote(compiled.node, requestedPatterns.length)
-            : undefined;
-        return note !== undefined
-          ? { pattern: String(raw), matches: found, note }
-          : { pattern: String(raw), matches: found };
-      });
-
-      return {
-        outcome: 'ok',
-        provider: 'tree-sitter',
+      const completePerPattern: Array<Extract<AstPatternReport, { matches: number }>> =
+        requestedPatterns.map((raw, patternIndex) => {
+          const found = Math.min(perPatternCounts[patternIndex] ?? 0, boundedMaxResults);
+          const compiled = compiledPatterns[patternIndex];
+          const note =
+            found === 0 && compiled && compiled.metavariables.length === 0
+              ? zeroMatchNote(compiled.node, requestedPatterns.length)
+              : undefined;
+          return note !== undefined
+            ? { pattern: String(raw), matches: found, note }
+            : { pattern: String(raw), matches: found };
+        });
+      const searchIncomplete = parseFailureCount > 0;
+      const perPattern: AstPatternReport[] = searchIncomplete
+        ? completePerPattern.map((report) =>
+            report.matches === 0
+              ? {
+                  pattern: report.pattern,
+                  completeness: 'unknown',
+                  ...(report.note ? { note: report.note } : {}),
+                }
+              : { ...report, completeness: 'lower-bound' }
+          )
+        : completePerPattern;
+      const result = {
+        provider: 'tree-sitter' as const,
         language: input.language,
         matches,
         truncated,
@@ -428,6 +439,14 @@ export class AstProvider {
         parseFailureCount,
         failedFiles,
         perPattern,
+      };
+      if (!searchIncomplete) return { outcome: 'ok', ...result };
+      return {
+        outcome: 'partial',
+        code: 'AST_SEARCH_PARTIAL',
+        recovery:
+          'Retry with a narrower path that parses completely, or resolve parser/source compatibility for the named failed files before retrying.',
+        ...result,
       };
     } finally {
       for (const compiled of compiledPatterns) compiled.tree.delete();

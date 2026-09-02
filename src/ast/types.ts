@@ -77,17 +77,21 @@ export interface ExactStructuralMatch {
   captures: ExactAstCapture[];
 }
 
-export interface AstPatternReport {
-  pattern: string;
-  matches: number;
-  /**
-   * Present only when this pattern contributed nothing. A structural zero and a
-   * regex habit that happens to parse are otherwise indistinguishable, so the
-   * note carries the parsed node kind: a caller who wrote `a|b` sees it was read
-   * as a binary expression, while a genuinely absent name reads as an identifier.
-   */
-  note?: string;
-}
+export type AstPatternReport =
+  | {
+      pattern: string;
+      matches: number;
+      /** Omitted for an exact count; lower-bound means failed files may contain more. */
+      completeness?: 'lower-bound';
+      note?: string;
+    }
+  | {
+      pattern: string;
+      /** No numeric count is exposed when failed files make absence unprovable. */
+      matches?: never;
+      completeness: 'unknown';
+      note?: string;
+    };
 
 export interface AstSearchInput {
   /** One pattern, or several asked in a single scan. Never alternation syntax. */
@@ -97,8 +101,7 @@ export interface AstSearchInput {
   maxResults?: number;
 }
 
-export interface AstSearchOk {
-  outcome: 'ok';
+interface AstSearchResult {
   provider: 'tree-sitter';
   language: AstLanguage;
   matches: AstMatch[];
@@ -110,8 +113,18 @@ export interface AstSearchOk {
   partial: boolean;
   parseFailureCount: number;
   failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' }>;
-  /** One row per requested pattern, in request order, so a zero among several is attributable. */
+  /** One row per requested pattern, in request order. */
   perPattern: AstPatternReport[];
+}
+
+export interface AstSearchOk extends AstSearchResult {
+  outcome: 'ok';
+}
+
+export interface AstSearchPartial extends AstSearchResult {
+  outcome: 'partial';
+  code: 'AST_SEARCH_PARTIAL';
+  recovery: string;
 }
 
 export type AstErrorCode =
@@ -132,7 +145,7 @@ export interface AstRejected {
   cap?: number;
 }
 
-export type AstSearchOutcome = AstSearchOk | AstRejected;
+export type AstSearchOutcome = AstSearchOk | AstSearchPartial | AstRejected;
 
 export interface AstRewriteInput {
   pattern: string;

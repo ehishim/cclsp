@@ -565,6 +565,55 @@ describe('a structural zero must say which kind of zero it is', () => {
     });
   });
 
+  it('marks an unproven zero unknown when a directory scan skips parse failures', async () => {
+    await withProject(
+      {
+        'complete.ts': 'export function confirmed() {}\n',
+        'failed.ts': 'export function unproven( {\n',
+      },
+      async (_root, provider) => {
+        const partial = await provider.search({
+          pattern: ['confirmed', 'unproven'],
+          language: 'typescript',
+        });
+        expect(partial).toMatchObject({
+          outcome: 'partial',
+          code: 'AST_SEARCH_PARTIAL',
+          partial: true,
+          parseFailureCount: 1,
+          perPattern: [
+            { pattern: 'confirmed', matches: 1, completeness: 'lower-bound' },
+            { pattern: 'unproven', completeness: 'unknown' },
+          ],
+        });
+        expect(partial.outcome === 'partial' && partial.recovery).toContain('narrower path');
+        expect(partial.outcome === 'partial' && partial.perPattern[1]?.matches).toBeUndefined();
+
+        const confirmedOnly = await provider.search({
+          pattern: 'confirmed',
+          language: 'typescript',
+        });
+        expect(confirmedOnly).toMatchObject({
+          outcome: 'partial',
+          code: 'AST_SEARCH_PARTIAL',
+          partial: true,
+          perPattern: [{ pattern: 'confirmed', matches: 1, completeness: 'lower-bound' }],
+        });
+
+        const completeZero = await provider.search({
+          pattern: 'genuinelyAbsent',
+          language: 'typescript',
+          path: 'complete.ts',
+        });
+        expect(completeZero).toMatchObject({
+          outcome: 'ok',
+          partial: false,
+          perPattern: [{ pattern: 'genuinelyAbsent', matches: 0 }],
+        });
+      }
+    );
+  });
+
   it('refuses an unparseable pattern by naming which of several it was', async () => {
     await withProject(PROJECT, async (_root, provider) => {
       const result = await provider.search({

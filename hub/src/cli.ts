@@ -176,7 +176,7 @@ ROOTS & DAEMON
 
 CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd)
   ast_search              --pattern P [--pattern P2 ...] --language L [--path P]
-                          [--max-results N] [--root R]   (repeat --pattern: each reports its own count)
+                          [--max-results N] [--root R]   (repeat --pattern: exact counts require a complete scan)
   code_rewrite            --pattern P --replacement R --language L [--path P] [--root R]
                           [--dry-run=false --candidate-id ID]
   find_definition         --file F (--symbol-name NAME [--symbol-kind K] | --line N --character C)
