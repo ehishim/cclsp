@@ -49,12 +49,12 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.3",
+    "@repomix/tree-sitter-wasms": "^0.1.17",
     "@types/inquirer": "^9.0.8",
     "ignore": "^7.0.5",
     "inquirer": "^12.6.3",
-    "tree-sitter-wasms": "0.1.13",
     "typescript-language-server": "^4.3.4",
-    "web-tree-sitter": "0.24.7"
+    "web-tree-sitter": "^0.27.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",

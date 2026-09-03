@@ -37,6 +37,7 @@ const LANGUAGE_SMOKES = [
   ['go', 'sample.go', 'package p\nfunc f() {}\n', 'func f() {}'],
   ['rust', 'sample.rs', 'fn f() {}\n', 'fn f() {}'],
   ['java', 'Sample.java', 'class Sample {}\n', 'class Sample {}'],
+  ['css', 'sample.css', '.card { color: red; }\n', '.card { color: red; }'],
 ] as const;
 
 describe('AstProvider', () => {
@@ -565,41 +566,45 @@ describe('a structural zero must say which kind of zero it is', () => {
     });
   });
 
-  it('marks an unproven zero unknown when a directory scan skips parse failures', async () => {
+  it('searches a file the parser could only recover instead of discarding it', async () => {
     await withProject(
       {
         'complete.ts': 'export function confirmed() {}\n',
-        'failed.ts': 'export function unproven( {\n',
+        // Unparseable as a whole, yet `recoverable` is a real declaration inside
+        // it. Discarding the file loses that declaration to the parser's gap.
+        'failed.ts': 'export function recoverable() {}\nexport function broken( {\n',
       },
       async (_root, provider) => {
-        const partial = await provider.search({
-          pattern: ['confirmed', 'unproven'],
+        const scan = await provider.search({
+          pattern: ['confirmed', 'recoverable', 'genuinelyAbsent'],
           language: 'typescript',
         });
-        expect(partial).toMatchObject({
-          outcome: 'partial',
-          code: 'AST_SEARCH_PARTIAL',
-          partial: true,
-          parseFailureCount: 1,
-          perPattern: [
-            { pattern: 'confirmed', matches: 1, completeness: 'lower-bound' },
-            { pattern: 'unproven', completeness: 'unknown' },
-          ],
-        });
-        expect(partial.outcome === 'partial' && partial.recovery).toContain('narrower path');
-        expect(partial.outcome === 'partial' && partial.perPattern[1]?.matches).toBeUndefined();
+        if (scan.outcome !== 'partial') throw new Error(`expected partial, got ${scan.outcome}`);
 
-        const confirmedOnly = await provider.search({
-          pattern: 'confirmed',
-          language: 'typescript',
-        });
-        expect(confirmedOnly).toMatchObject({
-          outcome: 'partial',
-          code: 'AST_SEARCH_PARTIAL',
-          partial: true,
-          perPattern: [{ pattern: 'confirmed', matches: 1, completeness: 'lower-bound' }],
-        });
+        // The whole point: the declaration inside the unparseable file is found.
+        const recoveredMatch = scan.matches.find((match) => match.file.endsWith('failed.ts'));
+        expect(recoveredMatch?.text).toBe('recoverable');
+        expect(recoveredMatch?.recovered).toBe(true);
+        expect(scan.failedFiles).toEqual([
+          { file: expect.stringContaining('failed.ts'), code: 'AST_PARSE_RECOVERED' },
+        ]);
 
+        // A match from a sound file carries no recovered flag.
+        expect(
+          scan.matches.find((match) => match.file.endsWith('complete.ts'))?.recovered
+        ).toBeUndefined();
+
+        // The scan is still incomplete, so no count is exact and the genuinely
+        // absent pattern is unknown rather than a fabricated zero.
+        expect(scan.perPattern.map((row) => [row.pattern, row.completeness])).toEqual([
+          ['confirmed', 'lower-bound'],
+          ['recoverable', 'lower-bound'],
+          ['genuinelyAbsent', 'unknown'],
+        ]);
+        expect(scan.perPattern[2]?.matches).toBeUndefined();
+
+        // The negative control: over a scope the parser fully understands, an
+        // absent pattern is still an EXACT zero, so tolerance bought nothing.
         const completeZero = await provider.search({
           pattern: 'genuinelyAbsent',
           language: 'typescript',
@@ -624,6 +629,121 @@ describe('a structural zero must say which kind of zero it is', () => {
       expect(result.code).toBe('AST_PATTERN_INVALID');
       expect(result.reason).toContain('pattern 2 of 2');
     });
+  });
+
+  it('answers CSS structure at declaration, selector and value granularity', async () => {
+    await withProject(
+      {
+        // A real CSS-module shape: a class rule, a token-valued declaration and
+        // an at-rule the older grammar could not model.
+        'panel.module.css': [
+          '.panel {',
+          '  composes: base;',
+          '  color: var(--text-primary);',
+          '}',
+          '@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }',
+          '',
+        ].join('\n'),
+      },
+      async (_root, provider) => {
+        // Three pattern classes, because a CSS fragment is ambiguous and each one
+        // resolves through a different wrapper. `color: var(--text-primary)`
+        // parses DIRECTLY as a pseudo-class selector, so a declaration that
+        // matched only by accident would silently be a selector match.
+        const result = await provider.search({
+          pattern: [
+            'color: var(--text-primary)',
+            '.panel',
+            'var(--text-primary)',
+            'composes: base',
+          ],
+          language: 'css',
+        });
+        if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+        expect(result.provider).toBe('tree-sitter');
+        expect(result.parseFailureCount).toBe(0);
+        expect(result.perPattern.map((row) => [row.pattern, row.matches])).toEqual([
+          ['color: var(--text-primary)', 1],
+          ['.panel', 1],
+          ['var(--text-primary)', 1],
+          ['composes: base', 1],
+        ]);
+        expect(result.matches[0]?.recovered).toBeUndefined();
+
+        // The negative control for the language: a stylesheet the grammar fully
+        // parses still answers an absent pattern with an EXACT zero.
+        const absent = await provider.search({ pattern: 'color: magenta', language: 'css' });
+        if (absent.outcome !== 'ok') throw new Error(`expected ok, got ${absent.outcome}`);
+        expect(absent.perPattern[0]?.matches).toBe(0);
+      }
+    );
+  });
+
+  it('parses modern PHP completely and keeps its true negative exact', async () => {
+    await withProject(
+      {
+        // Forms that used to cost this file its whole result: 8.1 enum-body
+        // const, readonly promotion, first-class callable, 8.4 property hooks.
+        'Suit.php': [
+          '<?php',
+          'enum Suit: string {',
+          "  case Hearts = 'H';",
+          '  const Wild = self::Hearts;',
+          '  public function label(): string { return $this->name; }',
+          '}',
+          'final class Card {',
+          '  public function __construct(public readonly Suit $suit) {}',
+          '  public string $slug { get => $this->suit->value; }',
+          '}',
+          '$len = strlen(...);',
+          '',
+        ].join('\n'),
+      },
+      async (_root, provider) => {
+        const result = await provider.search({
+          pattern: ['label', 'Wild', 'absentSymbol'],
+          language: 'php',
+        });
+        if (result.outcome !== 'ok') throw new Error(`expected ok, got ${result.outcome}`);
+        expect(result.parseFailureCount).toBe(0);
+        expect(result.perPattern.map((row) => [row.pattern, row.matches])).toEqual([
+          ['label', 1],
+          ['Wild', 1],
+          // Exact, not unknown: nothing about this file is unparsed.
+          ['absentSymbol', 0],
+        ]);
+      }
+    );
+  });
+
+  it('recovers a genuinely broken PHP file instead of discarding its sound declarations', async () => {
+    await withProject(
+      {
+        'sound.php': '<?php function soundHelper() { return 1; }\n',
+        // Malformed on purpose. Tolerance must be language-general, not a
+        // TypeScript special case, and the sound declaration above the break
+        // must survive it.
+        'broken.php': '<?php function recoverableHelper() { return 2; }\nfunction broken( {\n',
+      },
+      async (_root, provider) => {
+        const result = await provider.search({
+          pattern: ['recoverableHelper', 'absentSymbol'],
+          language: 'php',
+        });
+        if (result.outcome !== 'partial')
+          throw new Error(`expected partial, got ${result.outcome}`);
+        const match = result.matches.find((row) => row.file.endsWith('broken.php'));
+        expect(match?.text).toBe('recoverableHelper');
+        expect(match?.recovered).toBe(true);
+        expect(result.failedFiles).toEqual([
+          { file: expect.stringContaining('broken.php'), code: 'AST_PARSE_RECOVERED' },
+        ]);
+        expect(result.perPattern.map((row) => [row.pattern, row.completeness])).toEqual([
+          ['recoverableHelper', 'lower-bound'],
+          ['absentSymbol', 'unknown'],
+        ]);
+      }
+    );
   });
 
   it('never reports a pattern absent because an earlier pattern spent the budget', async () => {

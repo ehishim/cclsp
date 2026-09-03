@@ -1,4 +1,4 @@
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import type { GrammarRegistry } from './grammar-registry.js';
 import {
   AST_MAX_METAVARIABLES,
@@ -73,28 +73,46 @@ function wrappers(source: string, language: AstLanguage): WrappedPattern[] {
         },
       ];
     }
+    case 'css': {
+      // A CSS fragment is ambiguous on its own, so the order below IS the
+      // contract: a complete rule parses directly, then a declaration, then a
+      // selector or at-rule prelude, and only then a value fragment. `#fff`
+      // compiles as both a selector and a value; the order makes it a selector.
+      const declaration = '_{';
+      const value = '_{_:';
+      // Order is the contract, and it is not arbitrary: `color: var(--x)` parses
+      // DIRECTLY as a pseudo-class selector (`tag:pseudo(...)`), which is never
+      // what a caller means, so the declaration wrapper must be tried first. A
+      // complete rule then still resolves through the direct form.
+      return [
+        {
+          text: `${declaration}${source};}`,
+          start: declaration.length,
+          end: declaration.length + source.length,
+        },
+        direct,
+        { text: `${source}{}`, start: 0, end: source.length },
+        { text: `${value}${source};}`, start: value.length, end: value.length + source.length },
+      ];
+    }
   }
 }
 
-function containsMissing(node: Parser.SyntaxNode): boolean {
+function containsMissing(node: TsNode): boolean {
   if (node.isMissing || node.isError) return true;
   return node.children.some(containsMissing);
 }
 
-function countNodes(node: Parser.SyntaxNode): number {
+function countNodes(node: TsNode): number {
   let count = 1;
   for (const child of node.namedChildren) count += countNodes(child);
   return count;
 }
 
-function nodeForPattern(
-  tree: Parser.Tree,
-  start: number,
-  end: number
-): Parser.SyntaxNode | undefined {
+function nodeForPattern(tree: TsTree, start: number, end: number): TsNode | undefined {
   if (end <= start) return undefined;
   const node = tree.rootNode.namedDescendantForIndex(start, end - 1);
-  if (node.startIndex > start || node.endIndex < end) return undefined;
+  if (!node || node.startIndex > start || node.endIndex < end) return undefined;
   return node;
 }
 

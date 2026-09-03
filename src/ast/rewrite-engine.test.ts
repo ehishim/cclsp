@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import { RewriteBuildError, RewriteEngine, type RewriteSourceFile } from './rewrite-engine.js';
 import type { CompiledPattern, ExactStructuralMatch } from './types.js';
 
@@ -33,8 +33,8 @@ function match(
 
 function compiled(variables: Array<{ name: string; variadic?: boolean }>): CompiledPattern {
   return {
-    tree: {} as Parser.Tree,
-    node: {} as Parser.SyntaxNode,
+    tree: {} as TsTree,
+    node: {} as TsNode,
     metavariables: variables.map((variable, order) => ({
       name: variable.name,
       variadic: variable.variadic ?? false,

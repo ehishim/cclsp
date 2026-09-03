@@ -104,6 +104,47 @@ describe('ast_search tool', () => {
     expect(result.content[0]?.text).not.toContain('0 match(es)');
   });
 
+  it('tells a recovered file apart from an unreadable one, and marks its matches', async () => {
+    const result = await astSearchTool.handler(
+      { pattern: 'writeCliPolicyCreate', language: 'typescript' },
+      client({
+        outcome: 'partial',
+        code: 'AST_SEARCH_PARTIAL',
+        recovery: 'Retry with a narrower path that parses completely.',
+        provider: 'tree-sitter',
+        language: 'typescript',
+        matches: [
+          {
+            file: '/root/recovered.ts',
+            range: { start: { line: 10, character: 16 }, end: { line: 10, character: 36 } },
+            text: 'writeCliPolicyCreate',
+            captures: [],
+            recovered: true,
+          },
+        ],
+        truncated: false,
+        effectiveMaxResults: 100,
+        filesScanned: 2,
+        filesSkippedOversized: 0,
+        indexCapped: false,
+        partial: true,
+        parseFailureCount: 2,
+        failedFiles: [
+          { file: '/root/recovered.ts', code: 'AST_PARSE_RECOVERED' },
+          { file: '/root/unreadable.ts', code: 'AST_PARSE_FAILED' },
+        ],
+        perPattern: [{ pattern: 'writeCliPolicyCreate', matches: 1, completeness: 'lower-bound' }],
+      })
+    );
+    const text = result.content[0]?.text ?? '';
+    // A recovered file WAS searched, so the reader must not be told it failed.
+    expect(text).toContain('/root/recovered.ts: AST_PARSE_RECOVERED — searched from a recovered');
+    expect(text).toContain('/root/unreadable.ts: AST_PARSE_FAILED — unreadable — not searched');
+    // The match itself carries where it came from, so a count is never read as exact.
+    expect(text).toContain('/root/recovered.ts:11:17 (recovered file)');
+    expect(text).toContain('searched 2 file(s) but cannot prove absence');
+  });
+
   it('preserves an exact zero when the scan is complete', async () => {
     const result = await astSearchTool.handler(
       { pattern: 'absent', language: 'typescript' },

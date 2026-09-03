@@ -1,6 +1,17 @@
-import type { AstPatternReport, AstSearchOutcome } from '../ast/types.js';
+import { AST_LANGUAGES, type AstPatternReport, type AstSearchOutcome } from '../ast/types.js';
 import { codeRewriteTool } from './code-rewrite.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
+
+/**
+ * The two incomplete-file codes mean opposite things to a reader, so the text
+ * says which one happened. A failed file was never searched, so it may hide
+ * anything; a recovered file WAS searched, so its matches are real and only its
+ * silence is unproven. Rendering both as "failed" would throw that away.
+ */
+const INCOMPLETE_FILE_MEANING = {
+  AST_PARSE_FAILED: 'unreadable — not searched',
+  AST_PARSE_RECOVERED: 'searched from a recovered tree — absence here is unproven',
+} as const;
 
 function renderPatternRow(report: AstPatternReport): string {
   const count =
@@ -37,7 +48,8 @@ function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'part
           return `  $${capture.variadic ? '$$' : ''}${capture.name} @ ${captureStart.line + 1}:${captureStart.character + 1} = ${capture.text}`;
         })
         .join('\n');
-      return `${match.file}:${start.line + 1}:${start.character + 1}\n${match.text}${captures ? `\n${captures}` : ''}`;
+      const origin = match.recovered ? ' (recovered file)' : '';
+      return `${match.file}:${start.line + 1}:${start.character + 1}${origin}\n${match.text}${captures ? `\n${captures}` : ''}`;
     })
     .join('\n\n');
 }
@@ -45,15 +57,17 @@ function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'part
 function renderText(result: AstSearchOutcome): string {
   if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
   if (result.outcome === 'partial') {
-    const header = `${result.code}: AST search (${result.provider}, ${result.language}) could not establish absence because ${result.parseFailureCount} file(s) failed to parse after ${result.filesScanned} file(s) parsed.`;
+    const header = `${result.code}: AST search (${result.provider}, ${result.language}) searched ${result.filesScanned} file(s) but cannot prove absence: ${result.parseFailureCount} file(s) did not parse completely.`;
     const breakdown = result.perPattern.map(renderPatternRow).join('\n');
     const failedFiles = result.failedFiles
-      .map((failure) => `  ${failure.file}: ${failure.code}`)
+      .map(
+        (failure) => `  ${failure.file}: ${failure.code} — ${INCOMPLETE_FILE_MEANING[failure.code]}`
+      )
       .join('\n');
     const summary = [
       header,
       breakdown,
-      `Failed files (${result.failedFiles.length}/${result.parseFailureCount} shown):`,
+      `Incomplete files (${result.failedFiles.length}/${result.parseFailureCount} shown):`,
       failedFiles,
       `Recovery: ${result.recovery}`,
     ]
@@ -94,7 +108,9 @@ export const astSearchTool: ToolDefinition = {
       },
       language: {
         type: 'string',
-        description: 'typescript, tsx, javascript, jsx, python, php, go, rust, or java',
+        // Derived from the one language table, so an added language can never
+        // ship a schema that still advertises the old set.
+        description: AST_LANGUAGES.join(', '),
       },
       path: {
         type: 'string',

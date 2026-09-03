@@ -1,4 +1,4 @@
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import type { DocumentSymbol, Location, SymbolInformation } from '../lsp/types.js';
 
 export const AST_MAX_FILE_BYTES = 512 * 1024;
@@ -19,19 +19,35 @@ export const AST_REWRITE_MAX_TRANSACTION_BYTES = 16 * 1024 * 1024;
 export const AST_REWRITE_GENERATED_SCAN_CHARACTERS = 2_048;
 export const AST_REWRITE_PREVIEW_TEXT_BYTES = 4_096;
 
-export const AST_LANGUAGES = [
-  'typescript',
-  'tsx',
-  'javascript',
-  'jsx',
-  'python',
-  'php',
-  'go',
-  'rust',
-  'java',
-] as const;
+/**
+ * One owner for everything that differs per language: which grammar parses it
+ * and which file extensions select it. Every admitted language gets the same
+ * search and rewrite contract, so a new language is a row here and never a
+ * branch at a call site.
+ */
+export interface AstLanguageDefinition {
+  readonly grammarAsset: string;
+  readonly extensions: readonly string[];
+}
 
-export type AstLanguage = (typeof AST_LANGUAGES)[number];
+export const AST_LANGUAGE_DEFINITIONS = {
+  typescript: { grammarAsset: 'tree-sitter-typescript.wasm', extensions: ['.ts'] },
+  tsx: { grammarAsset: 'tree-sitter-tsx.wasm', extensions: ['.tsx'] },
+  javascript: { grammarAsset: 'tree-sitter-javascript.wasm', extensions: ['.js', '.mjs', '.cjs'] },
+  jsx: { grammarAsset: 'tree-sitter-javascript.wasm', extensions: ['.jsx'] },
+  python: { grammarAsset: 'tree-sitter-python.wasm', extensions: ['.py'] },
+  php: { grammarAsset: 'tree-sitter-php.wasm', extensions: ['.php'] },
+  go: { grammarAsset: 'tree-sitter-go.wasm', extensions: ['.go'] },
+  rust: { grammarAsset: 'tree-sitter-rust.wasm', extensions: ['.rs'] },
+  java: { grammarAsset: 'tree-sitter-java.wasm', extensions: ['.java'] },
+  // `.scss`/`.less` stay unmapped: no grammar asset ships for them, and reading
+  // them as CSS would manufacture parse failures for a dialect nobody wrote here.
+  css: { grammarAsset: 'tree-sitter-css.wasm', extensions: ['.css'] },
+} as const satisfies Record<string, AstLanguageDefinition>;
+
+export type AstLanguage = keyof typeof AST_LANGUAGE_DEFINITIONS;
+
+export const AST_LANGUAGES = Object.keys(AST_LANGUAGE_DEFINITIONS) as readonly AstLanguage[];
 export type Provider = 'lsp' | 'tree-sitter' | 'none';
 
 export interface AstRange {
@@ -61,6 +77,8 @@ export interface AstMatch {
   range: AstRange;
   text: string;
   captures: AstCapture[];
+  /** Present when the match came from a tree the parser recovered: presence evidence, never an exact count. */
+  recovered?: true;
 }
 
 export interface ExactAstCapture extends AstCapture {
@@ -112,7 +130,7 @@ interface AstSearchResult {
   indexCapped: boolean;
   partial: boolean;
   parseFailureCount: number;
-  failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' }>;
+  failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' | 'AST_PARSE_RECOVERED' }>;
   /** One row per requested pattern, in request order. */
   perPattern: AstPatternReport[];
 }
@@ -322,7 +340,7 @@ export interface CachedTree {
   mtimeMs: number;
   bytes: number;
   source: string;
-  tree: Parser.Tree;
+  tree: TsTree;
   lastUsed: number;
 }
 
@@ -334,7 +352,7 @@ export interface PatternMetavariable {
 }
 
 export interface CompiledPattern {
-  tree: Parser.Tree;
-  node: Parser.SyntaxNode;
+  tree: TsTree;
+  node: TsNode;
   metavariables: PatternMetavariable[];
 }

@@ -1,4 +1,4 @@
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode } from 'web-tree-sitter';
 import type { AstRange } from './types.js';
 
 // web-tree-sitter indexes JavaScript string input in UTF-16 code units, matching LSP columns.
@@ -15,7 +15,7 @@ export class SourceLocator {
     return this.source.slice(startIndex, endIndex);
   }
 
-  range(node: Parser.SyntaxNode): AstRange {
+  range(node: TsNode): AstRange {
     return {
       start: { line: node.startPosition.row, character: node.startPosition.column },
       end: { line: node.endPosition.row, character: node.endPosition.column },

@@ -1,4 +1,4 @@
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import { SourceLocator } from './source-locator.js';
 import {
   AST_MAX_CAPTURE_TEXT_BYTES,
@@ -34,7 +34,7 @@ function truncateUtf8(text: string, maxBytes: number): string {
   return result;
 }
 
-function anonymousSignature(node: Parser.SyntaxNode): string[] {
+function anonymousSignature(node: TsNode): string[] {
   return node.children
     .filter((child) => !child.isNamed && !child.isExtra && !IGNORED_ANONYMOUS.has(child.type))
     .map((child) => child.type);
@@ -49,7 +49,7 @@ function captureFingerprint(bindings: Map<string, BoundCapture>): string {
 
 export class SearchEngine {
   search(
-    tree: Parser.Tree,
+    tree: TsTree,
     source: string,
     compiled: CompiledPattern,
     file: string,
@@ -67,7 +67,7 @@ export class SearchEngine {
   }
 
   searchExact(
-    tree: Parser.Tree,
+    tree: TsTree,
     source: string,
     compiled: CompiledPattern,
     file: string,
@@ -79,7 +79,7 @@ export class SearchEngine {
       compiled.metavariables.map((variable) => [variable.sentinel, variable])
     );
 
-    const visit = (node: Parser.SyntaxNode): void => {
+    const visit = (node: TsNode): void => {
       if (results.length >= maxResults) return;
       const bindings = this.matchNode(compiled.node, node, locator, variables, new Map());
       if (bindings) {
@@ -115,8 +115,8 @@ export class SearchEngine {
   }
 
   private matchNode(
-    pattern: Parser.SyntaxNode,
-    sourceNode: Parser.SyntaxNode,
+    pattern: TsNode,
+    sourceNode: TsNode,
     locator: SourceLocator,
     variables: Map<string, PatternMetavariable>,
     bindings: Map<string, BoundCapture>
@@ -147,8 +147,8 @@ export class SearchEngine {
   }
 
   private matchChildren(
-    patternParent: Parser.SyntaxNode,
-    sourceParent: Parser.SyntaxNode,
+    patternParent: TsNode,
+    sourceParent: TsNode,
     locator: SourceLocator,
     variables: Map<string, PatternMetavariable>,
     initial: Map<string, BoundCapture>

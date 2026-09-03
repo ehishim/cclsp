@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type Parser from 'web-tree-sitter';
+import type { Tree as TsTree } from 'web-tree-sitter';
 import { AST_MAX_FILES, AST_MAX_FILE_BYTES } from './types.js';
 import { WorkspaceIndex } from './workspace-index.js';
 
@@ -53,7 +53,7 @@ describe('WorkspaceIndex maximum representative scope', () => {
           delete: () => {
             deleted[entry] = (deleted[entry] ?? 0) + 1;
           },
-        } as unknown as Parser.Tree;
+        } as unknown as TsTree;
         index.setCachedTree(
           {
             path: join(root, `${entry}.ts`),
@@ -88,7 +88,7 @@ describe('WorkspaceIndex maximum representative scope', () => {
             mtimeMs: entry,
             bytes: 1024 * 1024,
             source: '',
-            tree: { delete: () => deleted++ } as unknown as Parser.Tree,
+            tree: { delete: () => deleted++ } as unknown as TsTree,
           },
           'typescript'
         );
@@ -99,6 +99,27 @@ describe('WorkspaceIndex maximum representative scope', () => {
       await rm(root, { recursive: true, force: true });
     }
     expect(deleted).toBe(65);
+  });
+
+  it('indexes .css and leaves the preprocessor dialects unmapped', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-index-css-'));
+    let index: WorkspaceIndex | undefined;
+    try {
+      await writeFile(join(root, 'panel.module.css'), '.panel { color: red; }\n');
+      // No grammar asset ships for these dialects, and parsing them as CSS would
+      // manufacture failures for a syntax nobody claimed to support.
+      await writeFile(join(root, 'legacy.scss'), '$c: red;\n.panel { color: $c; }\n');
+      await writeFile(join(root, 'legacy.less'), '@c: red;\n.panel { color: @c; }\n');
+
+      index = await WorkspaceIndex.create(root);
+      const snapshot = await index.ensure();
+      expect(snapshot.files.map((file) => [file.relativePath, file.language]).sort()).toEqual([
+        ['panel.module.css', 'css'],
+      ]);
+    } finally {
+      index?.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('coalesces a deterministic gitignore-aware 5,000-file index and rebuilds its capped prefix', async () => {

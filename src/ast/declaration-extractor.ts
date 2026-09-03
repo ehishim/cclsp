@@ -1,4 +1,4 @@
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import { type DocumentSymbol, SymbolKind } from '../lsp/types.js';
 import { SourceLocator } from './source-locator.js';
 import type { AstLanguage } from './types.js';
@@ -33,7 +33,7 @@ const KIND_BY_NODE: Record<string, SymbolKind> = {
   property_declaration: SymbolKind.Property,
 };
 
-function findName(node: Parser.SyntaxNode): Parser.SyntaxNode | undefined {
+function findName(node: TsNode): TsNode | undefined {
   const field = node.childForFieldName('name') ?? node.childForFieldName('declarator');
   if (field) {
     if (
@@ -60,7 +60,7 @@ function findName(node: Parser.SyntaxNode): Parser.SyntaxNode | undefined {
   ])[0];
 }
 
-function hasAncestor(node: Parser.SyntaxNode, type: string): boolean {
+function hasAncestor(node: TsNode, type: string): boolean {
   let parent = node.parent;
   while (parent) {
     if (parent.type === type) return true;
@@ -69,7 +69,7 @@ function hasAncestor(node: Parser.SyntaxNode, type: string): boolean {
   return false;
 }
 
-function kindFor(node: Parser.SyntaxNode, parentKind?: SymbolKind): SymbolKind | undefined {
+function kindFor(node: TsNode, parentKind?: SymbolKind): SymbolKind | undefined {
   const mapped = KIND_BY_NODE[node.type];
   if (!mapped) return undefined;
   if (node.type === 'type_spec') {
@@ -92,12 +92,12 @@ function kindFor(node: Parser.SyntaxNode, parentKind?: SymbolKind): SymbolKind |
 }
 
 export function extractDeclarations(
-  tree: Parser.Tree,
+  tree: TsTree,
   source: string,
   _language: AstLanguage
 ): DocumentSymbol[] {
   const locator = new SourceLocator(source);
-  const visit = (node: Parser.SyntaxNode, parentKind?: SymbolKind): DocumentSymbol[] => {
+  const visit = (node: TsNode, parentKind?: SymbolKind): DocumentSymbol[] => {
     const kind = kindFor(node, parentKind);
     const nameNode = kind ? findName(node) : undefined;
     if (kind && nameNode) {

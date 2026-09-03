@@ -59,8 +59,9 @@ npm run prepublishOnly  # build + test + typecheck
 
 **AST Provider** (`src/ast/`)
 
-- Loads installed Tree-sitter/WASM grammars for TypeScript/TSX, JavaScript/JSX, Python, PHP, Go, Rust, and Java without request-time downloads
+- Loads installed Tree-sitter/WASM grammars for TypeScript/TSX, JavaScript/JSX, Python, PHP, Go, Rust, Java, and CSS without request-time downloads. `AST_LANGUAGE_DEFINITIONS` in `src/ast/types.ts` is the single owner of which grammar and which file extensions each language uses; the registry, the index and the tool schemas all derive from it. `.scss`/`.less` are deliberately unmapped: no grammar ships for them, and reading them as CSS would manufacture parse failures.
 - Owns a root-contained, gitignore-aware index capped at 5,000 files and 512 KiB per file
+- Uses Tree-sitter's error recovery as designed: a tree carrying parse errors is searched rather than discarded, so a grammar gap in one region never hides declarations that parsed correctly. Matches from such a file come back with `recovered: true` and the file is named `AST_PARSE_RECOVERED`; absence over that scope stays unproven
 - Exposes structural patterns with `$NAME` single-node and `$$$NAME` variadic captures
 - Builds root-bound structural rewrite previews and candidate identities; `file-editor.ts` owns exact-byte atomic commit/rollback and `LSPClient` owns strict provider synchronization
 - Supplies explicitly syntax-only declaration, document-symbol, and query-position fallback when no configured LSP exists or the selected server does not support the required method
@@ -168,7 +169,7 @@ bun run lint:fix && bun run format && bun run typecheck && bun run test
 
 `ast_search(pattern, language, path?, max_results?)` is an offline structural-search tool. `language` is required. A relative `path` resolves under the registered root, and canonical path checks reject traversal or symlink escape. `max_results` defaults to 100 and is capped at 1,000.
 
-Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, explicit oversized files, and parse failures are typed `AST_*` rejections. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
+Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, and explicit oversized files are typed `AST_*` rejections, and an explicitly named unparseable file is still `AST_PARSE_FAILED`. In a directory scan a file the parser could only recover is searched instead of skipped: its matches are returned as `recovered` presence evidence, the file is listed as `AST_PARSE_RECOVERED`, and the result stays `partial` so no zero over that scope is read as absence. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
 
 Tree-sitter evidence is syntax-only. Never use it as semantic proof for references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety.
 

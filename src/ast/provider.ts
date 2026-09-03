@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { lstat, open, realpath, stat } from 'node:fs/promises';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import type Parser from 'web-tree-sitter';
+import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import { type Location, SymbolKind } from '../lsp/types.js';
 import { pathToUri } from '../utils.js';
 import { extractDeclarations } from './declaration-extractor.js';
@@ -99,7 +99,7 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
  * node alone therefore missed exactly the shape a regex habit reaches for first.
  * Matched structurally rather than by grammar name so this holds across languages.
  */
-function unwrapGrouping(node: Parser.SyntaxNode): Parser.SyntaxNode {
+function unwrapGrouping(node: TsNode): TsNode {
   let current = node;
   while (current.type.includes('parenthes') && current.namedChildren.length === 1) {
     const inner = current.namedChildren[0];
@@ -109,12 +109,12 @@ function unwrapGrouping(node: Parser.SyntaxNode): Parser.SyntaxNode {
   return current;
 }
 
-function alternationOperator(node: Parser.SyntaxNode): string | undefined {
+function alternationOperator(node: TsNode): string | undefined {
   return unwrapGrouping(node).children.find((child) => child.type === '|' || child.type === '||')
     ?.type;
 }
 
-function zeroMatchNote(node: Parser.SyntaxNode, patternCount: number): string | undefined {
+function zeroMatchNote(node: TsNode, patternCount: number): string | undefined {
   const operator = alternationOperator(node);
   if (operator === undefined) return undefined;
   // Name the operator that was actually applied. `|` is bitwise and `||` is logical,
@@ -332,7 +332,8 @@ export class AstProvider {
 
       const matches = [];
       const perPatternCounts: number[] = new Array(compiledPatterns.length).fill(0);
-      const failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' }> = [];
+      const failedFiles: Array<{ file: string; code: 'AST_PARSE_FAILED' | 'AST_PARSE_RECOVERED' }> =
+        [];
       let parseFailureCount = 0;
       let filesScanned = 0;
       let truncated = false;
@@ -340,10 +341,9 @@ export class AstProvider {
       for (let indexInCandidates = 0; indexInCandidates < candidates.length; indexInCandidates++) {
         const file = candidates[indexInCandidates];
         if (!file) continue;
-        let parsed: { tree: Parser.Tree; source: string };
+        let parsed: { tree: TsTree; source: string };
         try {
           parsed = await this.getFreshTree(index, file, input.language);
-          if (parsed.tree.rootNode.hasError) throw new Error('source tree contains parse errors');
         } catch (error) {
           if (error instanceof OversizedFileError) {
             if (explicitFile) {
@@ -370,6 +370,25 @@ export class AstProvider {
           }
           continue;
         }
+        // Tree-sitter recovers from a syntax it cannot model, and the recovered
+        // tree still holds every subtree that did parse. Discarding it loses real
+        // declarations to a grammar gap, which is the false absence this tier
+        // exists to prevent; searching it reports presence while absence over
+        // this file stays unproven.
+        const recovered = parsed.tree.rootNode.hasError;
+        if (recovered) {
+          if (explicitFile) {
+            return rejected(
+              'tree-sitter',
+              'AST_PARSE_FAILED',
+              `Failed to parse ${file.absolutePath}`
+            );
+          }
+          parseFailureCount++;
+          if (failedFiles.length < AST_MAX_FAILED_FILES) {
+            failedFiles.push({ file: file.absolutePath, code: 'AST_PARSE_RECOVERED' });
+          }
+        }
         filesScanned++;
         for (let patternIndex = 0; patternIndex < compiledPatterns.length; patternIndex++) {
           const compiled = compiledPatterns[patternIndex];
@@ -391,7 +410,14 @@ export class AstProvider {
           perPatternCounts[patternIndex] = alreadyFound + fileMatches.length;
           const storable = Math.max(0, boundedMaxResults - matches.length);
           if (fileMatches.length > storable) truncated = true;
-          if (storable > 0) matches.push(...fileMatches.slice(0, storable));
+          if (storable > 0) {
+            const storing = fileMatches.slice(0, storable);
+            matches.push(
+              ...(recovered
+                ? storing.map((match) => ({ ...match, recovered: true as const }))
+                : storing)
+            );
+          }
         }
         // Stopping early is only safe once every pattern has proven itself
         // present: a pattern still at zero must be scanned to exhaustion, or its
@@ -740,7 +766,7 @@ export class AstProvider {
       const imports: AstQueryOccurrence[] = [];
       const other: AstQueryOccurrence[] = [];
       let otherTruncated = false;
-      const visit = (node: Parser.SyntaxNode, importBinding: boolean): void => {
+      const visit = (node: TsNode, importBinding: boolean): void => {
         const isImportBinding =
           importBinding ||
           node.type.includes('import') ||
@@ -858,7 +884,7 @@ export class AstProvider {
     index: WorkspaceIndex,
     file: IndexedFile,
     language: AstLanguage
-  ): Promise<{ tree: Parser.Tree; source: string }> {
+  ): Promise<{ tree: TsTree; source: string }> {
     const current = await readBoundedSource(file.absolutePath);
     const { source } = current;
     const contentHash = createHash('sha256').update(source).digest('hex');

@@ -3,6 +3,7 @@ import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Ignore } from 'ignore';
 import { loadGitignore } from '../file-scanner.js';
 import {
+  AST_LANGUAGE_DEFINITIONS,
   AST_MAX_FILES,
   AST_MAX_FILE_BYTES,
   AST_TREE_CACHE_BYTES,
@@ -14,19 +15,13 @@ import {
   type WorkspaceSnapshot,
 } from './types.js';
 
-const LANGUAGE_BY_EXTENSION: Record<string, AstLanguage> = {
-  '.ts': 'typescript',
-  '.tsx': 'tsx',
-  '.js': 'javascript',
-  '.jsx': 'jsx',
-  '.mjs': 'javascript',
-  '.cjs': 'javascript',
-  '.py': 'python',
-  '.php': 'php',
-  '.go': 'go',
-  '.rs': 'rust',
-  '.java': 'java',
-};
+// Derived from the one language owner, so an added language never needs a second
+// table to be updated in step.
+const LANGUAGE_BY_EXTENSION: Record<string, AstLanguage> = Object.fromEntries(
+  Object.entries(AST_LANGUAGE_DEFINITIONS).flatMap(([language, definition]) =>
+    definition.extensions.map((extension) => [extension, language as AstLanguage])
+  )
+);
 
 interface ScanResult {
   files: IndexedFile[];

@@ -1,4 +1,4 @@
-import type { AstRewriteOutcome } from '../ast/types.js';
+import { AST_LANGUAGES, type AstRewriteOutcome } from '../ast/types.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
 
 function renderRollback(
@@ -52,7 +52,9 @@ export const codeRewriteTool: ToolDefinition = {
       },
       language: {
         type: 'string',
-        description: 'typescript, tsx, javascript, jsx, python, php, go, rust, or java',
+        // Derived from the one language table, so an added language can never
+        // ship a schema that still advertises the old set.
+        description: AST_LANGUAGES.join(', '),
       },
       path: {
         type: 'string',

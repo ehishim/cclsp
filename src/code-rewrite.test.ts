@@ -88,6 +88,92 @@ describe('code_rewrite', () => {
     );
   });
 
+  it('rewrites CSS through the same contract as every other language', async () => {
+    // CSS carries no per-language exception: the preview, the exact candidate,
+    // the atomic apply and the parse validation are language-agnostic, so a
+    // refusal here would be a special case with no mechanism behind it.
+    await withClient(
+      { 'panel.module.css': '.panel {\n  color: red;\n}\n' },
+      async (root, client) => {
+        const input = {
+          pattern: 'color: red',
+          // A CSS declaration node carries its own terminating `;`, exactly as a
+          // statement does in every other language here, so the replacement
+          // supplies one. Preview shows the matched bytes before anything moves.
+          replacement: 'color: var(--danger);',
+          language: 'css',
+          path: 'panel.module.css',
+        };
+        const preview = ok(await client.codeRewrite(input));
+        expect(preview).toMatchObject({ dryRun: true, changesPlanned: 1, filesChanged: 1 });
+        expect(preview.changes[0]?.before).toBe('color: red;');
+        expect(await readFile(join(root, 'panel.module.css'), 'utf8')).toContain('color: red;');
+
+        const applied = ok(
+          await client.codeRewrite({ ...input, dryRun: false, candidateId: preview.candidateId })
+        );
+        expect(applied).toMatchObject({ dryRun: false, changesApplied: 1 });
+        expect(await readFile(join(root, 'panel.module.css'), 'utf8')).toBe(
+          '.panel {\n  color: var(--danger);\n}\n'
+        );
+      }
+    );
+  });
+
+  it('never lets a tree the parser only recovered authorise a byte mutation', async () => {
+    // The load-bearing safety boundary of error-tolerant SEARCH: search reads a
+    // recovered tree as presence evidence, but a rewrite computes byte ranges
+    // from it, and a range derived from an unparsed region would corrupt the
+    // file. Refusal here is what makes tolerance safe over there.
+    await withClient(
+      {
+        'sound.ts': 'const sound = foo(1);\n',
+        'broken.ts': 'const broken = foo(2);\nfunction wrong( {\n',
+        'style.css': '.panel { color: red; }\n@custom-variant dark (&:where(\n',
+      },
+      async (root, client) => {
+        const before = await readFile(join(root, 'broken.ts'), 'utf8');
+
+        const explicit = await client.codeRewrite({
+          pattern: 'foo($ARG)',
+          replacement: 'bar($ARG)',
+          language: 'typescript',
+          path: 'broken.ts',
+        });
+        expect(explicit).toMatchObject({
+          outcome: 'rejected',
+          code: 'AST_PARSE_FAILED',
+        });
+
+        // A directory scope must refuse too, rather than quietly rewriting the
+        // sound file and leaving the scope half-applied.
+        const scope = await client.codeRewrite({
+          pattern: 'foo($ARG)',
+          replacement: 'bar($ARG)',
+          language: 'typescript',
+        });
+        expect(scope).toMatchObject({
+          outcome: 'rejected',
+          code: 'AST_REWRITE_SCOPE_INCOMPLETE',
+        });
+
+        // CSS carries no exception in either direction: it is admitted for
+        // rewrite, and refused on an error-bearing source like every language.
+        expect(
+          await client.codeRewrite({
+            pattern: 'color: red',
+            replacement: 'color: blue;',
+            language: 'css',
+            path: 'style.css',
+          })
+        ).toMatchObject({ outcome: 'rejected', code: 'AST_PARSE_FAILED' });
+
+        expect(await readFile(join(root, 'broken.ts'), 'utf8')).toBe(before);
+        expect(await readFile(join(root, 'sound.ts'), 'utf8')).toBe('const sound = foo(1);\n');
+      }
+    );
+  });
+
   it('serializes concurrent apply calls so only one candidate mutates', async () => {
     await withClient({ 'a.ts': 'const a = foo(1);\n' }, async (root, client) => {
       const input = {
