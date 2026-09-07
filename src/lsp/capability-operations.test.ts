@@ -6,12 +6,14 @@ import { LspToolOutcomeError } from './capabilities.js';
 import { DiagnosticsCache } from './diagnostics.js';
 import { DocumentManager } from './document-manager.js';
 import {
+  findReferences,
   findTypeDefinition,
   getCompletions,
   getDiagnosticsBatch,
   getDocumentSymbols,
   renameSymbol,
   resolveCompletionItem,
+  willRenameFiles,
 } from './operations.js';
 import type { ServerState } from './types.js';
 
@@ -109,6 +111,73 @@ describe('capability-gated operations', () => {
       expect.any(Object),
       30000
     );
+  });
+
+  it('refuses semantic rows when the provider cannot confirm project readiness', async () => {
+    const sendRequest = jest.fn();
+    const state = server({ referencesProvider: true }, sendRequest);
+    state.adapter = {
+      name: 'fixture',
+      matches: () => true,
+      waitForProjectReady: jest.fn().mockResolvedValue(false),
+    };
+
+    await expect(
+      findReferences(state, TEST_FILE, { line: 0, character: 13 })
+    ).rejects.toMatchObject({
+      outcome: {
+        outcome: 'stale',
+        code: 'LSP_PROJECT_NOT_READY',
+        method: 'project readiness',
+      },
+    });
+    expect(state.adapter.waitForProjectReady).toHaveBeenCalledWith(state, TEST_FILE, 30000);
+    expect(sendRequest).not.toHaveBeenCalled();
+  });
+
+  it('requests references only after provider project readiness', async () => {
+    const order: string[] = [];
+    const sendRequest = jest.fn().mockImplementation(async () => {
+      order.push('references');
+      return [];
+    });
+    const state = server({ referencesProvider: true }, sendRequest);
+    state.adapter = {
+      name: 'fixture',
+      matches: () => true,
+      waitForProjectReady: async () => {
+        order.push('ready');
+        return true;
+      },
+    };
+
+    expect(await findReferences(state, TEST_FILE, { line: 0, character: 13 })).toEqual([]);
+    expect(order).toEqual(['ready', 'references']);
+  });
+
+  it('gates file rename edits before requesting workspace changes', async () => {
+    const sendRequest = jest.fn();
+    const state = server(
+      {
+        workspace: {
+          fileOperations: {
+            willRename: { filters: [{ scheme: 'file', pattern: { glob: '**/*.ts' } }] },
+          },
+        },
+      },
+      sendRequest
+    );
+    state.adapter = {
+      name: 'fixture',
+      matches: () => true,
+      waitForProjectReady: jest.fn().mockResolvedValue(false),
+    };
+
+    await expect(willRenameFiles(state, TEST_FILE, `${TEST_FILE}.moved.ts`)).rejects.toMatchObject({
+      outcome: { code: 'LSP_PROJECT_NOT_READY' },
+    });
+    expect(state.adapter.waitForProjectReady).toHaveBeenCalledWith(state, TEST_FILE, 30000);
+    expect(sendRequest).not.toHaveBeenCalled();
   });
 
   it('refuses a rename when prepareRename declines and never sends rename', async () => {

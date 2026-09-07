@@ -1,10 +1,5 @@
 // Canonical Hub projection that removes MCP transport and bounds source ranges.
 
-const INDEX_DEPENDENT_TOOLS = new Set([
-  'find_definition', 'find_references', 'find_workspace_symbols',
-]);
-const COLD_INDEX_WINDOW_MS = 5_000;
-
 interface ToolResultEnvelope {
   content?: unknown;
   structuredContent?: unknown;
@@ -104,49 +99,6 @@ function resultCardinality(normalized: Record<string, unknown>, ranges: Normaliz
     if (Array.isArray(value)) return value.length;
   }
   return 0;
-}
-
-/**
- * A project-wide answer produced while the server is still indexing is not just
- * possibly empty — it is possibly PARTIAL, and a partial answer that reports
- * `ok` with its own totals reads as complete. Measured on a cold root, one
- * reference query answered `1/1` and the same query answered `14/14` seconds
- * later. So every index-dependent answer inside the cold window is `stale`,
- * whatever it found; the rows are kept and the caller is told to re-ask.
- */
-export function markColdIndexResult(
-  result: unknown,
-  toolName: string,
-  rootAgeMs: number,
-): unknown {
-  if (!INDEX_DEPENDENT_TOOLS.has(toolName) || !result || typeof result !== 'object') return result;
-  const normalized = result as Record<string, unknown>;
-  // A tool that REPORTS its own readiness has observed the thing this wall clock
-  // can only guess at, so the reported fact decides and the window never overrules
-  // it. The window survives only for tools that report nothing: a fixed few
-  // seconds cannot describe a real project graph load, which is why an answer
-  // served after it closed still read as complete.
-  const reported = normalized.readinessConfirmed;
-  if (typeof reported === 'boolean') {
-    if (reported) return result;
-  } else if (rootAgeMs >= COLD_INDEX_WINDOW_MS) {
-    return result;
-  }
-  if (typeof normalized.outcome === 'string'
-    && !['ok', 'empty'].includes(normalized.outcome)) return result;
-  const recovery = normalized.outcome === 'empty'
-    ? 'Retry the same call after the newly warmed root finishes indexing.'
-    : 'This answer may be partial: retry the same call once the newly warmed root finishes indexing.';
-  const text = typeof normalized.text === 'string' && normalized.text.length > 0
-    ? `${normalized.text}\nHub: ${recovery}`
-    : `Hub root is indexing. ${recovery}`;
-  return {
-    ...normalized,
-    outcome: 'stale',
-    code: 'HUB_ROOT_INDEXING',
-    recovery,
-    text,
-  };
 }
 
 export function normalizeToolResult(

@@ -14,7 +14,7 @@ import {
   SOCKET_PATH,
 } from './config.js';
 import { RootPool, normalizeRoot, type RoutedRoot, type ToolSchema } from './pool.js';
-import { markColdIndexResult, normalizeToolResult } from './tool-result.js';
+import { normalizeToolResult } from './tool-result.js';
 import { type HubRequest, createLineReader, writeMessage } from './protocol.js';
 import { acquireDaemonLock } from './startup-lock.js';
 
@@ -133,11 +133,7 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   const routed = withRoutingMetadata(answer, route);
   if (args.rawMcp === true) return routed;
   const defaultProvider = name === 'ast_search' || name === 'code_rewrite' ? 'tree-sitter' : 'lsp';
-  const normalized = normalizeToolResult(routed, { defaultProvider });
-  // Read the age from the root that actually SERVED this answer: a retry rebinds
-  // route.entry to a freshly spawned dedicated root, and the retired covering
-  // root's age would report a brand-new server as long warm.
-  return markColdIndexResult(normalized, name, Date.now() - route.entry.startedAt);
+  return normalizeToolResult(routed, { defaultProvider });
 }
 
 /**

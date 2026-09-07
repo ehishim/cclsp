@@ -1,6 +1,5 @@
 import { describe, expect, it } from 'bun:test';
 import { normalizeToolJson, parse, runCli } from './cli.js';
-import { markColdIndexResult } from './tool-result.js';
 
 describe('cclsp-hub semantic ergonomics', () => {
   it('parses structural rewrite apply flags and alias without consuming values', () => {
@@ -78,48 +77,6 @@ describe('cclsp-hub semantic ergonomics', () => {
     });
   });
 
-  it('marks cold workspace-index emptiness stale without delaying direct file tools', () => {
-    const empty = {
-      outcome: 'empty',
-      provider: 'lsp',
-      shown: 0,
-      total: 0,
-      omitted: 0,
-      text: 'No symbols.',
-    };
-    expect(markColdIndexResult(empty, 'find_workspace_symbols', 100)).toMatchObject({
-      outcome: 'stale',
-      code: 'HUB_ROOT_INDEXING',
-      recovery: expect.stringContaining('Retry'),
-    });
-    expect(markColdIndexResult(empty, 'find_workspace_symbols', 6_000)).toBe(empty);
-    expect(markColdIndexResult(empty, 'get_document_symbols', 100)).toBe(empty);
-  });
-
-  it('marks a cold-index answer stale even when it found rows, because it may be partial', () => {
-    const partial = {
-      outcome: 'ok',
-      provider: 'lsp',
-      shown: 1,
-      total: 1,
-      omitted: 0,
-      text: 'References (1/1)',
-    };
-    const marked = markColdIndexResult(partial, 'find_references', 100) as Record<string, unknown>;
-    expect(marked).toMatchObject({
-      outcome: 'stale',
-      code: 'HUB_ROOT_INDEXING',
-      shown: 1,
-      total: 1,
-    });
-    expect(marked.recovery).toContain('may be partial');
-    expect(marked.text).toContain('References (1/1)');
-
-    expect(markColdIndexResult(partial, 'find_references', 6_000)).toBe(partial);
-    const failed = { outcome: 'unavailable', provider: 'none', text: 'server down' };
-    expect(markColdIndexResult(failed, 'find_references', 100)).toBe(failed);
-  });
-
   it('parses raw-mcp as a boolean without consuming the command', () => {
     const parsed = parse(['--raw-mcp', 'document-symbols', '--file', 'src/a.ts']);
     expect(parsed.command).toBe('document-symbols');
@@ -167,6 +124,7 @@ describe('cclsp-hub semantic ergonomics', () => {
     expect(output).toContain('--resolve-limit N');
     expect(output).toContain('--synthetic-trigger');
     expect(output).toContain('Ambiguous and unknown queries return bounded candidates');
-    expect(output).toContain('returns stale with');
+    expect(output).toContain('unconfirmed timeout is');
+    expect(output).toContain('typed stale instead of false absence');
   });
 });

@@ -135,6 +135,13 @@ export interface ServerState {
  * protocol or have special requirements.
  */
 export interface ServerAdapter {
+  /**
+   * Wait until the provider can answer file-based semantic requests from the
+   * current project graph. A false result is a bounded non-answer, never
+   * permission to return potentially incomplete rows as final.
+   */
+  waitForProjectReady?(state: ServerState, filePath: string, timeout: number): Promise<boolean>;
+
   /** Optional request-based diagnostics for providers without standard pull. */
   pullDiagnostics?(
     state: ServerState,

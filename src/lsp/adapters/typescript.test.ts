@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, jest, test } from 'bun:test';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { InitializeParams } from '../types.js';
 import { TypeScriptAdapter } from './typescript.js';
 
@@ -65,6 +68,119 @@ describe('TypeScriptAdapter', () => {
     await expect(adapter.pullDiagnostics(state as never, '/file.ts', 1000)).rejects.toThrow(
       'LSP_REQUEST_INVALID_RESPONSE'
     );
+  });
+
+  test('shares file readiness without changing workspace-wide readiness', async () => {
+    let finish!: (value: unknown) => void;
+    const reply = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const calls: Array<{ method: string; input: unknown; timeout: number }> = [];
+    const state = {
+      config: { extensions: ['ts'], command: ['typescript-language-server'], rootDir: '/project' },
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: {
+        sendRequest: (method: string, input: unknown, timeout: number) => {
+          calls.push({ method, input, timeout });
+          return reply;
+        },
+      },
+    };
+
+    const first = adapter.waitForProjectReady(state as never, '/project/a.ts', 1000);
+    const concurrent = adapter.waitForProjectReady(state as never, '/project/b.ts', 1000);
+    expect(calls).toHaveLength(1);
+    finish({ success: true, body: [] });
+    expect(await Promise.all([first, concurrent])).toEqual([true, true]);
+    expect(await adapter.waitForProjectReady(state as never, '/project/c.ts', 1000)).toBe(true);
+    expect(state).not.toHaveProperty('indexingComplete');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      method: 'workspace/executeCommand',
+      timeout: 1000,
+      input: {
+        command: 'typescript.tsserverRequest',
+        arguments: [
+          'semanticDiagnosticsSync',
+          { file: '/project/a.ts', includeLinePosition: true },
+          { executionTarget: 0 },
+        ],
+      },
+    });
+  });
+
+  test('confirms independent configured subprojects separately', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'cclsp-readiness-'));
+    const firstRoot = join(root, 'first');
+    const secondRoot = join(root, 'second');
+    mkdirSync(firstRoot);
+    mkdirSync(secondRoot);
+    writeFileSync(join(firstRoot, 'tsconfig.json'), '{}');
+    writeFileSync(join(secondRoot, 'tsconfig.json'), '{}');
+    const calls: string[] = [];
+    const state = {
+      config: { extensions: ['ts'], command: ['typescript-language-server'], rootDir: root },
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: {
+        sendRequest: async (_method: string, input: { arguments: [string, { file: string }] }) => {
+          calls.push(input.arguments[1].file);
+          return { success: true, body: [] };
+        },
+      },
+    };
+    try {
+      expect(
+        await Promise.all([
+          adapter.waitForProjectReady(state as never, join(firstRoot, 'a.ts'), 1000),
+          adapter.waitForProjectReady(state as never, join(secondRoot, 'b.ts'), 1000),
+        ])
+      ).toEqual([true, true]);
+      expect(await adapter.waitForProjectReady(state as never, join(firstRoot, 'c.ts'), 1000)).toBe(
+        true
+      );
+      expect(
+        await adapter.waitForProjectReady(state as never, join(secondRoot, 'c.ts'), 1000)
+      ).toBe(true);
+      expect(calls).toEqual([join(firstRoot, 'a.ts'), join(secondRoot, 'b.ts')]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('does not confirm readiness from an unavailable or malformed provider response', async () => {
+    expect(
+      await adapter.waitForProjectReady(
+        {
+          config: { extensions: ['ts'], command: ['typescript-language-server'] },
+          serverCapabilities: {},
+          transport: { sendRequest: async () => undefined },
+        } as never,
+        '/file.ts',
+        1000
+      )
+    ).toBe(false);
+    const state = {
+      config: { extensions: ['ts'], command: ['typescript-language-server'] },
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: { sendRequest: async () => ({ success: true, body: undefined }) },
+    };
+    expect(await adapter.waitForProjectReady(state as never, '/file.ts', 1000)).toBe(false);
+  });
+
+  test('clears failed project readiness so the same project can recover', async () => {
+    const sendRequest = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('request timeout'))
+      .mockResolvedValueOnce({ success: true, body: [] });
+    const state = {
+      config: { extensions: ['ts'], command: ['typescript-language-server'] },
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: { sendRequest },
+    };
+
+    expect(await adapter.waitForProjectReady(state as never, '/project/a.ts', 5)).toBe(false);
+    expect(await adapter.waitForProjectReady(state as never, '/project/b.ts', 1000)).toBe(true);
+    expect(sendRequest).toHaveBeenCalledTimes(2);
   });
 
   test('matches the typescript language server only', () => {

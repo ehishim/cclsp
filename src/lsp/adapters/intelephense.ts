@@ -17,6 +17,7 @@ import type { ServerAdapter, ServerState } from '../types.js';
  */
 export class IntelephenseAdapter implements ServerAdapter {
   readonly name = 'intelephense';
+  private readonly readinessWaiters = new WeakMap<ServerState, Set<() => void>>();
 
   matches(config: LSPServerConfig): boolean {
     return config.command.some((c: string) => c.includes('intelephense'));
@@ -37,14 +38,45 @@ export class IntelephenseAdapter implements ServerAdapter {
       logger.debug('[DEBUG IntelephenseAdapter] Indexing ended\n');
       state.indexingStarted = true;
       state.indexingComplete = true;
+      const waiters = this.readinessWaiters.get(state);
+      if (waiters) {
+        for (const resolve of waiters) resolve();
+        waiters.clear();
+      }
       return true;
     }
     return false;
   }
 
+  async waitForProjectReady(
+    state: ServerState,
+    _filePath: string,
+    timeout: number
+  ): Promise<boolean> {
+    if (state.indexingComplete) return true;
+    return new Promise<boolean>((resolve) => {
+      let waiters = this.readinessWaiters.get(state);
+      if (!waiters) {
+        waiters = new Set();
+        this.readinessWaiters.set(state, waiters);
+      }
+      const ready = () => {
+        clearTimeout(timer);
+        waiters?.delete(ready);
+        resolve(true);
+      };
+      const timer = setTimeout(() => {
+        waiters?.delete(ready);
+        resolve(false);
+      }, timeout);
+      waiters.add(ready);
+    });
+  }
+
   getTimeout(method: string): number | undefined {
     // Intelephense can be slow while the workspace index is still building.
     const timeouts: Record<string, number> = {
+      'project/readiness': 60000, // 60 seconds
       'workspace/symbol': 60000, // 60 seconds
       'textDocument/references': 60000, // 60 seconds
       'textDocument/rename': 60000, // 60 seconds

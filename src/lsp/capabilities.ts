@@ -1,7 +1,7 @@
 import { extname } from 'node:path';
 import type { ServerState } from './types.js';
 
-export type LspToolOutcomeKind = 'unsupported' | 'rejected' | 'too-large';
+export type LspToolOutcomeKind = 'unsupported' | 'rejected' | 'stale' | 'too-large';
 
 export interface LspToolOutcome {
   outcome: LspToolOutcomeKind;
@@ -9,6 +9,7 @@ export interface LspToolOutcome {
     | 'LSP_METHOD_UNSUPPORTED'
     | 'LSP_RENAME_REJECTED'
     | 'LSP_ACTION_NOT_APPLICABLE'
+    | 'LSP_PROJECT_NOT_READY'
     | 'LSP_RESPONSE_SPOOLED';
   method: string;
   server: string;

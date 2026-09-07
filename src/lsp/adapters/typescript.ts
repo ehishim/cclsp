@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { logger } from '../../logger.js';
 import type { LSPServerConfig } from '../../types.js';
 import { pathToUri } from '../../utils.js';
@@ -38,6 +40,9 @@ export class TypeScriptAdapter implements ServerAdapter {
 
   /** Progress tokens seen beginning a project load, per server. */
   private readonly loadTokens = new WeakMap<ServerState, Set<string>>();
+  private readonly projectKeys = new WeakMap<ServerState, Map<string, string>>();
+  private readonly readyProjects = new WeakMap<ServerState, Set<string>>();
+  private readonly readinessInFlight = new WeakMap<ServerState, Map<string, Promise<boolean>>>();
   private readonly diagnosticSlots = new WeakMap<
     ServerState,
     { active: number; waiting: Array<() => void> }
@@ -80,6 +85,97 @@ export class TypeScriptAdapter implements ServerAdapter {
       return true;
     }
     return false;
+  }
+
+  async waitForProjectReady(
+    state: ServerState,
+    filePath: string,
+    timeout: number
+  ): Promise<boolean> {
+    const project = this.projectKey(state, filePath);
+    const ready = this.readyProjects.get(state);
+    if (ready?.has(project)) return true;
+    let inFlight = this.readinessInFlight.get(state);
+    if (!inFlight) {
+      inFlight = new Map();
+      this.readinessInFlight.set(state, inFlight);
+    }
+    const current = inFlight.get(project);
+    if (current) return current;
+
+    const run = (async () => {
+      const capability = state.serverCapabilities.executeCommandProvider as
+        | { commands?: unknown }
+        | undefined;
+      if (
+        !Array.isArray(capability?.commands) ||
+        !capability.commands.includes('typescript.tsserverRequest')
+      ) {
+        return false;
+      }
+      try {
+        const reply = (await state.transport.sendRequest(
+          'workspace/executeCommand',
+          {
+            command: 'typescript.tsserverRequest',
+            arguments: [
+              'semanticDiagnosticsSync',
+              { file: filePath, includeLinePosition: true },
+              { executionTarget: 0 },
+            ],
+          },
+          timeout
+        )) as { success?: boolean; body?: unknown; message?: string } | undefined;
+        if (reply?.success !== true || !Array.isArray(reply.body)) {
+          logger.debug(
+            `[TypeScriptAdapter] Project readiness request failed: ${reply?.message ?? 'missing diagnostic array'}\n`
+          );
+          return false;
+        }
+        const confirmed = this.readyProjects.get(state) ?? new Set<string>();
+        confirmed.add(project);
+        this.readyProjects.set(state, confirmed);
+        return true;
+      } catch (error) {
+        logger.debug(`[TypeScriptAdapter] Project readiness request failed: ${error}\n`);
+        return false;
+      }
+    })();
+
+    inFlight.set(project, run);
+    try {
+      return await run;
+    } finally {
+      inFlight.delete(project);
+    }
+  }
+
+  private projectKey(state: ServerState, filePath: string): string {
+    const fileDirectory = resolve(dirname(filePath));
+    let cached = this.projectKeys.get(state);
+    const known = cached?.get(fileDirectory);
+    if (known) return known;
+
+    const configuredRoot = state.config.rootDir ? resolve(state.config.rootDir) : fileDirectory;
+    let current = fileDirectory;
+    let project = configuredRoot;
+    while (true) {
+      if (
+        existsSync(join(current, 'tsconfig.json')) ||
+        existsSync(join(current, 'jsconfig.json'))
+      ) {
+        project = current;
+        break;
+      }
+      if (current === configuredRoot) break;
+      const parent = dirname(current);
+      if (parent === current || !current.startsWith(`${configuredRoot}/`)) break;
+      current = parent;
+    }
+    cached ??= new Map();
+    cached.set(fileDirectory, project);
+    this.projectKeys.set(state, cached);
+    return project;
   }
 
   async pullDiagnostics(

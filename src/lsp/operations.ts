@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { logger } from '../logger.js';
 import { pathToUri, uriToPath } from '../utils.js';
 import {
+  LspToolOutcomeError,
   rejectRename,
   requireFileRenameSupport,
   requireMethodSupport,
@@ -196,6 +197,23 @@ export function findSymbolPositionInFile(filePath: string, symbol: SymbolInforma
 
 // --- LSP Operations ---
 
+async function ensureProjectReady(serverState: ServerState, filePath: string): Promise<void> {
+  const readiness = serverState.adapter?.waitForProjectReady;
+  if (!readiness) return;
+  const timeout = serverState.adapter?.getTimeout?.('project/readiness') ?? 30000;
+  const ready = await readiness.call(serverState.adapter, serverState, filePath, timeout);
+  if (ready) return;
+  throw new LspToolOutcomeError({
+    outcome: 'stale',
+    code: 'LSP_PROJECT_NOT_READY',
+    method: 'project readiness',
+    server: serverState.config.command.join(' '),
+    reason: `the provider did not confirm the project graph for ${filePath} within ${timeout}ms`,
+    recovery:
+      'Restart the serving root, verify the language provider is healthy, then repeat the semantic request.',
+  });
+}
+
 /**
  * Ensure the server's view of a file matches disk before a position-based request
  * (definition, references, rename, hover, implementation, call hierarchy,
@@ -204,8 +222,8 @@ export function findSymbolPositionInFile(filePath: string, symbol: SymbolInforma
  * diagnostics. Cheap by design: unchanged files cost only a stat — no didChange, no
  * re-analysis — so warm repeated calls stay fast while external edits are picked up.
  *
- * Returns whether the file was opened for the first time; callers may briefly wait
- * for the server to index a freshly opened file.
+ * Returns whether the file was opened for the first time. Provider adapters may
+ * first establish project-graph readiness through their bounded native signal.
  */
 async function withFreshDocument<T>(
   serverState: ServerState,
@@ -231,6 +249,7 @@ async function withFreshDocument<T>(
         dm.setSyncSig(filePath, snap.sig);
       }
     }
+    await ensureProjectReady(serverState, filePath);
     return await action(lease.justOpened);
   } finally {
     lease.release();
@@ -276,14 +295,7 @@ export async function findDefinition(
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/definition');
 
-  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
-    if (justOpened) {
-      logger.debug(
-        '[DEBUG findDefinition] File was just opened, waiting for server to index project...\n'
-      );
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-
+  const result = await withFreshDocument(serverState, filePath, async () => {
     logger.debug('[DEBUG findDefinition] Sending textDocument/definition request\n');
     const method = 'textDocument/definition';
     const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
@@ -313,8 +325,7 @@ export async function findTypeDefinition(
 ): Promise<Location[]> {
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/typeDefinition');
-  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
-    if (justOpened) await new Promise((resolve) => setTimeout(resolve, 200));
+  const result = await withFreshDocument(serverState, filePath, async () => {
     const method = 'textDocument/typeDefinition';
     const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
     return serverState.transport.sendRequest(
@@ -339,14 +350,7 @@ export async function findReferences(
   await serverState.initializationPromise;
   requireMethodSupport(serverState, 'textDocument/references');
 
-  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
-    if (justOpened) {
-      logger.debug(
-        '[DEBUG findReferences] File was just opened, waiting for server to index project...\n'
-      );
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-
+  const result = await withFreshDocument(serverState, filePath, async () => {
     const method = 'textDocument/references';
     const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
     return serverState.transport.sendRequest(
@@ -435,14 +439,7 @@ export async function renameSymbol(
   }
 
   let prepared = false;
-  const result = await withFreshDocument(serverState, filePath, async (justOpened) => {
-    if (justOpened) {
-      logger.debug(
-        '[DEBUG renameSymbol] File was just opened, waiting for server to index project...\n'
-      );
-      await new Promise((resolve) => setTimeout(resolve, 200));
-    }
-
+  const result = await withFreshDocument(serverState, filePath, async () => {
     if (prepareSupported) {
       const prepareMethod = 'textDocument/prepareRename';
       const prepareTimeout = serverState.adapter?.getTimeout?.(prepareMethod) ?? 30000;
@@ -726,6 +723,7 @@ export async function willRenameFiles(
 ): Promise<WorkspaceEditResult> {
   await serverState.initializationPromise;
   requireFileRenameSupport(serverState, 'workspace/willRenameFiles', oldPath);
+  await ensureProjectReady(serverState, oldPath);
   const method = 'workspace/willRenameFiles';
   const result = await serverState.transport.sendRequest(
     method,

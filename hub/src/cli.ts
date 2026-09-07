@@ -218,8 +218,8 @@ OPTIONS
 
 POSITION TOOLS accept exactly one selector: --query Q or a complete 1-indexed
 line/character pair. Ambiguous and unknown queries return bounded candidates.
-A first empty workspace-index query on a newly warmed root returns stale with
-retry recovery instead of false absence. Run '<command> --help' for parameters.
+A workspace-index query waits for provider readiness; an unconfirmed timeout is
+typed stale instead of false absence. Run '<command> --help' for parameters.
 
 TIP  Prefer a root at the PROJECT ROOT — the directory with tsconfig.json /
      package.json (TS/JS) or composer.json (PHP). Pointing at a random subdir makes
