@@ -19,7 +19,17 @@ function createMockClient(): MockLSPClient {
 }
 
 function callHandler(args: { file_path: string }, mock: MockLSPClient) {
-  return getDiagnosticsTool.handler(args as Record<string, unknown>, mock as unknown as LSPClient);
+  const client = {
+    ...mock,
+    getDiagnosticsReport: async (path: string) => ({
+      diagnostics: await mock.getDiagnostics(path),
+      freshness: { status: 'current' },
+    }),
+  };
+  return getDiagnosticsTool.handler(
+    args as Record<string, unknown>,
+    client as unknown as LSPClient
+  );
 }
 
 function callBatchHandler(

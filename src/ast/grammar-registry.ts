@@ -1,5 +1,7 @@
+import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Language, Parser, type Tree } from 'web-tree-sitter';
 import { AST_LANGUAGE_DEFINITIONS, type AstLanguage } from './types.js';
 
@@ -26,13 +28,13 @@ export class GrammarRegistry {
   async getLanguage(language: AstLanguage): Promise<Language> {
     if (this.disposed) throw new Error('AST grammar registry is disposed');
     await initializeParser();
-    const asset = AST_LANGUAGE_DEFINITIONS[language].grammarAsset;
+    const asset = grammarAssetPath(language);
     const cached = this.languages.get(asset);
     if (cached) return cached;
     const pending = this.loading.get(asset);
     if (pending) return pending;
 
-    const load = Language.load(join(GRAMMAR_DIR, asset))
+    const load = Language.load(asset)
       .then((loaded) => {
         this.languages.set(asset, loaded);
         return loaded;
@@ -65,5 +67,13 @@ export class GrammarRegistry {
 }
 
 export function grammarAssetPath(language: AstLanguage): string {
-  return join(GRAMMAR_DIR, AST_LANGUAGE_DEFINITIONS[language].grammarAsset);
+  const definition = AST_LANGUAGE_DEFINITIONS[language];
+  if (!('ownedAsset' in definition)) return join(GRAMMAR_DIR, definition.grammarAsset);
+  let root = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(join(root, 'package.json'))) {
+    const parent = dirname(root);
+    if (parent === root) throw new Error('Cannot locate cclsp grammar assets');
+    root = parent;
+  }
+  return join(root, 'grammars', definition.ownedAsset);
 }

@@ -1,4 +1,3 @@
-import { textResult } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
 
 export const restartServerTool: ToolDefinition = {
@@ -32,11 +31,14 @@ export const restartServerTool: ToolDefinition = {
         response += `\n\nFailed to restart:\n${result.failed.map((s) => `• ${s}`).join('\n')}`;
       }
 
-      return textResult(response);
+      return {
+        content: [{ type: 'text' as const, text: response }],
+        structuredContent: { ...result, outcome: result.success ? 'ok' : 'unavailable' },
+        ...(!result.success ? { isError: true } : {}),
+      };
     } catch (error) {
-      return textResult(
-        `Error restarting servers: ${error instanceof Error ? error.message : String(error)}`
-      );
+      return { content: [{ type: 'text' as const, text: `Error restarting servers: ${error instanceof Error ? error.message : String(error)}` }],
+        structuredContent: { outcome: 'unavailable', code: 'LSP_RESTART_FAILED' }, isError: true };
     }
   },
 };

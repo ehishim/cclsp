@@ -371,7 +371,11 @@ describe('AstProvider', () => {
         pattern: 'const $NAME = $VALUE',
         path: 'broken.ts',
       });
-      expect(parseFailure.outcome === 'rejected' && parseFailure.code).toBe('AST_PARSE_FAILED');
+      expect(parseFailure.outcome).toBe('partial');
+      if (parseFailure.outcome === 'partial') {
+        expect(parseFailure.code).toBe('AST_SEARCH_PARTIAL');
+        expect(parseFailure.failedFiles[0]?.code).toBe('AST_PARSE_RECOVERED');
+      }
 
       const invalidPath = await provider.search({
         language: 'typescript',
@@ -712,6 +716,45 @@ describe('a structural zero must say which kind of zero it is', () => {
           // Exact, not unknown: nothing about this file is unparsed.
           ['absentSymbol', 0],
         ]);
+      }
+    );
+  });
+
+  it('finds a bare method name and type name without matching strings or comments', async () => {
+    await withProject(
+      {
+        'names.ts':
+          'interface Result {}\nclass Store { getOperationalTeam(): Result { return {}; } }\nconst text = "getOperationalTeam"; // getOperationalTeam\n',
+      },
+      async (_root, provider) => {
+        const method = await provider.search({
+          language: 'typescript',
+          pattern: 'getOperationalTeam',
+        });
+        expect(method.outcome).toBe('ok');
+        if (method.outcome === 'ok') expect(method.matches).toHaveLength(1);
+        const type = await provider.search({ language: 'typescript', pattern: 'Result' });
+        expect(type.outcome).toBe('ok');
+        if (type.outcome === 'ok') expect(type.matches).toHaveLength(2);
+      }
+    );
+  });
+
+  it('finds Go and Rust field-only name occurrences', async () => {
+    await withProject(
+      {
+        'a.go': 'package p\nfunc read(x T) { _ = x.FieldOnly }\n',
+        'a.rs': 'fn read(x: T) { let _ = x.field_only; }\n',
+      },
+      async (_root, provider) => {
+        for (const input of [
+          { language: 'go', pattern: 'FieldOnly' },
+          { language: 'rust', pattern: 'field_only' },
+        ]) {
+          const result = await provider.search(input);
+          expect(result.outcome).toBe('ok');
+          if (result.outcome === 'ok') expect(result.matches).toHaveLength(1);
+        }
       }
     );
   });

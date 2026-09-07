@@ -214,19 +214,22 @@ async function withFreshDocument<T>(
   exclusive = false
 ): Promise<T> {
   const dm = serverState.documentManager;
-  const lease =
-    typeof dm.acquire === 'function'
-      ? await dm.acquire(filePath, exclusive)
-      : { justOpened: await dm.ensureOpen(filePath), release: () => undefined };
+  const lease = await dm.acquire(filePath, exclusive);
   try {
     const snap = readAndSign(filePath);
     if (snap && dm.getSyncSig(filePath) !== snap.sig) {
       if (!lease.justOpened) {
         logger.debug(`[DEBUG withFreshDocument] ${filePath} changed on disk, re-syncing\n`);
-        dm.sendChange(filePath, snap.content);
+        await dm.withWriter(async (scope) => {
+          const current = readAndSign(filePath);
+          if (!current) throw new Error(`LSP_FRESHNESS_UNKNOWN: cannot read ${filePath}`);
+          dm.changeUnderScope(filePath, current.content, scope);
+          dm.setSyncSig(filePath, current.sig);
+        });
         serverState.diagnosticsCache.delete(pathToUri(filePath));
+      } else {
+        dm.setSyncSig(filePath, snap.sig);
       }
-      dm.setSyncSig(filePath, snap.sig);
     }
     return await action(lease.justOpened);
   } finally {
@@ -723,7 +726,6 @@ export async function willRenameFiles(
 ): Promise<WorkspaceEditResult> {
   await serverState.initializationPromise;
   requireFileRenameSupport(serverState, 'workspace/willRenameFiles', oldPath);
-  requireFileRenameSupport(serverState, 'workspace/didRenameFiles', newPath);
   const method = 'workspace/willRenameFiles';
   const result = await serverState.transport.sendRequest(
     method,
@@ -763,6 +765,7 @@ export async function didRenameFiles(
   oldPath: string,
   newPath: string
 ): Promise<void> {
+  if (!supportsMethod(serverState, 'workspace/didRenameFiles')) return;
   requireFileRenameSupport(serverState, 'workspace/didRenameFiles', newPath);
   serverState.transport.sendNotification('workspace/didRenameFiles', {
     files: [{ oldUri: pathToUri(oldPath), newUri: pathToUri(newPath) }],
@@ -993,9 +996,9 @@ async function pullDiagnostics(
   timeout: number
 ): Promise<Diagnostic[] | null> {
   if (!supportsMethod(serverState, 'textDocument/diagnostic')) {
-    return null;
+    return serverState.adapter?.pullDiagnostics?.(serverState, uriToPath(fileUri), timeout) ?? null;
   }
-  try {
+  {
     const result = await serverState.transport.sendRequest(
       'textDocument/diagnostic',
       { textDocument: { uri: fileUri } },
@@ -1008,114 +1011,59 @@ async function pullDiagnostics(
         return report.items;
       }
       if (report.kind === 'unchanged') {
-        // Server says nothing changed since its last report — trust the cache.
-        return serverState.diagnosticsCache.get(fileUri) ?? [];
+        throw new Error(
+          'LSP_REQUEST_INVALID_RESPONSE: unchanged report without a previous result id'
+        );
       }
     }
     // Some servers answer with a bare diagnostics array.
     if (Array.isArray(result)) {
       return result as Diagnostic[];
     }
-    // Unknown/empty shape: treat as unsupported and let the caller fall back.
-    return null;
-  } catch (error) {
-    // MethodNotFound / timeout / other: pull not usable here.
-    logger.debug(
-      `[DEBUG getDiagnostics] textDocument/diagnostic not supported or failed: ${error}\n`
-    );
-    return null;
+    throw new Error('LSP_REQUEST_INVALID_RESPONSE: diagnostic response has no supported report');
   }
+}
+
+export interface DiagnosticFreshness {
+  epoch: number;
+  resynced: string[];
+  bytesCompared: number;
+  status: 'current' | 'unverified' | 'unknown';
+  causality: 'pull' | 'request' | 'push';
+  waitedFor: string[];
+  changedDuringRequest: string[];
 }
 
 export async function getDiagnostics(
   serverState: ServerState,
   filePath: string
 ): Promise<Diagnostic[]> {
-  logger.debug(`[DEBUG getDiagnostics] Requesting diagnostics for ${filePath}\n`);
-
-  await serverState.initializationPromise;
-
-  const fileUri = pathToUri(filePath);
-  const dm = serverState.documentManager;
-  const lease = await dm.acquire(filePath);
-  try {
-    const cache = serverState.diagnosticsCache;
-    const snap = readAndSign(filePath);
-    const method = 'textDocument/diagnostic';
-    const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
-
-    if (!lease.justOpened) {
-      const cached = cache.get(fileUri);
-      if (snap && dm.getSyncSig(filePath) === snap.sig && cached !== undefined) {
-        // Fast path: file unchanged on disk since we last synced it and we already
-        // have diagnostics for it. No re-sync, no round-trip.
-        logger.debug(
-          `[DEBUG getDiagnostics] Fast path: ${cached.length} cached diagnostics (file unchanged)\n`
-        );
-        return cached;
-      }
-      if (snap && dm.getSyncSig(filePath) !== snap.sig) {
-        // File was edited externally (e.g. Claude Code's Edit tool): push the new
-        // content and drop stale diagnostics.
-        logger.debug('[DEBUG getDiagnostics] File changed on disk, re-syncing\n');
-        dm.sendChange(filePath, snap.content);
-        dm.setSyncSig(filePath, snap.sig);
-        cache.delete(fileUri);
-      }
-    } else if (snap) {
-      dm.setSyncSig(filePath, snap.sig);
-    }
-
-    // Prefer pull diagnostics.
-    const pulled = await pullDiagnostics(serverState, fileUri, timeout);
-    if (pulled !== null) {
-      cache.update(fileUri, pulled);
-      logger.debug(`[DEBUG getDiagnostics] Pull returned ${pulled.length} diagnostics\n`);
-      return pulled;
-    }
-
-    // Push-model fallback: the server doesn't support pull diagnostics.
-    const cached = cache.get(fileUri);
-    if (cached !== undefined) {
-      logger.debug(
-        `[DEBUG getDiagnostics] Returning ${cached.length} cached diagnostics from publishDiagnostics\n`
-      );
-      return cached;
-    }
-
-    await cache.waitForIdle(fileUri, { maxWaitTime: 8000, idleTime: 200 });
-    const afterWait = cache.get(fileUri);
-    if (afterWait !== undefined) {
-      return afterWait;
-    }
-
-    // Last resort: nudge the server with a no-op change to trigger publishDiagnostics.
-    logger.debug('[DEBUG getDiagnostics] No diagnostics yet, triggering with no-op change\n');
-    try {
-      const fileContent = readFileSync(filePath, 'utf-8');
-      dm.sendChange(filePath, `${fileContent} `);
-      dm.sendChange(filePath, fileContent);
-
-      await cache.waitForIdle(fileUri, { maxWaitTime: 8000, idleTime: 200 });
-      const afterTrigger = cache.get(fileUri);
-      if (afterTrigger !== undefined) {
-        return afterTrigger;
-      }
-    } catch (triggerError) {
-      logger.debug(
-        `[DEBUG getDiagnostics] Failed to trigger publishDiagnostics: ${triggerError}\n`
-      );
-    }
-
-    return [];
-  } finally {
-    lease.release();
+  const report = await getDiagnosticsReport(serverState, filePath);
+  if (report.freshness.status !== 'current') {
+    const error = new Error(
+      report.reason ?? 'LSP_DIAGNOSTICS_UNKNOWN: diagnostics are not current'
+    );
+    Object.assign(error, report, { status: report.freshness.status });
+    throw error;
   }
+  return report.diagnostics;
+}
+
+export async function getDiagnosticsReport(
+  serverState: ServerState,
+  filePath: string
+): Promise<{ diagnostics: Diagnostic[]; freshness: DiagnosticFreshness; reason?: string }> {
+  const [result] = await getDiagnosticsBatch(serverState, [filePath]);
+  if (!result?.freshness) throw new Error('LSP_DIAGNOSTICS_UNKNOWN: missing file result');
+  return { diagnostics: result.diagnostics, freshness: result.freshness, reason: result.reason };
 }
 
 export interface BatchDiagnosticResult {
   filePath: string;
   diagnostics: Diagnostic[];
+  status?: 'current' | 'unverified' | 'unknown';
+  reason?: string;
+  freshness?: DiagnosticFreshness;
 }
 
 export async function getDiagnosticsBatch(
@@ -1129,75 +1077,80 @@ export async function getDiagnosticsBatch(
   await serverState.initializationPromise;
 
   const dm = serverState.documentManager;
-  const leases: Array<{ release(): void }> = [];
-  const justOpenedFiles = new Set<string>();
-  try {
-    for (const filePath of filePaths) {
-      const lease = await dm.acquire(filePath);
-      leases.push(lease);
-      if (lease.justOpened) justOpenedFiles.add(filePath);
+  if (filePaths.length > dm.capacity) {
+    const results: BatchDiagnosticResult[] = [];
+    for (let offset = 0; offset < filePaths.length; offset += dm.capacity) {
+      results.push(
+        ...(await getDiagnosticsBatch(serverState, filePaths.slice(offset, offset + dm.capacity)))
+      );
     }
-    const cache = serverState.diagnosticsCache;
+    return results;
+  }
+  const leases = await dm.acquireChunk(filePaths);
+  try {
     const method = 'textDocument/diagnostic';
     const timeout = serverState.adapter?.getTimeout?.(method) ?? 30000;
 
     const entries = filePaths.map((filePath) => ({ filePath, fileUri: pathToUri(filePath) }));
 
-    // Phase 1: Open/re-sync only what changed. Files that are unchanged since the
-    // last sync and already have diagnostics are reused straight from the cache.
-    const toAnalyze: Array<{ filePath: string; fileUri: string }> = [];
-    for (const e of entries) {
-      const snap = readAndSign(e.filePath);
-      if (!justOpenedFiles.has(e.filePath)) {
-        if (snap && dm.getSyncSig(e.filePath) !== snap.sig) {
-          dm.sendChange(e.filePath, snap.content);
-          dm.setSyncSig(e.filePath, snap.sig);
-          cache.delete(e.fileUri);
-          toAnalyze.push(e);
-        } else if (cache.get(e.fileUri) === undefined) {
-          toAnalyze.push(e);
+    const snapshot = await dm.reconcile();
+    const results: BatchDiagnosticResult[] = new Array(entries.length);
+    let next = 0;
+    const workers = await Promise.allSettled(
+      Array.from({ length: Math.min(4, entries.length) }, async () => {
+        while (next < entries.length) {
+          const index = next++;
+          const entry = entries[index];
+          if (!entry) continue;
+          try {
+            const pulled = await pullDiagnostics(serverState, entry.fileUri, timeout);
+            const cached = serverState.diagnosticsCache.get(entry.fileUri);
+            results[index] =
+              pulled === null
+                ? {
+                    filePath: entry.filePath,
+                    diagnostics: cached ?? [],
+                    status: cached === undefined ? 'unknown' : 'unverified',
+                    reason:
+                      'LSP_DIAGNOSTICS_UNKNOWN: provider has no request-based diagnostics; use a pull-capable provider or typescript-language-server >=5.3',
+                  }
+                : { filePath: entry.filePath, diagnostics: pulled, status: 'current' };
+          } catch (error) {
+            results[index] = {
+              filePath: entry.filePath,
+              diagnostics: [],
+              status: 'unknown',
+              reason: String(error),
+            };
+          }
         }
-        // else: unchanged and already cached -> reuse.
-      } else {
-        if (snap) dm.setSyncSig(e.filePath, snap.sig);
-        toAnalyze.push(e);
+      })
+    );
+    const failed = workers.find((result) => result.status === 'rejected');
+    if (failed?.status === 'rejected') throw failed.reason;
+    const changed = await dm.changedSince(snapshot);
+    if (changed.length > 0) {
+      for (const result of results) {
+        if (result.status === 'current') result.status = 'unverified';
+        result.reason = `LSP_FRESHNESS_UNKNOWN: files changed during diagnostics: ${changed.join(', ')}`;
       }
     }
 
-    // Phase 2: Get diagnostics for the files that need (re)analysis. Probe pull
-    // support on the first file (serial); if it's supported, fan the rest out
-    // concurrently (pull returns as soon as each file is computed). If the server
-    // doesn't support pull, skip the fan-out entirely and use the push model — a
-    // single batch idle wait — instead of firing N requests that would all fail.
-    if (toAnalyze.length > 0) {
-      const [probe, ...rest] = toAnalyze;
-      const probed = probe ? await pullDiagnostics(serverState, probe.fileUri, timeout) : null;
-
-      if (probe && probed === null) {
-        logger.debug(
-          '[DEBUG getDiagnosticsBatch] Pull unsupported, waiting for publishDiagnostics\n'
-        );
-        await cache.waitForAllIdle(
-          toAnalyze.map((e) => e.fileUri),
-          { maxWaitTime: 15000, idleTime: 300 }
-        );
-      } else {
-        if (probe && probed) cache.update(probe.fileUri, probed);
-        await Promise.all(
-          rest.map(async (e) => {
-            const pulled = await pullDiagnostics(serverState, e.fileUri, timeout);
-            if (pulled !== null) cache.update(e.fileUri, pulled);
-          })
-        );
-      }
+    for (const result of results) {
+      result.freshness = {
+        epoch: snapshot.epoch,
+        resynced: snapshot.resynced,
+        bytesCompared: snapshot.bytesCompared,
+        status: result.status ?? 'unknown',
+        causality: supportsMethod(serverState, method)
+          ? 'pull'
+          : serverState.adapter?.pullDiagnostics
+            ? 'request'
+            : 'push',
+        waitedFor: snapshot.waitedFor ?? [],
+        changedDuringRequest: changed,
+      };
     }
-
-    // Phase 3: Collect results
-    const results: BatchDiagnosticResult[] = entries.map((e) => ({
-      filePath: e.filePath,
-      diagnostics: cache.get(e.fileUri) ?? [],
-    }));
-
     const totalDiags = results.reduce((sum, r) => sum + r.diagnostics.length, 0);
     const filesWithDiags = results.filter((r) => r.diagnostics.length > 0).length;
     logger.debug(

@@ -35,6 +35,18 @@ function seedWarm(pool: RootPool, root: string): RootEntry {
 }
 
 describe('RootPool smart target routing', () => {
+  it('finds descendant and covering serving roots without starting a core', () => {
+    const pool = new RootPool();
+    const root = fixture();
+    const nested = join(root, 'package');
+    mkdirSync(nested);
+    const outer = seedWarm(pool, root);
+    const inner = seedWarm(pool, nested);
+    expect(pool.servingRoots(root)).toEqual([outer, inner]);
+    expect(pool.servingRoots(join(nested, 'src'))).toEqual([inner]);
+    expect(pool.servingRoots(fixture())).toEqual([]);
+    expect(pool.list()).toHaveLength(2);
+  });
   it('uses the most-specific warm root without discovery or ensure work', async () => {
     const discover = mock(() => undefined);
     const pool = new RootPool({ discoverProjectRoot: discover });

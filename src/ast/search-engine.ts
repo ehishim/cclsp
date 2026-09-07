@@ -55,6 +55,29 @@ export class SearchEngine {
     file: string,
     maxResults: number
   ): AstMatch[] {
+    // A standalone name asks for name occurrences, not one grammar's identifier
+    // subtype. Keep structural rewrite on searchExact's strict node matching.
+    if (compiled.metavariables.length === 0 && compiled.node.type === 'identifier') {
+      const matches: AstMatch[] = [];
+      const locator = new SourceLocator(source);
+      const nameKinds = new Set([
+        'identifier',
+        'property_identifier',
+        'field_identifier',
+        'type_identifier',
+        'shorthand_property_identifier',
+        'shorthand_property_identifier_pattern',
+      ]);
+      const visit = (node: TsNode): void => {
+        if (matches.length >= maxResults) return;
+        if (nameKinds.has(node.type) && node.text === compiled.node.text) {
+          matches.push({ file, range: locator.range(node), text: node.text, captures: [] });
+        }
+        for (const child of node.namedChildren) visit(child);
+      };
+      visit(tree.rootNode);
+      return matches;
+    }
     return this.searchExact(tree, source, compiled, file, maxResults).map((match) => ({
       file: match.file,
       range: match.range,

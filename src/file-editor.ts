@@ -34,6 +34,7 @@ export interface ApplyEditResult {
   filesModified: string[];
   backupFiles: string[];
   error?: string;
+  rollbackFailures?: string[];
 }
 
 export type AtomicRewriteStage =
@@ -258,6 +259,23 @@ export async function applyWorkspaceEdit(
     lspClient?: LSPClient;
   } = {}
 ): Promise<ApplyEditResult> {
+  const paths = Object.keys(workspaceEdit.changes ?? {}).map(uriToPath);
+  return options.lspClient
+    ? options.lspClient.withDocumentWriteScopes(paths, () =>
+        applyWorkspaceEditUnderScope(workspaceEdit, options)
+      )
+    : applyWorkspaceEditUnderScope(workspaceEdit, options);
+}
+
+async function applyWorkspaceEditUnderScope(
+  workspaceEdit: WorkspaceEdit,
+  options: {
+    createBackups?: boolean;
+    validateBeforeApply?: boolean;
+    backupSuffix?: string;
+    lspClient?: LSPClient;
+  } = {}
+): Promise<ApplyEditResult> {
   const {
     createBackups = true,
     validateBeforeApply = true,
@@ -381,18 +399,19 @@ export async function applyWorkspaceEdit(
         .map((b) => b.backupPath),
     };
   } catch (error) {
-    // Rollback: restore original files from backups
+    const rollbackFailures: string[] = [];
     for (const backup of backups) {
       try {
         // Restore to the target path (the actual file, not the symlink)
         writeFileSync(backup.targetPath, backup.originalContent, 'utf-8');
+        if (lspClient) await lspClient.syncFileContent(backup.originalPath);
       } catch (rollbackError) {
-        console.error(`Failed to rollback ${backup.targetPath}:`, rollbackError);
+        rollbackFailures.push(`${backup.originalPath}: ${String(rollbackError)}`);
       }
     }
 
-    // Clean up backup files after successful rollback
-    for (const backup of backups) {
+    // Keep recovery bytes when any disk/provider restoration failed.
+    for (const backup of rollbackFailures.length === 0 ? backups : []) {
       if (backup.backupPath) {
         try {
           if (existsSync(backup.backupPath)) {
@@ -407,8 +426,12 @@ export async function applyWorkspaceEdit(
     return {
       success: false,
       filesModified: [],
-      backupFiles: [],
+      backupFiles:
+        rollbackFailures.length > 0
+          ? backups.flatMap((backup) => (backup.backupPath ? [backup.backupPath] : []))
+          : [],
       error: error instanceof Error ? error.message : String(error),
+      ...(rollbackFailures.length > 0 ? { rollbackFailures } : {}),
     };
   }
 }

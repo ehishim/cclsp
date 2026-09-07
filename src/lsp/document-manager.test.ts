@@ -25,6 +25,13 @@ function createMockTransport(): JsonRpcTransport & {
   };
 }
 
+async function openAndRelease(manager: DocumentManager, path: string): Promise<boolean> {
+  const lease = await manager.acquire(path);
+  const opened = lease.justOpened;
+  lease.release();
+  return opened;
+}
+
 describe('DocumentManager', () => {
   let transport: ReturnType<typeof createMockTransport>;
   let manager: DocumentManager;
@@ -39,12 +46,12 @@ describe('DocumentManager', () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  describe('ensureOpen', () => {
+  describe('opening through a read lease', () => {
     it('opens a file and sends didOpen notification', async () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'const x = 1;');
 
-      const result = await manager.ensureOpen(filePath);
+      const result = await openAndRelease(manager, filePath);
 
       expect(result).toBe(true);
       expect(transport.sendNotification).toHaveBeenCalledTimes(1);
@@ -61,8 +68,8 @@ describe('DocumentManager', () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'const x = 1;');
 
-      await manager.ensureOpen(filePath);
-      const result = await manager.ensureOpen(filePath);
+      await openAndRelease(manager, filePath);
+      const result = await openAndRelease(manager, filePath);
 
       expect(result).toBe(false);
       expect(transport.sendNotification).toHaveBeenCalledTimes(1);
@@ -71,7 +78,7 @@ describe('DocumentManager', () => {
     it('throws when file does not exist', async () => {
       const filePath = join(TEST_DIR, 'nonexistent.ts');
 
-      expect(manager.ensureOpen(filePath)).rejects.toThrow();
+      expect(openAndRelease(manager, filePath)).rejects.toThrow();
     });
   });
 
@@ -80,8 +87,8 @@ describe('DocumentManager', () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'const x = 1;');
 
-      await manager.ensureOpen(filePath);
-      manager.sendChange(filePath, 'const x = 2;');
+      await openAndRelease(manager, filePath);
+      await manager.withWriter(async () => manager.sendChange(filePath, 'const x = 2;'));
 
       expect(transport.sendNotification).toHaveBeenCalledWith('textDocument/didChange', {
         textDocument: expect.objectContaining({
@@ -95,9 +102,11 @@ describe('DocumentManager', () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'v1');
 
-      await manager.ensureOpen(filePath);
-      manager.sendChange(filePath, 'v2');
-      manager.sendChange(filePath, 'v3');
+      await openAndRelease(manager, filePath);
+      await manager.withWriter(async () => {
+        manager.sendChange(filePath, 'v2');
+        manager.sendChange(filePath, 'v3');
+      });
 
       expect(manager.getVersion(filePath)).toBe(3);
     });
@@ -108,11 +117,11 @@ describe('DocumentManager', () => {
       expect(manager.isOpen('/some/file.ts')).toBe(false);
     });
 
-    it('returns true after ensureOpen', async () => {
+    it('reports an open document after a read lease', async () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'content');
 
-      await manager.ensureOpen(filePath);
+      await openAndRelease(manager, filePath);
       expect(manager.isOpen(filePath)).toBe(true);
     });
   });
@@ -126,7 +135,7 @@ describe('DocumentManager', () => {
       const filePath = join(TEST_DIR, 'test.ts');
       await writeFile(filePath, 'content');
 
-      await manager.ensureOpen(filePath);
+      await openAndRelease(manager, filePath);
       expect(manager.getVersion(filePath)).toBe(1);
     });
   });
@@ -156,10 +165,10 @@ describe('DocumentManager bounded lifecycle', () => {
     const internals = manager as unknown as { documents: Map<string, unknown> };
     internals.documents = new Node18Map(internals.documents);
     try {
-      await manager.ensureOpen(first);
-      await manager.ensureOpen(second);
-      await manager.ensureOpen(first);
-      await manager.ensureOpen(third);
+      await openAndRelease(manager, first);
+      await openAndRelease(manager, second);
+      await openAndRelease(manager, first);
+      await openAndRelease(manager, third);
       expect(manager.isOpen(first)).toBe(true);
       expect(manager.isOpen(second)).toBe(false);
       expect(manager.getVersion(second)).toBe(0);
@@ -181,10 +190,11 @@ describe('DocumentManager bounded lifecycle', () => {
     const manager = new DocumentManager(createMockTransport(), 1);
     try {
       const firstLease = await manager.acquire(first);
-      const secondLease = await manager.acquire(second);
-      expect(manager.getOpenCount()).toBe(2);
+      const secondPending = manager.acquire(second);
+      expect(manager.getOpenCount()).toBe(1);
       expect(manager.isOpen(first)).toBe(true);
       firstLease.release();
+      const secondLease = await secondPending;
       expect(manager.getOpenCount()).toBe(1);
       expect(manager.isOpen(first)).toBe(false);
       expect(manager.isOpen(second)).toBe(true);
@@ -233,7 +243,7 @@ describe('DocumentManager bounded lifecycle', () => {
     await writeFile(file, 'const value = target;\n');
     const manager = new DocumentManager(createMockTransport());
     try {
-      await manager.ensureOpen(file);
+      await openAndRelease(manager, file);
       let finishTemporary: (() => void) | undefined;
       const temporaryAction = manager.withTemporaryContent(
         file,
@@ -271,7 +281,7 @@ describe('DocumentManager bounded lifecycle', () => {
     await writeFile(file, 'const value = target;\n');
     const manager = new DocumentManager(createMockTransport());
     try {
-      await manager.ensureOpen(file);
+      await openAndRelease(manager, file);
       await manager.withTemporaryContent(file, 'const value = target.;\n', async () => {
         expect(manager.getText(file)).toBe('const value = target.;\n');
       });

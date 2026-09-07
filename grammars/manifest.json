@@ -1,0 +1,19 @@
+{
+  "source": {
+    "url": "https://codeload.github.com/tree-sitter/tree-sitter-typescript/tar.gz/refs/tags/v0.23.2",
+    "sha256": "2c4ce711ae8d1218a3b2f899189298159d672870b5b34dff5d937bed2f3e8983",
+    "directory": "tree-sitter-typescript-0.23.2"
+  },
+  "cliVersion": "0.24.7",
+  "javascriptVersion": "0.23.1",
+  "builder": "emscripten/emsdk@sha256:8847dad4171ebc8a53d9ae5cda86a2546ef5b2e68834c14dc1ba2b2962e125cc",
+  "patches": {
+    "tree-sitter-typescript-0.23.2-jsx-bare-ampersand.patch": "df8bae969c0851eb1f92401a3e6e1fe2df5732a3d42c8f7c7e2d24b21eff9bd5",
+    "tree-sitter-typescript-0.23.2-import-type-and-type-reexport.patch": "f95df58652493e68dd3239eec2946c65c9966795b4cd3f1d562e351182ae2995"
+  },
+  "emccFlags": ["-Os", "-s", "WASM=1", "-s", "SIDE_MODULE=2", "-s", "TOTAL_MEMORY=33554432", "-s", "NODEJS_CATCH_EXIT=0", "-s", "NODEJS_CATCH_REJECTION=0", "-fno-exceptions"],
+  "assets": {
+    "tree-sitter-typescript.wasm": "062ef92ff3f6b1d3d868af46a2445fd7057e6f604d07df0d9311e82323bf3fc4",
+    "tree-sitter-tsx.wasm": "caef4cf10f2a54ca50f9631f6d3d13e00ec43e0da8a8b91d95d0efc58409d856"
+  }
+}

@@ -169,7 +169,7 @@ ROOTS & DAEMON
                           (a subroot of a warm root is reused; --isolate to force new)
   list-roots | roots      Show active roots (pid, age, idle)
   stop-root <path>        Tear down one root
-  restart-root <path>     Restart one root (recover a stale index)
+  restart-root <path>     Restart warm roots serving this path (including covering roots)
   status                  Daemon status (pid, socket, uptime, roots)
   shutdown                Stop all roots and the daemon
   describe                List the available cclsp tools
@@ -274,7 +274,7 @@ function printManagementHelp(command: string): void {
       '  A covered subroot reuses its enclosing instance; pass --isolate only to force\n' +
       '  a dedicated instance.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
-    'restart-root': 'cclsp-hub restart-root <path>\n  Restart one root (recover a stale index).',
+    'restart-root': 'cclsp-hub restart-root <path>\n  Restart warm roots at/below this path and its serving covering root. No warm root is a typed refusal; none is created merely to restart.',
     'list-roots':
       'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
     roots: 'cclsp-hub roots [--json]\n  Alias for list-roots.',
@@ -386,8 +386,8 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res = (await request('restart-root', { root })) as { root: string; pid?: number };
-        out(json ? asJson(res) : `restarted: ${res.root} (pid ${res.pid ?? '?'})`);
+        const res = (await request('restart-root', { root })) as { root: string; pid?: number; roots?: Array<{ root: string; pid?: number }> };
+        out(json ? asJson(res) : (res.roots ?? [res]).map((entry) => `restarted: ${entry.root} (pid ${entry.pid ?? '?'})`).join('\n'));
         return;
       }
       case 'shutdown': {

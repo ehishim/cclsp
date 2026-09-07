@@ -3,6 +3,7 @@
 // escapes embedded newlines, so a single object is always exactly one line.
 
 import type { Socket } from 'node:net';
+import { StringDecoder } from 'node:string_decoder';
 
 export interface HubRequest {
   id: number;
@@ -39,30 +40,42 @@ export function createLineReader(
   const limit = options.maxFrameBytes && options.maxFrameBytes > 0
     ? options.maxFrameBytes
     : DEFAULT_MAX_FRAME_BYTES;
+  let decoder = new StringDecoder('utf8');
   let buffer = '';
+  let frameBytes = 0;
   let discardingFrame = false;
   return (chunk: Buffer) => {
-    buffer += chunk.toString('utf8');
-    let nl = buffer.indexOf('\n');
-    while (nl !== -1) {
-      const line = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 1);
-      if (discardingFrame) {
-        discardingFrame = false;
-      } else if (line.trim().length > 0) {
-        try {
-          onMessage(JSON.parse(line));
-        } catch {
-          // ignore a malformed line rather than tearing down the connection
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(10, offset);
+      const end = newline === -1 ? chunk.length : newline;
+      if (!discardingFrame) {
+        frameBytes += end - offset;
+        if (frameBytes > limit) {
+          discardingFrame = true;
+          buffer = '';
+          decoder = new StringDecoder('utf8');
+          options.onOverflow?.(frameBytes, limit);
+        } else {
+          buffer += decoder.write(chunk.subarray(offset, end));
         }
       }
-      nl = buffer.indexOf('\n');
-    }
-    const pending = Buffer.byteLength(buffer, 'utf8');
-    if (pending > limit) {
-      options.onOverflow?.(pending, limit);
+      if (newline === -1) break;
+      if (!discardingFrame) {
+        const line = buffer + decoder.end();
+        if (line.trim()) {
+          try {
+            onMessage(JSON.parse(line));
+          } catch {
+            // Malformed input costs one frame, not the connection.
+          }
+        }
+      }
       buffer = '';
-      discardingFrame = true;
+      frameBytes = 0;
+      discardingFrame = false;
+      decoder = new StringDecoder('utf8');
+      offset = newline + 1;
     }
   };
 }

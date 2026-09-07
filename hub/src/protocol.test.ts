@@ -30,6 +30,30 @@ describe('cclsp Hub line framing', () => {
     expect(seen).toEqual([{ id: 7, cmd: 'status' }]);
   });
 
+  it('rejects oversized complete frames without discarding adjacent replies', () => {
+    const seen: unknown[] = [];
+    const overflow: number[] = [];
+    const read = createLineReader((msg) => seen.push(msg), {
+      maxFrameBytes: 32,
+      onOverflow: (bytes) => overflow.push(bytes),
+    });
+    read(Buffer.from(`${JSON.stringify({ text: 'x'.repeat(64) })}\n{"id":1}\n{"id":2}\n`));
+    expect(overflow).toHaveLength(1);
+    expect(seen).toEqual([{ id: 1 }, { id: 2 }]);
+  });
+
+  it('preserves UTF-8 at every byte boundary', () => {
+    const expected = { text: 'Ж → 😀' };
+    const bytes = Buffer.from(`${JSON.stringify(expected)}\n`);
+    for (let split = 1; split < bytes.length; split++) {
+      const seen: unknown[] = [];
+      const read = createLineReader((msg) => seen.push(msg));
+      read(bytes.subarray(0, split));
+      read(bytes.subarray(split));
+      expect(seen).toEqual([expected]);
+    }
+  });
+
   it('ignores a malformed line without tearing down the connection', () => {
     const seen: unknown[] = [];
     const read = createLineReader((msg) => seen.push(msg));

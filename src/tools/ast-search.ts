@@ -96,7 +96,7 @@ function toolResult(result: AstSearchOutcome): ToolResult {
 export const astSearchTool: ToolDefinition = {
   name: 'ast_search',
   description:
-    'Search syntax structure with offline Tree-sitter patterns. $NAME captures one named node and $$$NAME captures zero or more named siblings.',
+    'Find code by name or syntax shape. A bare name finds identifier, method/property and type-name occurrences, not comments or string text. $NAME captures one named node and $$$NAME captures zero or more named siblings. Use semantic references before renaming.',
   inputSchema: {
     type: 'object',
     properties: {

@@ -222,7 +222,7 @@ export class ServerManager {
         clearTimeout(serverState.restartTimer);
         serverState.restartTimer = undefined;
       }
-      this.servers.delete(key);
+      if (this.servers.get(key) === serverState) this.servers.delete(key);
     });
 
     childProcess.on('error', (error) => {
@@ -232,7 +232,7 @@ export class ServerManager {
 
       // Reject pending requests and clean up so next request starts fresh
       transport.rejectAllPending(`LSP server process error: ${error.message}`);
-      this.servers.delete(key);
+      if (this.servers.get(key) === serverState) this.servers.delete(key);
     });
 
     // Initialize the server

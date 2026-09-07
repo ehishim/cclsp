@@ -214,6 +214,14 @@ export class RootPool {
       .sort((a, b) => b.root.length - a.root.length)[0];
   }
 
+  servingRoots(rootInput: string): RootEntry[] {
+    const root = normalizeRoot(rootInput);
+    const selected = this.list().filter((entry) => isUnder(entry.root, root));
+    const covering = this.findCoveringRoot(root);
+    if (covering && !selected.includes(covering)) selected.push(covering);
+    return selected.sort((a, b) => a.root.localeCompare(b.root));
+  }
+
   private rememberDetectedRoot(root: string): void {
     const normalized = normalizeRoot(root);
     this.detectedRoots.delete(normalized);

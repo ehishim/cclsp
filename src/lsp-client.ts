@@ -31,6 +31,7 @@ import {
   getCompletions as opsGetCompletions,
   getDiagnostics as opsGetDiagnostics,
   getDiagnosticsBatch as opsGetDiagnosticsBatch,
+  getDiagnosticsReport as opsGetDiagnosticsReport,
   getDocumentSymbols as opsGetDocumentSymbols,
   getSignatureHelp as opsGetSignatureHelp,
   hover as opsHover,
@@ -278,17 +279,14 @@ export class LSPClient {
     try {
       const serverState = await this.getServer(filePath);
 
-      const lease = await serverState.documentManager.acquire(filePath);
-      try {
-        logger.debug(`[syncFileContent] Syncing file: ${filePath}\n`);
+      await serverState.documentManager.withWriter(async (scope) => {
+        if (!serverState.documentManager.isOpen(filePath)) return;
         const fileContent = readFileSync(filePath, 'utf-8');
-        serverState.documentManager.sendChange(filePath, fileContent);
-        logger.debug(`[syncFileContent] File synced: ${filePath}\n`);
-      } finally {
-        lease.release();
-      }
+        serverState.documentManager.changeUnderScope(filePath, fileContent, scope);
+      });
     } catch (error) {
       logger.error(`[syncFileContent] Failed to sync file ${filePath}: ${error}\n`);
+      throw error;
     } finally {
       await this.astProvider.invalidate(filePath);
     }
@@ -339,13 +337,17 @@ export class LSPClient {
           reason: 'Candidate identity no longer matches a fresh structural rewrite preview',
         };
       }
-      const transaction = await applyAtomicRewrite(result.prepared, {
-        synchronize: (files) => this.synchronizeRewriteFilesStrict(files),
-        invalidate: async (paths) => {
-          await Promise.all(paths.map((path) => this.astProvider.invalidate(path)));
-        },
-        inject: (stage, _file, index) => this.injectRewriteFailureForTest(stage, index),
-      });
+      const transaction = await this.withDocumentWriteScopes(
+        result.prepared.files.map((file) => file.absolutePath),
+        () =>
+          applyAtomicRewrite(result.prepared, {
+            synchronize: (files) => this.synchronizeRewriteFilesStrict(files),
+            invalidate: async (paths) => {
+              await Promise.all(paths.map((path) => this.astProvider.invalidate(path)));
+            },
+            inject: (stage, _file, index) => this.injectRewriteFailureForTest(stage, index),
+          })
+      );
       if (!transaction.success) {
         if (transaction.code === 'AST_REWRITE_STALE' && !transaction.rollback.attempted) {
           return {
@@ -376,6 +378,23 @@ export class LSPClient {
     });
   }
 
+  async withDocumentWriteScopes<T>(paths: string[], action: () => Promise<T>): Promise<T> {
+    const configurations = new Map<string, LSPServerConfig>();
+    for (const path of paths) {
+      const config = this.getServerForFile(path);
+      if (config) configurations.set(JSON.stringify(config), config);
+    }
+    const states: ServerState[] = [];
+    for (const [, config] of [...configurations].sort(([a], [b]) => a.localeCompare(b))) {
+      states.push(await this.serverManager.getServer(config));
+    }
+    const run = (index: number): Promise<T> => {
+      const state = states[index];
+      return state ? state.documentManager.withWriter(() => run(index + 1)) : action();
+    };
+    return run(0);
+  }
+
   async synchronizeRewriteFilesStrict(
     files: Array<{ path: string; content: string }>
   ): Promise<void> {
@@ -394,16 +413,14 @@ export class LSPClient {
     for (const group of groups.values()) {
       const serverState = await this.serverManager.getServer(group.config);
       await serverState.initializationPromise;
-      for (const file of group.files) {
-        const lease = await serverState.documentManager.acquire(file.path, true);
-        try {
-          serverState.documentManager.sendChange(file.path, file.content);
+      await serverState.documentManager.withWriter(async (scope) => {
+        for (const file of group.files) {
+          if (!serverState.documentManager.isOpen(file.path)) continue;
+          serverState.documentManager.changeUnderScope(file.path, file.content, scope);
           serverState.documentManager.setSyncSig(file.path, contentSignature(file.content));
           serverState.diagnosticsCache.delete(pathToUri(file.path));
-        } finally {
-          lease.release();
         }
-      }
+      });
     }
   }
 
@@ -624,7 +641,7 @@ export class LSPClient {
         range: occurrence.range,
         detail: 'syntax-located query occurrence; semantic identity is resolved by LSP',
       })),
-      truncated: found.truncated,
+      truncated: found.truncated || found.recovered === true,
     };
   }
 
@@ -741,7 +758,10 @@ export class LSPClient {
   async didRenameFiles(oldPath: string, newPath: string): Promise<void> {
     try {
       const serverState = await this.getServer(oldPath);
-      return opsDidRenameFiles(serverState, oldPath, newPath);
+      await serverState.documentManager.withWriter(async (scope) => {
+        serverState.documentManager.renameOpenDocument(oldPath, newPath, scope);
+        await opsDidRenameFiles(serverState, oldPath, newPath);
+      });
     } finally {
       await this.astProvider.invalidate(oldPath);
       await this.astProvider.invalidate(newPath);
@@ -753,6 +773,10 @@ export class LSPClient {
     return opsGetDiagnostics(serverState, filePath);
   }
 
+  async getDiagnosticsReport(filePath: string) {
+    return opsGetDiagnosticsReport(await this.getServer(filePath), filePath);
+  }
+
   async getDiagnosticsBatch(filePaths: string[]): Promise<BatchDiagnosticResult[]> {
     // Group files by their LSP server
     const serverGroups = new Map<string, { serverConfig: LSPServerConfig; paths: string[] }>();
@@ -760,8 +784,7 @@ export class LSPClient {
     for (const filePath of filePaths) {
       const serverConfig = this.getServerForFile(filePath);
       if (!serverConfig) {
-        logger.debug(`[getDiagnosticsBatch] No server for file, skipping: ${filePath}\n`);
-        continue;
+        throw new Error(`LSP_DIAGNOSTICS_UNKNOWN: no configured server for ${filePath}`);
       }
       const key = JSON.stringify(serverConfig);
       const group = serverGroups.get(key);

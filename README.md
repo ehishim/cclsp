@@ -492,7 +492,7 @@ Rename a symbol selected by `query` or a specific position in a file. Use this w
 
 ### `get_diagnostics`
 
-Get language diagnostics (errors, warnings, hints) for a file. Uses LSP textDocument/diagnostic to pull current diagnostics.
+Check a file for errors, warnings and hints after changing it or its imports. A current empty result establishes that no diagnostics were found in that scope. Unverified or unavailable results do not establish clean code: follow the returned recovery and retry. For TypeScript, configure typescript-language-server 5.3 or newer on a compatible Node host for current diagnostics.
 
 **Parameters:**
 - `file_path`: The path to the file to get diagnostics for

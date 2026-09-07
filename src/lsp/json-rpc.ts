@@ -31,7 +31,9 @@ const MAX_HEADER_BYTES = 64 * 1024;
 
 function maxMessageBytes(): number {
   const configured = Number.parseInt(process.env.CCLSP_LSP_MAX_MESSAGE_BYTES ?? '', 10);
-  return Number.isSafeInteger(configured) && configured > 0 ? configured : DEFAULT_MAX_MESSAGE_BYTES;
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_MESSAGE_BYTES;
 }
 
 /** One frame being streamed to disk because it is too large to hold in memory. */
@@ -176,7 +178,10 @@ export class JsonRpcTransport {
       fd = null;
     }
     this.oversized = {
-      remaining: contentLength, total: contentLength, path, fd,
+      remaining: contentLength,
+      total: contentLength,
+      path,
+      fd,
       scanner: new TopLevelResponseIdScanner(),
     };
   }
@@ -230,7 +235,7 @@ export class JsonRpcTransport {
     const request = id !== null ? this.pendingRequests.get(id) : undefined;
     if (id === null || !request) {
       logger.error(
-        `Spooled a ${frame.total}-byte oversized LSP frame that answers no pending request${frame.path ? ` at ${frame.path}` : ''}\n`,
+        `Spooled a ${frame.total}-byte oversized LSP frame that answers no pending request${frame.path ? ` at ${frame.path}` : ''}\n`
       );
       return;
     }
@@ -248,7 +253,7 @@ export class JsonRpcTransport {
         ...(frame.path ? { resultFile: frame.path } : {}),
         bytes: frame.total,
         recovery,
-      }),
+      })
     );
   }
 
@@ -256,8 +261,14 @@ export class JsonRpcTransport {
    * Handle an incoming message: correlate responses, delegate the rest.
    */
   private handleIncoming(message: LSPMessage): void {
-    // Response correlation: match responses to pending requests
-    // Use !== undefined to handle id: 0 (valid JSON-RPC id)
+    // Request ids are independent in each direction; a server request can reuse
+    // an id that this client is still waiting for.
+    if (message.method !== undefined) {
+      this.onMessage(message);
+      return;
+    }
+    if (!('result' in message) && !('error' in message)) return;
+
     if (message.id !== undefined && this.pendingRequests.has(message.id)) {
       const request = this.pendingRequests.get(message.id);
       if (!request) return;
@@ -269,11 +280,6 @@ export class JsonRpcTransport {
       } else {
         resolve(message.result);
       }
-    }
-
-    // Delegate notifications and server-initiated requests to the handler
-    if (message.method) {
-      this.onMessage(message);
     }
   }
 

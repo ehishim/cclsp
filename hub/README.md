@@ -97,7 +97,7 @@ cclsp-hub status
 | `ensure-root <path>` | Register a project root and warm its language servers (idempotent). A subroot of an already-warm root is reused — pass `--isolate` to force a dedicated instance. |
 | `list-roots` / `roots` | Show active roots with pid, age, idle time. |
 | `stop-root <path>` | Tear down one root and its language servers. |
-| `restart-root <path>` | Restart one root (recover a stale index). |
+| `restart-root <path>` | Restart warm roots at/below the path and its serving covering root; refuses when none is warm. |
 | `status` | Daemon status (pid, socket, uptime, roots). Does **not** start the daemon. |
 | `shutdown` | Stop all roots and the daemon. |
 | `describe` | List the available cclsp tools (and schemas with `--json`). |

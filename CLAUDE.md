@@ -169,9 +169,15 @@ bun run lint:fix && bun run format && bun run typecheck && bun run test
 
 `ast_search(pattern, language, path?, max_results?)` is an offline structural-search tool. `language` is required. A relative `path` resolves under the registered root, and canonical path checks reject traversal or symlink escape. `max_results` defaults to 100 and is capped at 1,000.
 
-Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, and explicit oversized files are typed `AST_*` rejections, and an explicitly named unparseable file is still `AST_PARSE_FAILED`. In a directory scan a file the parser could only recover is searched instead of skipped: its matches are returned as `recovered` presence evidence, the file is listed as `AST_PARSE_RECOVERED`, and the result stays `partial` so no zero over that scope is read as absence. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
+Use `$NAME` for one named syntax node and `$$$NAME` for zero or more named siblings. Structured ranges are zero-indexed; default text coordinates are one-indexed. Invalid patterns, unsupported languages, invalid/escaped paths, and explicit oversized files are typed `AST_*` rejections, while an unreadable file is `AST_PARSE_FAILED`. A file the parser could only recover is searched in both explicit-file and directory scopes: its matches are returned as `recovered` presence evidence, the file is listed as `AST_PARSE_RECOVERED`, and the result stays `partial` so no zero over that scope is read as absence. Directory searches expose skipped-file, index-cap, truncation, and partial-parse metadata.
 
 Tree-sitter evidence is syntax-only. Never use it as semantic proof for references, inferred types, signatures, implementations, call hierarchy, diagnostics, or rename safety.
+
+Use structural search to locate a name or code shape before opening implementation files. Search a file when its owner is known, or the relevant directory when it is not. TypeScript/TSX support includes JSX text, import types and type re-exports; normal searches need no download or build.
+
+## Diagnostics Freshness
+
+Check diagnostics after changing a file or its imports. Use one-file diagnostics for a focused check and batch diagnostics for the affected directory. A current empty result means no diagnostics were found in the checked scope; an unverified or unknown result does not establish that the code is clean. Follow its recovery before relying on it. For current TypeScript diagnostics, configure typescript-language-server 5.3 or newer on a compatible Node host; upgrading an installed provider is separate from editing code.
 
 ## Structural Rewrite
 

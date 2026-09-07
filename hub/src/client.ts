@@ -4,7 +4,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { type Socket, connect } from 'node:net';
-import { SOCKET_PATH } from './config.js';
+import { SOCKET_PATH, TOOL_TIMEOUT_MS } from './config.js';
 import { type HubResponse, createLineReader, writeMessage } from './protocol.js';
 
 let reqId = 0;
@@ -52,22 +52,54 @@ async function getConnection(autoStart: boolean): Promise<Socket> {
 export async function request(
   cmd: string,
   args: Record<string, unknown> = {},
-  opts: { autoStart?: boolean } = {},
+  opts: { autoStart?: boolean } = {}
 ): Promise<unknown> {
   const sock = await getConnection(opts.autoStart ?? true);
   const id = ++reqId;
   return new Promise((res, rej) => {
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      sock.destroy();
+      rej(error);
+    };
+    const timer = setTimeout(
+      () =>
+        fail(new Error('HUB_TIMEOUT: response deadline exceeded; inspect effects before retrying')),
+      TOOL_TIMEOUT_MS
+    );
     sock.on(
       'data',
-      createLineReader((msg: HubResponse) => {
-        if (msg.id !== id) return;
-        sock.end();
-        if (msg.ok) res(msg.result);
-        else rej(new Error(msg.error || 'request failed'));
-      }),
+      createLineReader(
+        (msg: HubResponse) => {
+          if (msg.id !== id) return;
+          settled = true;
+          clearTimeout(timer);
+          sock.end();
+          if (msg.ok) res(msg.result);
+          else rej(new Error(msg.error || 'request failed'));
+        },
+        {
+          onOverflow: () =>
+            fail(new Error('HUB_FRAME_TOO_LARGE: response exceeds the frame bound')),
+        }
+      )
     );
-    sock.on('error', rej);
-    writeMessage(sock, { id, cmd, args });
+    sock.once('error', fail);
+    sock.once('close', () =>
+      fail(
+        new Error(
+          'HUB_REPLY_LOST: connection closed before a response; inspect effects before retrying'
+        )
+      )
+    );
+    try {
+      writeMessage(sock, { id, cmd, args });
+    } catch (error) {
+      fail(error as Error);
+    }
   });
 }
 

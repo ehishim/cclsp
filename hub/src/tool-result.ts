@@ -167,7 +167,7 @@ export function normalizeToolResult(
   if (text) normalized.text = text;
   if (!Array.isArray(normalized.ranges) && ranges.length > 0) normalized.ranges = ranges;
   if (typeof normalized.shown !== 'number') normalized.shown = cardinality;
-  if (normalized.outcome !== 'partial' && typeof normalized.total !== 'number') {
+  if (normalized.outcome !== 'partial' && normalized.total !== null && typeof normalized.total !== 'number') {
     normalized.total = cardinality;
   }
   if (typeof normalized.total === 'number' && typeof normalized.omitted !== 'number') {

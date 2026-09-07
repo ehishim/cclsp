@@ -41,10 +41,21 @@ function createMockDiagnosticsCache(initial?: Map<string, unknown[]>) {
 
 /** Create a mock DocumentManager for test server states */
 function createMockDocumentManager() {
+  const sendChange = jest.fn();
   return {
+    withWriter: jest.fn(async (action: (scope: { epoch: number }) => Promise<unknown>) =>
+      action({ epoch: 0 })
+    ),
+    changeUnderScope: jest.fn((path: string, text: string) => sendChange(path, text)),
+    reconcile: jest
+      .fn()
+      .mockResolvedValue({ epoch: 0, contents: new Map(), resynced: [], bytesCompared: 0 }),
+    changedSince: jest.fn().mockResolvedValue([]),
+    capacity: 100,
+    acquireChunk: jest.fn().mockResolvedValue([{ justOpened: true, release: jest.fn() }]),
     ensureOpen: jest.fn().mockResolvedValue(false),
     acquire: jest.fn().mockResolvedValue({ justOpened: true, release: jest.fn() }),
-    sendChange: jest.fn(),
+    sendChange,
     isOpen: jest.fn().mockReturnValue(false),
     getVersion: jest.fn().mockReturnValue(0),
     getSyncSig: jest.fn().mockReturnValue(undefined),
@@ -1178,7 +1189,7 @@ describe('LSPClient', () => {
       getServerSpy.mockRestore();
     });
 
-    it('should return empty array for unchanged report', async () => {
+    it('rejects unchanged reports without a corresponding previous result id', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
 
       const mockTransport = createMockTransport({
@@ -1203,14 +1214,14 @@ describe('LSPClient', () => {
         'getServer'
       ).mockResolvedValue(mockServerState);
 
-      const result = await client.getDiagnostics(MOCK_TEST_TS);
-
-      expect(result).toEqual([]);
+      await expect(client.getDiagnostics(MOCK_TEST_TS)).rejects.toThrow(
+        'LSP_REQUEST_INVALID_RESPONSE'
+      );
 
       getServerSpy.mockRestore();
     });
 
-    it('should return cached diagnostics from publishDiagnostics', async () => {
+    it('does not certify cached push diagnostics as current', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
 
       const mockDiagnostics = [
@@ -1228,6 +1239,7 @@ describe('LSPClient', () => {
         serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport(),
         initialized: true,
         documentManager: createMockDocumentManager(),
         diagnosticsCache: createMockDiagnosticsCache(
@@ -1244,11 +1256,8 @@ describe('LSPClient', () => {
       process.env.CCLSP_LOG_LEVEL = 'debug';
 
       try {
-        const result = await client.getDiagnostics(MOCK_TEST_TS);
-
-        expect(result).toEqual(mockDiagnostics);
-        expect(stderrSpy).toHaveBeenCalledWith(
-          expect.stringContaining('Returning 1 cached diagnostics from publishDiagnostics')
+        await expect(client.getDiagnostics(MOCK_TEST_TS)).rejects.toThrow(
+          'LSP_REQUEST_INVALID_RESPONSE'
         );
       } finally {
         if (savedLogLevel !== undefined) {
@@ -1288,9 +1297,9 @@ describe('LSPClient', () => {
       process.env.CCLSP_LOG_LEVEL = 'debug';
 
       try {
-        const result = await client.getDiagnostics(MOCK_TEST_TS);
-
-        expect(result).toEqual([]);
+        await expect(client.getDiagnostics(MOCK_TEST_TS)).rejects.toThrow(
+          'LSP_DIAGNOSTICS_UNKNOWN'
+        );
         expect(mockTransport.sendRequest).not.toHaveBeenCalled();
       } finally {
         if (savedLogLevel !== undefined) {
@@ -1325,9 +1334,9 @@ describe('LSPClient', () => {
         'getServer'
       ).mockResolvedValue(mockServerState);
 
-      const result = await client.getDiagnostics(MOCK_TEST_TS);
-
-      expect(result).toEqual([]);
+      await expect(client.getDiagnostics(MOCK_TEST_TS)).rejects.toThrow(
+        'LSP_REQUEST_INVALID_RESPONSE'
+      );
 
       getServerSpy.mockRestore();
     });
@@ -1879,12 +1888,19 @@ describe('LSPClient', () => {
   });
 
   describe('strict rewrite synchronization', () => {
-    it('takes one exclusive lease, sends one change, updates signature, and clears diagnostics', async () => {
+    it('takes one writer scope, syncs an open document, and clears diagnostics', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
       const documentManager = createMockDocumentManager();
       const diagnosticsCache = createMockDiagnosticsCache();
       const release = jest.fn();
-      documentManager.acquire.mockResolvedValue({ justOpened: false, release });
+      documentManager.isOpen.mockReturnValue(true);
+      documentManager.withWriter.mockImplementation(async (action) => {
+        try {
+          return await action({ epoch: 0 });
+        } finally {
+          release();
+        }
+      });
       const serverState = {
         initializationPromise: Promise.resolve(),
         documentManager,
@@ -1903,7 +1919,8 @@ describe('LSPClient', () => {
         { path: MOCK_TEST_TS, content: 'const x = 2;\n' },
       ]);
 
-      expect(documentManager.acquire).toHaveBeenCalledWith(MOCK_TEST_TS, true);
+      expect(documentManager.withWriter).toHaveBeenCalledTimes(1);
+      expect(documentManager.acquire).not.toHaveBeenCalled();
       expect(documentManager.sendChange).toHaveBeenCalledTimes(1);
       expect(documentManager.sendChange).toHaveBeenCalledWith(MOCK_TEST_TS, 'const x = 2;\n');
       expect(documentManager.setSyncSig).toHaveBeenCalledWith(
@@ -1918,6 +1935,7 @@ describe('LSPClient', () => {
     it('groups files by server while sending one change per configured document', async () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
       const documentManager = createMockDocumentManager();
+      documentManager.isOpen.mockReturnValue(true);
       const getServerSpy = spyOn(
         (
           client as unknown as {
@@ -1945,7 +1963,14 @@ describe('LSPClient', () => {
       const client = new LSPClient(TEST_CONFIG_PATH);
       const documentManager = createMockDocumentManager();
       const release = jest.fn();
-      documentManager.acquire.mockResolvedValue({ justOpened: false, release });
+      documentManager.isOpen.mockReturnValue(true);
+      documentManager.withWriter.mockImplementation(async (action) => {
+        try {
+          return await action({ epoch: 0 });
+        } finally {
+          release();
+        }
+      });
       documentManager.sendChange.mockImplementation(() => {
         throw new Error('didChange failed');
       });

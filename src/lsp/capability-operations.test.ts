@@ -33,7 +33,10 @@ function server(
       rejectAllPending: jest.fn(),
     },
     documentManager: {
-      ensureOpen: jest.fn().mockResolvedValue(false),
+      acquire: jest.fn().mockResolvedValue({ justOpened: false, release: jest.fn() }),
+      withWriter: async (action: (scope: { epoch: number }) => Promise<unknown>) =>
+        action({ epoch: 0 }),
+      changeUnderScope: jest.fn(),
       sendChange: jest.fn(),
       isOpen: jest.fn().mockReturnValue(false),
       getVersion: jest.fn().mockReturnValue(1),
@@ -56,7 +59,7 @@ describe('capability-gated operations', () => {
     const state = server({}, sendRequest);
     await expect(getDocumentSymbols(state, TEST_FILE)).rejects.toBeInstanceOf(LspToolOutcomeError);
     expect(sendRequest).not.toHaveBeenCalled();
-    expect(state.documentManager.ensureOpen).not.toHaveBeenCalled();
+    expect(state.documentManager.acquire).not.toHaveBeenCalled();
   });
 
   it('normalizes type-definition links to their semantic target', async () => {

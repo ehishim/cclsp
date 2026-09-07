@@ -13,7 +13,7 @@ import type { ToolDefinition } from './registry.js';
 export const getDiagnosticsTool: ToolDefinition = {
   name: 'get_diagnostics',
   description:
-    'Get language diagnostics (errors, warnings, hints) for a file. Uses LSP textDocument/diagnostic to pull current diagnostics.',
+    'Check one file for errors, warnings and hints after editing it or its imports. Only a current result can establish that the file is clean; an unverified or unavailable result explains what to correct before retrying.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -21,7 +21,10 @@ export const getDiagnosticsTool: ToolDefinition = {
         type: 'string',
         description: 'The path to the file to get diagnostics for',
       },
-      max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
+      max_results: {
+        type: 'number',
+        description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
+      },
     },
     required: ['file_path'],
   },
@@ -30,18 +33,43 @@ export const getDiagnosticsTool: ToolDefinition = {
     const absolutePath = resolvePath(file_path);
 
     try {
-      const allDiagnostics = await client.getDiagnostics(absolutePath);
+      const report = await client.getDiagnosticsReport(absolutePath);
+      const allDiagnostics = report.diagnostics;
       const diagnostics = allDiagnostics.slice(0, boundedResultLimit(max_results));
       const omitted = allDiagnostics.length - diagnostics.length;
-      const text = diagnostics.length === 0
-        ? `No diagnostics found for ${file_path}. The file has no errors, warnings, or hints.`
-        : `${formatDiagnosticsForFile(file_path, diagnostics)}${omitted > 0 ? `\n\n... ${omitted} omitted. Narrow the file or severity.` : ''}`;
+      if (report.freshness.status !== 'current') {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `${report.reason ?? 'Diagnostics are not current'}${diagnostics.length ? `\n${formatDiagnosticsForFile(file_path, diagnostics)}` : ''}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'stale',
+            provider: 'lsp',
+            code: 'LSP_DIAGNOSTICS_UNKNOWN',
+            diagnostics,
+            shown: diagnostics.length,
+            total: null,
+            omitted,
+            freshness: report.freshness,
+            recovery:
+              'Retry after the reported write finishes, or use a request-capable diagnostics provider.',
+          },
+        };
+      }
+      const text =
+        diagnostics.length === 0
+          ? `No diagnostics found for ${file_path}. The file has no errors, warnings, or hints.`
+          : `${formatDiagnosticsForFile(file_path, diagnostics)}${omitted > 0 ? `\n\n... ${omitted} omitted. Narrow the file or severity.` : ''}`;
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
           outcome: diagnostics.length > 0 ? 'ok' : 'empty',
           provider: 'lsp',
           file: absolutePath,
+          freshness: report.freshness,
           diagnostics,
           shown: diagnostics.length,
           total: allDiagnostics.length,
@@ -51,11 +79,29 @@ export const getDiagnosticsTool: ToolDefinition = {
       };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
+      const details = error as {
+        diagnostics?: import('../lsp/types.js').Diagnostic[];
+        status?: string;
+      };
+      const stale =
+        reason.startsWith('LSP_DIAGNOSTICS_UNKNOWN') || reason.startsWith('LSP_FRESHNESS_UNKNOWN');
       return {
-        content: [{ type: 'text', text: `Error getting diagnostics: ${reason}` }],
+        content: [
+          {
+            type: 'text',
+            text: `Error getting diagnostics: ${reason}${details.diagnostics?.length ? `\nUnverified provider rows:\n${formatDiagnosticsForFile(file_path, details.diagnostics)}` : ''}`,
+          },
+        ],
         structuredContent: {
-          outcome: 'unavailable', provider: 'none', code: 'LSP_DIAGNOSTICS_UNAVAILABLE', reason,
-          diagnostics: [], shown: 0, total: 0, omitted: 0,
+          outcome: stale ? 'stale' : 'unavailable',
+          provider: stale ? 'lsp' : 'none',
+          code: stale ? reason.split(':')[0] : 'LSP_DIAGNOSTICS_UNAVAILABLE',
+          reason,
+          diagnostics: details.diagnostics ?? [],
+          shown: details.diagnostics?.length ?? 0,
+          total: null,
+          omitted: 0,
+          freshness: { status: details.status ?? 'unknown' },
         },
         isError: true,
       };
@@ -66,7 +112,7 @@ export const getDiagnosticsTool: ToolDefinition = {
 export const getDiagnosticsBatchTool: ToolDefinition = {
   name: 'get_diagnostics_batch',
   description:
-    'Get language diagnostics for multiple files at once. Accepts a directory path with optional file pattern filter. Much faster than calling get_diagnostics repeatedly because files are opened in batch and diagnostics are collected in a single wait cycle.',
+    'Check a directory or file for errors, warnings and hints in one call. Filter paths to focus on the affected area. Results distinguish current diagnostics from unverified files and say when the file limit leaves more to check.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -95,7 +141,12 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
     required: ['path'],
   },
   handler: async (args, client) => {
-    const { path: inputPath, pattern, severity_filter, max_files } = args as {
+    const {
+      path: inputPath,
+      pattern,
+      severity_filter,
+      max_files,
+    } = args as {
       path: string;
       pattern?: string;
       severity_filter?: string;
@@ -111,13 +162,19 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
       return Number.isFinite(n) && n > 0 ? n : def;
     };
     const ceiling = envInt(process.env.CCLSP_MAX_FILES_LIMIT, 200);
-    const maxFiles = Math.min(max_files ?? envInt(process.env.CCLSP_MAX_FILES_DEFAULT, 50), ceiling);
+    const maxFiles = Math.min(
+      max_files ?? envInt(process.env.CCLSP_MAX_FILES_DEFAULT, 50),
+      ceiling
+    );
 
     try {
+      if (!Number.isInteger(maxFiles) || maxFiles < 1)
+        throw new Error('max_files must be a positive integer');
       // Check if path is a file or directory
       const pathStat = await stat(absolutePath);
 
       let filePaths: string[];
+      let truncated = false;
 
       if (pathStat.isFile()) {
         filePaths = [absolutePath];
@@ -128,28 +185,56 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
           try {
             regex = new RegExp(pattern);
           } catch {
-            return textResult(`Invalid regex pattern: ${pattern}`);
+            throw new Error(`Invalid regex pattern: ${pattern}`);
           }
         }
 
         // Scan directory for files
-        filePaths = await scanFilesRecursive(absolutePath, regex, maxFiles);
+        filePaths = await scanFilesRecursive(absolutePath, regex, maxFiles + 1);
+        truncated = filePaths.length > maxFiles;
+        filePaths = filePaths.slice(0, maxFiles);
 
         if (filePaths.length === 0) {
           const patternMsg = pattern ? ` matching pattern "${pattern}"` : '';
           return textResult(`No files found in ${inputPath}${patternMsg}.`);
         }
       } else {
-        return textResult(`Path is neither a file nor a directory: ${inputPath}`);
+        throw new Error(`Path is neither a file nor a directory: ${inputPath}`);
       }
 
       // Run batch diagnostics
-      const results = await client.getDiagnosticsBatch(filePaths);
-
-      // Apply severity filter
       const severityThreshold = severity_filter
-        ? { error: 1, warning: 2, info: 3, hint: 4 }[severity_filter] ?? 4
+        ? ({ error: 1, warning: 2, info: 3, hint: 4 }[severity_filter] ?? 4)
         : 4;
+      const results = (await client.getDiagnosticsBatch(filePaths)).map((result) => ({
+        ...result,
+        diagnostics: result.diagnostics.filter(
+          (diagnostic) => (diagnostic.severity ?? 1) <= severityThreshold
+        ),
+      }));
+
+      const uncertain = results.filter((result) => result.status && result.status !== 'current');
+      if (uncertain.length > 0) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Diagnostics incomplete: ${uncertain.length}/${filePaths.length} files are unverified or unknown.\n${results.map((result) => `${result.filePath}: ${result.status ?? 'current'}${result.reason ? ` — ${result.reason}` : ''}${result.diagnostics.length ? `\n${formatDiagnosticsForFile(result.filePath, result.diagnostics)}` : ''}`).join('\n')}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'stale',
+            provider: 'lsp',
+            code: 'LSP_DIAGNOSTICS_UNKNOWN',
+            files: results,
+            shown: results.length,
+            total: null,
+            freshness: { status: 'unknown' },
+            recovery:
+              'Use a request-capable diagnostics provider; retry after any concurrent write completes.',
+          },
+        };
+      }
 
       let totalDiags = 0;
       let totalErrors = 0;
@@ -160,9 +245,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
       const fileOutputs: string[] = [];
 
       for (const result of results) {
-        const filtered = result.diagnostics.filter(
-          (d) => (d.severity ?? 1) <= severityThreshold
-        );
+        const filtered = result.diagnostics.filter((d) => (d.severity ?? 1) <= severityThreshold);
 
         if (filtered.length === 0) continue;
 
@@ -197,30 +280,70 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
 
       if (totalDiags === 0) {
         const patternMsg = pattern ? ` matching "${pattern}"` : '';
-        return textResult(
-          `No diagnostics found across ${filePaths.length} file${filePaths.length === 1 ? '' : 's'}${patternMsg}. All clean!`
-        );
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `No diagnostics found across ${filePaths.length} file${filePaths.length === 1 ? '' : 's'}${patternMsg}.${truncated ? ' Scan reached the file limit; narrow the scope for complete coverage.' : ' All clean!'}`,
+            },
+          ],
+          structuredContent: {
+            outcome: truncated ? 'partial' : 'empty',
+            provider: 'lsp',
+            files: results,
+            shown: 0,
+            total: truncated ? null : 0,
+            freshness: { status: 'current' },
+            fileLimitReached: truncated,
+          },
+        };
       }
 
       // Build summary
       const severityParts: string[] = [];
-      if (totalErrors > 0) severityParts.push(`${totalErrors} error${totalErrors === 1 ? '' : 's'}`);
-      if (totalWarnings > 0) severityParts.push(`${totalWarnings} warning${totalWarnings === 1 ? '' : 's'}`);
+      if (totalErrors > 0)
+        severityParts.push(`${totalErrors} error${totalErrors === 1 ? '' : 's'}`);
+      if (totalWarnings > 0)
+        severityParts.push(`${totalWarnings} warning${totalWarnings === 1 ? '' : 's'}`);
       if (totalInfo > 0) severityParts.push(`${totalInfo} info`);
       if (totalHints > 0) severityParts.push(`${totalHints} hint${totalHints === 1 ? '' : 's'}`);
 
       const filesWithDiags = fileOutputs.length;
       const summary = `Found ${totalDiags} diagnostic${totalDiags === 1 ? '' : 's'} across ${filesWithDiags}/${filePaths.length} files (${severityParts.join(', ')})`;
-      const truncatedMsg =
-        filePaths.length >= maxFiles
-          ? `\n⚠️ Scanned max ${maxFiles} files. Increase max_files to scan more.`
-          : '';
+      const truncatedMsg = truncated
+        ? `\n⚠️ Scanned max ${maxFiles} files. Increase max_files to scan more.`
+        : '';
 
-      return textResult(`${summary}${truncatedMsg}\n\n${fileOutputs.join('\n\n')}`);
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `${summary}${truncatedMsg}\n\n${fileOutputs.join('\n\n')}`,
+          },
+        ],
+        structuredContent: {
+          outcome: truncated ? 'partial' : 'ok',
+          provider: 'lsp',
+          files: results,
+          shown: totalDiags,
+          total: truncated ? null : totalDiags,
+          freshness: { status: 'current' },
+        },
+      };
     } catch (error) {
-      return textResult(
-        `Error getting batch diagnostics: ${error instanceof Error ? error.message : String(error)}`
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text' as const, text: `Error getting batch diagnostics: ${reason}` }],
+        structuredContent: {
+          outcome: 'unavailable',
+          provider: 'none',
+          code: 'LSP_DIAGNOSTICS_UNAVAILABLE',
+          reason,
+          shown: 0,
+          total: null,
+        },
+        isError: true,
+      };
     }
   },
 };
@@ -260,9 +383,33 @@ function formatDiagnosticsForFile(
 
 // Supported extensions that LSP servers typically handle
 const LSP_EXTENSIONS = new Set([
-  'ts', 'tsx', 'js', 'jsx', 'py', 'go', 'rs', 'c', 'cpp', 'h', 'hpp',
-  'java', 'cs', 'php', 'rb', 'swift', 'kt', 'scala', 'dart', 'lua',
-  'vue', 'svelte', 'css', 'scss', 'less', 'md', 'markdown',
+  'ts',
+  'tsx',
+  'js',
+  'jsx',
+  'py',
+  'go',
+  'rs',
+  'c',
+  'cpp',
+  'h',
+  'hpp',
+  'java',
+  'cs',
+  'php',
+  'rb',
+  'swift',
+  'kt',
+  'scala',
+  'dart',
+  'lua',
+  'vue',
+  'svelte',
+  'css',
+  'scss',
+  'less',
+  'md',
+  'markdown',
 ]);
 
 async function scanFilesRecursive(
@@ -293,7 +440,7 @@ async function scanFilesRecursive(
 
       if (ig.ignores(normalized)) continue;
 
-      let entryStat;
+      let entryStat: Awaited<ReturnType<typeof stat>>;
       try {
         entryStat = await stat(fullPath);
       } catch {

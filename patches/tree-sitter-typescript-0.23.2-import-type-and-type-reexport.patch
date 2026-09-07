@@ -1,0 +1,61 @@
+--- a/common/define-grammar.js
++++ b/common/define-grammar.js
+@@ -63,7 +63,6 @@
+       [$.decorator_call_expression, $.decorator],
+       [$.literal_type, $.pattern],
+       [$.predefined_type, $.pattern],
+-      [$.call_expression, $._type_query_call_expression],
+       [$.call_expression, $._type_query_call_expression_in_type_annotation],
+       [$.new_expression, $.primary_expression],
+       [$.meta_property, $.primary_expression],
+@@ -71,6 +70,7 @@
+     ]),
+ 
+     conflicts: ($, previous) => previous.concat([
++      [$.call_expression, $._type_query_call_expression],
+       [$.call_expression, $.instantiation_expression, $.binary_expression],
+       [$.call_expression, $.instantiation_expression, $.binary_expression, $.unary_expression],
+       [$.call_expression, $.instantiation_expression, $.binary_expression, $.update_expression],
+@@ -322,8 +322,10 @@
+         seq(
+           'export',
+           'type',
+-          $.export_clause,
+-          optional($._from_clause),
++          choice(
++            seq($.export_clause, optional($._from_clause)),
++            seq(choice('*', seq('*', 'as', $.identifier)), $._from_clause),
++          ),
+           $._semicolon,
+         ),
+         seq('export', '=', $.expression, $._semicolon),
+@@ -720,14 +722,17 @@
+         seq(':', $.asserts),
+       ),
+ 
++      _import_generic_type: $ => prec(0, seq(
++        field('name', alias($._type_query_member_expression_in_type_annotation, $.member_expression)),
++        field('type_arguments', $.type_arguments),
++      )),
++
+       type: $ => choice(
+         $.primary_type,
+         $.function_type,
+         $.readonly_type,
+         $.constructor_type,
+         $.infer_type,
+-        prec(-1, alias($._type_query_member_expression_in_type_annotation, $.member_expression)),
+-        prec(-1, alias($._type_query_call_expression_in_type_annotation, $.call_expression)),
+       ),
+ 
+       tuple_parameter: $ => seq(
+@@ -762,6 +767,9 @@
+       )),
+ 
+       primary_type: $ => choice(
++        alias($._import_generic_type, $.generic_type),
++        prec(-1, alias($._type_query_member_expression_in_type_annotation, $.member_expression)),
++        prec(-1, alias($._type_query_call_expression_in_type_annotation, $.call_expression)),
+         $.parenthesized_type,
+         $.predefined_type,
+         $._type_identifier,

@@ -1,4 +1,4 @@
-import { existsSync, renameSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { applyWorkspaceEdit } from '../file-editor.js';
 import type { LSPClient } from '../lsp-client.js';
 import { pathToUri, uriToPath } from '../utils.js';
@@ -393,42 +393,93 @@ export const renameFileTool: ToolDefinition = {
           },
         };
       }
-      renameSync(oldPath, newPath);
-      const applied = await applyWorkspaceEdit(normalizedEdit, { lspClient: client });
-      if (!applied.success) {
-        renameSync(newPath, oldPath);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Failed to update imports; file rename rolled back: ${applied.error}`,
+      return await client.withDocumentWriteScopes(
+        [oldPath, ...Object.keys(edit.changes ?? {}).map(uriToPath)],
+        async () => {
+          if (!existsSync(oldPath) || existsSync(newPath))
+            throw new Error('File rename target changed before apply');
+          const currentEdit = await client.willRenameFiles(oldPath, newPath);
+          if (JSON.stringify(currentEdit) !== JSON.stringify(edit))
+            throw new Error('File rename edits changed before apply; preview again');
+          const originals = new Map(
+            Object.keys(edit.changes ?? {}).map((uri) => {
+              const path = uriToPath(uri);
+              return [path, readFileSync(path)] as const;
+            })
+          );
+          let moved = false;
+          let applied: Awaited<ReturnType<typeof applyWorkspaceEdit>>;
+          try {
+            applied = await applyWorkspaceEdit(edit, { createBackups: false });
+            if (!applied.success) throw new Error(applied.error ?? 'failed to update imports');
+            renameSync(oldPath, newPath);
+            moved = true;
+            await client.didRenameFiles(oldPath, newPath);
+            for (const path of applied.filesModified)
+              await client.syncFileContent(path === oldPath ? newPath : path);
+          } catch (error) {
+            const failures: string[] = [];
+            if (moved) {
+              try {
+                renameSync(newPath, oldPath);
+              } catch {
+                failures.push('rename');
+              }
+            }
+            for (const [path, bytes] of originals) {
+              try {
+                writeFileSync(path, bytes);
+              } catch {
+                failures.push(path);
+              }
+            }
+            if (moved && !failures.includes('rename')) {
+              try {
+                await client.didRenameFiles(newPath, oldPath);
+              } catch {
+                failures.push('documents');
+              }
+            }
+            for (const path of originals.keys()) {
+              try {
+                await client.syncFileContent(path);
+              } catch {
+                failures.push(`sync:${path}`);
+              }
+            }
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `File rename failed: ${String(error)}; rollback ${failures.length ? 'incomplete' : 'complete'}`,
+                },
+              ],
+              structuredContent: {
+                outcome: 'rejected',
+                code: 'LSP_ACTION_NOT_APPLICABLE',
+                rolledBack: failures.length === 0,
+                rollbackFailures: failures,
+              },
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Renamed ${oldPath} to ${newPath}${applied.filesModified.length > 0 ? ` and updated:\n${applied.filesModified.join('\n')}` : ''}`,
+              },
+            ],
+            structuredContent: {
+              outcome: 'ok',
+              applied: true,
+              oldPath,
+              newPath,
+              filesModified: applied.filesModified,
             },
-          ],
-          structuredContent: {
-            outcome: 'rejected',
-            code: 'LSP_ACTION_NOT_APPLICABLE',
-            method: 'workspace/willRenameFiles',
-            reason: applied.error ?? 'failed to apply import edits',
-          },
-          isError: true,
-        };
-      }
-      await client.didRenameFiles(oldPath, newPath);
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: `Renamed ${oldPath} to ${newPath}${applied.filesModified.length > 0 ? ` and updated:\n${applied.filesModified.join('\n')}` : ''}`,
-          },
-        ],
-        structuredContent: {
-          outcome: 'ok',
-          applied: true,
-          oldPath,
-          newPath,
-          filesModified: applied.filesModified,
-        },
-      };
+          };
+        }
+      );
     } catch (error) {
       rethrowToolOutcome(error);
       throw error;

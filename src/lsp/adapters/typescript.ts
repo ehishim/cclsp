@@ -1,6 +1,7 @@
 import { logger } from '../../logger.js';
 import type { LSPServerConfig } from '../../types.js';
-import type { InitializeParams, ServerAdapter, ServerState } from '../types.js';
+import { pathToUri } from '../../utils.js';
+import type { Diagnostic, InitializeParams, ServerAdapter, ServerState } from '../types.js';
 
 /**
  * The work-done progress tsserver reports while it builds the project graph.
@@ -37,6 +38,10 @@ export class TypeScriptAdapter implements ServerAdapter {
 
   /** Progress tokens seen beginning a project load, per server. */
   private readonly loadTokens = new WeakMap<ServerState, Set<string>>();
+  private readonly diagnosticSlots = new WeakMap<
+    ServerState,
+    { active: number; waiting: Array<() => void> }
+  >();
 
   matches(config: LSPServerConfig): boolean {
     return config.command.some((c: string) => c.includes('typescript-language-server'));
@@ -75,6 +80,145 @@ export class TypeScriptAdapter implements ServerAdapter {
       return true;
     }
     return false;
+  }
+
+  async pullDiagnostics(
+    state: ServerState,
+    filePath: string,
+    timeout: number
+  ): Promise<Diagnostic[] | null> {
+    const capability = state.serverCapabilities.executeCommandProvider as
+      | { commands?: unknown }
+      | undefined;
+    if (
+      !Array.isArray(capability?.commands) ||
+      !capability.commands.includes('typescript.tsserverRequest')
+    )
+      return null;
+    let slots = this.diagnosticSlots.get(state);
+    if (!slots) {
+      slots = { active: 0, waiting: [] };
+      this.diagnosticSlots.set(state, slots);
+    }
+    if (slots.active >= 4) {
+      await new Promise<void>((resolve, reject) => {
+        const wake = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(() => {
+          const index = slots.waiting.indexOf(wake);
+          if (index >= 0) slots.waiting.splice(index, 1);
+          reject(new Error('LSP_REQUEST_INVALID_RESPONSE: diagnostic request queue timed out'));
+        }, timeout);
+        slots.waiting.push(wake);
+      });
+    } else slots.active++;
+    try {
+      const diagnostics: Diagnostic[] = [];
+      for (const command of [
+        'syntacticDiagnosticsSync',
+        'semanticDiagnosticsSync',
+        'suggestionDiagnosticsSync',
+      ]) {
+        const reply = (await state.transport.sendRequest(
+          'workspace/executeCommand',
+          {
+            command: 'typescript.tsserverRequest',
+            arguments: [
+              command,
+              { file: filePath, includeLinePosition: true },
+              { executionTarget: 0 },
+            ],
+          },
+          timeout
+        )) as { success?: boolean; body?: unknown; message?: string } | undefined;
+        if (reply?.success !== true || !Array.isArray(reply.body)) {
+          throw new Error(
+            `LSP_REQUEST_INVALID_RESPONSE: ${command}: ${reply?.message ?? 'missing diagnostic array'}`
+          );
+        }
+        for (const value of reply.body) {
+          const item = value as {
+            message: string;
+            category: string;
+            code: number;
+            startLocation?: { line: number; offset: number };
+            endLocation?: { line: number; offset: number };
+            reportsUnnecessary?: boolean;
+            reportsDeprecated?: boolean;
+            relatedInformation?: Array<{
+              message: string;
+              span?: {
+                file: string;
+                start: { line: number; offset: number };
+                end: { line: number; offset: number };
+              };
+            }>;
+          };
+          if (!item.startLocation || !item.endLocation)
+            throw new Error('LSP_REQUEST_INVALID_RESPONSE: missing diagnostic locations');
+          diagnostics.push({
+            range: {
+              start: {
+                line: item.startLocation.line - 1,
+                character: item.startLocation.offset - 1,
+              },
+              end: { line: item.endLocation.line - 1, character: item.endLocation.offset - 1 },
+            },
+            message: item.message,
+            code: item.code,
+            source: 'typescript',
+            ...(item.reportsUnnecessary || item.reportsDeprecated
+              ? {
+                  tags: [
+                    ...(item.reportsUnnecessary ? [1 as const] : []),
+                    ...(item.reportsDeprecated ? [2 as const] : []),
+                  ],
+                }
+              : {}),
+            ...(item.relatedInformation?.length
+              ? {
+                  relatedInformation: item.relatedInformation.flatMap((related) => {
+                    if (!related.span) return [];
+                    return [
+                      {
+                        message: related.message,
+                        location: {
+                          uri: pathToUri(related.span.file),
+                          range: {
+                            start: {
+                              line: related.span.start.line - 1,
+                              character: related.span.start.offset - 1,
+                            },
+                            end: {
+                              line: related.span.end.line - 1,
+                              character: related.span.end.offset - 1,
+                            },
+                          },
+                        },
+                      },
+                    ];
+                  }),
+                }
+              : {}),
+            severity:
+              item.category === 'error'
+                ? 1
+                : item.category === 'warning'
+                  ? 2
+                  : item.category === 'suggestion'
+                    ? 4
+                    : 3,
+          });
+        }
+      }
+      return diagnostics;
+    } finally {
+      const next = slots.waiting.shift();
+      if (next) next();
+      else slots.active--;
+    }
   }
 
   customizeInitializeParams(params: InitializeParams): InitializeParams {

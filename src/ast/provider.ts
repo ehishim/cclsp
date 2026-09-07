@@ -377,13 +377,6 @@ export class AstProvider {
         // this file stays unproven.
         const recovered = parsed.tree.rootNode.hasError;
         if (recovered) {
-          if (explicitFile) {
-            return rejected(
-              'tree-sitter',
-              'AST_PARSE_FAILED',
-              `Failed to parse ${file.absolutePath}`
-            );
-          }
           parseFailureCount++;
           if (failedFiles.length < AST_MAX_FAILED_FILES) {
             failedFiles.push({ file: file.absolutePath, code: 'AST_PARSE_RECOVERED' });
@@ -761,7 +754,7 @@ export class AstProvider {
         },
         language
       );
-      if (parsed.tree.rootNode.hasError) return { occurrences: [], truncated: false };
+      const recovered = parsed.tree.rootNode.hasError;
       const locator = new SourceLocator(parsed.source);
       const imports: AstQueryOccurrence[] = [];
       const other: AstQueryOccurrence[] = [];
@@ -793,9 +786,14 @@ export class AstProvider {
         return {
           occurrences: imports.slice(0, maxResults),
           truncated: imports.length > maxResults,
+          ...(recovered ? { recovered: true } : {}),
         };
       }
-      return { occurrences: other, truncated: otherTruncated };
+      return {
+        occurrences: other,
+        truncated: otherTruncated,
+        ...(recovered ? { recovered: true } : {}),
+      };
     } catch {
       return { occurrences: [], truncated: false };
     }
@@ -827,12 +825,13 @@ export class AstProvider {
     const candidates = index.allFilesFor(snapshot, index.root, language);
     const locations: Location[] = [];
     let truncated = false;
+    let recovered = false;
     for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
       const fileEntry = candidates[candidateIndex];
       if (!fileEntry) continue;
       try {
         const parsed = await this.getFreshTree(index, fileEntry, language);
-        if (parsed.tree.rootNode.hasError) continue;
+        recovered ||= parsed.tree.rootNode.hasError;
         const visit = (symbols: ReturnType<typeof extractDeclarations>): void => {
           for (const symbol of symbols) {
             const kindName = normalizeKind(SymbolKind[symbol.kind] ?? String(symbol.kind));
@@ -862,8 +861,8 @@ export class AstProvider {
       outcome: 'ok',
       provider: 'tree-sitter',
       value: locations.slice(0, AST_FALLBACK_DEFINITION_RESULTS),
-      limitations: LIMITATIONS,
-      truncated: truncated || snapshot.capped,
+      limitations: recovered ? [...LIMITATIONS, 'recovered-parse: absence-unproven'] : LIMITATIONS,
+      truncated: truncated || snapshot.capped || recovered,
     };
   }
 

@@ -61,7 +61,19 @@ export interface ServerState {
     rejectAllPending(reason: string): void;
   };
   documentManager: {
-    ensureOpen(filePath: string): Promise<boolean>;
+    readonly capacity: number;
+    withWriter<T>(action: (scope: { readonly epoch: number }) => Promise<T>): Promise<T>;
+    changeUnderScope(path: string, text: string, scope: { readonly epoch: number }): void;
+    renameOpenDocument(oldPath: string, newPath: string, scope: { readonly epoch: number }): void;
+    acquireChunk(paths: string[]): Promise<Array<{ justOpened: boolean; release(): void }>>;
+    reconcile(): Promise<{
+      epoch: number;
+      contents: Map<string, string>;
+      bytesCompared: number;
+      resynced: string[];
+      waitedFor?: string[];
+    }>;
+    changedSince(snapshot: { epoch: number; contents: Map<string, string> }): Promise<string[]>;
     acquire(
       filePath: string,
       exclusive?: boolean
@@ -123,6 +135,12 @@ export interface ServerState {
  * protocol or have special requirements.
  */
 export interface ServerAdapter {
+  /** Optional request-based diagnostics for providers without standard pull. */
+  pullDiagnostics?(
+    state: ServerState,
+    filePath: string,
+    timeout: number
+  ): Promise<Diagnostic[] | null>;
   /** Adapter name for logging */
   readonly name: string;
 

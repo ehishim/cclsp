@@ -27,12 +27,21 @@ export const AST_REWRITE_PREVIEW_TEXT_BYTES = 4_096;
  */
 export interface AstLanguageDefinition {
   readonly grammarAsset: string;
+  readonly ownedAsset?: string;
   readonly extensions: readonly string[];
 }
 
 export const AST_LANGUAGE_DEFINITIONS = {
-  typescript: { grammarAsset: 'tree-sitter-typescript.wasm', extensions: ['.ts'] },
-  tsx: { grammarAsset: 'tree-sitter-tsx.wasm', extensions: ['.tsx'] },
+  typescript: {
+    grammarAsset: 'tree-sitter-typescript.wasm',
+    ownedAsset: 'tree-sitter-typescript.wasm',
+    extensions: ['.ts'],
+  },
+  tsx: {
+    grammarAsset: 'tree-sitter-tsx.wasm',
+    ownedAsset: 'tree-sitter-tsx.wasm',
+    extensions: ['.tsx'],
+  },
   javascript: { grammarAsset: 'tree-sitter-javascript.wasm', extensions: ['.js', '.mjs', '.cjs'] },
   jsx: { grammarAsset: 'tree-sitter-javascript.wasm', extensions: ['.jsx'] },
   python: { grammarAsset: 'tree-sitter-python.wasm', extensions: ['.py'] },
@@ -70,6 +79,7 @@ export interface AstQueryOccurrence {
 export interface AstQueryOccurrences {
   occurrences: AstQueryOccurrence[];
   truncated: boolean;
+  recovered?: boolean;
 }
 
 export interface AstMatch {

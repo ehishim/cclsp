@@ -85,6 +85,25 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
         ? (rawParams.path as string)
         : cwd;
 
+  if (name === 'restart_server') {
+    const entries = pool.servingRoots(explicitRoot ?? cwd);
+    if (entries.length === 0) {
+      return { outcome: 'unavailable', provider: 'none', code: 'HUB_NO_SERVING_ROOT',
+        text: `No warm serving root for ${explicitRoot ?? cwd}.`,
+        recovery: 'Run a file-bearing semantic action in the intended project first.' };
+    }
+    const schema = (await pool.describe()).find((tool) => tool.name === name);
+    const params = coerceParams(rawParams, schema);
+    const answers = await Promise.all(entries.map(async (entry) => ({
+      root: entry.root,
+      result: normalizeToolResult(await pool.callTool(entry, name, params), { defaultProvider: 'lsp' }),
+    })));
+    const failed = answers.some(({ result }) => (result as { outcome?: string }).outcome !== 'ok');
+    return { outcome: failed ? 'unavailable' : 'ok', provider: 'lsp', roots: answers,
+      text: answers.map(({ root, result }) => `${root}\n${(result as { text?: string }).text ?? ''}`).join('\n\n'),
+      shown: answers.length, total: answers.length };
+  }
+
   let route: RoutedRoot;
   if (explicitRoot) {
     const detectedRoot = normalizeRoot(explicitRoot);
@@ -326,8 +345,14 @@ export async function runDaemon(): Promise<void> {
           reply(true, { stopped: await pool.stop(String(args.root)) });
           break;
         case 'restart-root': {
-          const e = await pool.restart(String(args.root));
-          reply(true, { root: e.root, pid: e.pid });
+          const entries = pool.servingRoots(String(args.root));
+          if (entries.length === 0) throw new Error('HUB_NO_SERVING_ROOT: no warm root serves the requested path');
+          const roots = [];
+          for (const entry of entries) {
+            const restarted = await pool.restart(entry.root);
+            roots.push({ root: restarted.root, pid: restarted.pid });
+          }
+          reply(true, { ...roots[0], roots });
           break;
         }
         case 'tool':

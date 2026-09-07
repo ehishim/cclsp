@@ -16,6 +16,57 @@ function params(overrides: Partial<InitializeParams> = {}): InitializeParams {
 describe('TypeScriptAdapter', () => {
   const adapter = new TypeScriptAdapter();
 
+  test('requests explicit diagnostic arrays and preserves positions', async () => {
+    const calls: unknown[] = [];
+    const state = {
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: {
+        sendRequest: async (_method: string, input: unknown) => {
+          calls.push(input);
+          return {
+            success: true,
+            body:
+              calls.length === 2
+                ? [
+                    {
+                      message: 'Missing property',
+                      category: 'error',
+                      code: 2339,
+                      startLocation: { line: 2, offset: 3 },
+                      endLocation: { line: 2, offset: 8 },
+                    },
+                  ]
+                : [],
+          };
+        },
+      },
+    };
+    const result = await adapter.pullDiagnostics(state as never, '/project/file.ts', 1000);
+    expect(calls).toHaveLength(3);
+    expect(result).toEqual([
+      {
+        message: 'Missing property',
+        code: 2339,
+        source: 'typescript',
+        severity: 1,
+        range: { start: { line: 1, character: 2 }, end: { line: 1, character: 7 } },
+      },
+    ]);
+  });
+
+  test('does not turn unavailable request diagnostics into an empty answer', async () => {
+    expect(
+      await adapter.pullDiagnostics({ serverCapabilities: {} } as never, '/file.ts', 1000)
+    ).toBeNull();
+    const state = {
+      serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },
+      transport: { sendRequest: async () => undefined },
+    };
+    await expect(adapter.pullDiagnostics(state as never, '/file.ts', 1000)).rejects.toThrow(
+      'LSP_REQUEST_INVALID_RESPONSE'
+    );
+  });
+
   test('matches the typescript language server only', () => {
     expect(adapter.matches({ command: ['typescript-language-server', '--stdio'] } as never)).toBe(
       true

@@ -1,0 +1,46 @@
+--- a/common/scanner.h
++++ b/common/scanner.h
+@@ -282,7 +282,34 @@
+     bool at_newline = false;
+ 
+     while (lexer->lookahead != 0 && lexer->lookahead != '<' && lexer->lookahead != '>' && lexer->lookahead != '{' &&
+-           lexer->lookahead != '}' && lexer->lookahead != '&') {
++           lexer->lookahead != '}') {
++        if (lexer->lookahead == '&') {
++            lexer->mark_end(lexer);
++            advance(lexer);
++            unsigned count = 0;
++            unsigned maximum = 30;
++            bool numeric = lexer->lookahead == '#';
++            bool hex = false;
++            if (numeric) {
++                advance(lexer);
++                hex = lexer->lookahead == 'x' || lexer->lookahead == 'X';
++                if (hex) advance(lexer);
++                maximum = hex ? 6 : 5;
++            }
++            while (count < maximum && (numeric
++                ? (hex ? iswxdigit(lexer->lookahead) : (lexer->lookahead >= '0' && lexer->lookahead <= '9'))
++                : ((lexer->lookahead >= 'a' && lexer->lookahead <= 'z') || (lexer->lookahead >= 'A' && lexer->lookahead <= 'Z')))) {
++                count++;
++                advance(lexer);
++            }
++            if (count > 0 && lexer->lookahead == ';') {
++                lexer->result_symbol = JSX_TEXT;
++                return saw_text;
++            }
++            saw_text = true;
++            at_newline = false;
++            continue;
++        }
+         bool is_wspace = iswspace(lexer->lookahead);
+         if (lexer->lookahead == '\n') {
+             at_newline = true;
+@@ -310,6 +337,7 @@
+         advance(lexer);
+     }
+ 
++    lexer->mark_end(lexer);
+     lexer->result_symbol = JSX_TEXT;
+     return saw_text;
+ }
