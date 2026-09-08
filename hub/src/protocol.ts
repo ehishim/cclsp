@@ -6,13 +6,14 @@ import type { Socket } from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 
 export interface HubRequest {
-  id: number;
+  id: string | number;
   cmd: string;
   args?: Record<string, unknown>;
+  cancelId?: string | number;
 }
 
 export interface HubResponse {
-  id: number;
+  id: string | number;
   ok: boolean;
   result?: unknown;
   error?: string;

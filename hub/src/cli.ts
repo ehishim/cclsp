@@ -158,8 +158,8 @@ function rootArg(p: Parsed): string | undefined {
 const TOP_HELP = `cclsp-hub ${VERSION} — multi-root daemon + CLI over the cclsp language-server MCP
 
 One warm cclsp instance (and its language servers) is kept per project ROOT and
-shared by every caller. Target-bearing calls first reuse the most-specific warm
-root; only on a miss does the Hub discover and warm the owning language project.
+shared by every caller. Target-bearing calls discover the owning language project
+before warm reuse, so a warm parent never overrides a nested project's semantics.
 
 USAGE
   cclsp-hub <command> [options]
@@ -170,7 +170,7 @@ ROOTS & DAEMON
   list-roots | roots      Show active roots (pid, age, idle)
   stop-root <path>        Tear down one root
   restart-root <path>     Restart warm roots serving this path (including covering roots)
-  status                  Daemon status (pid, socket, uptime, roots)
+  status                  Daemon status (pid, socket, uptime, in-flight tools, roots)
   shutdown                Stop all roots and the daemon
   describe                List the available cclsp tools
 
@@ -269,8 +269,8 @@ function printManagementHelp(command: string): void {
   const help: Record<string, string> = {
     'ensure-root':
       'cclsp-hub ensure-root <path> [--isolate]\n' +
-      '  Explicitly warm a project root. Normal target-bearing calls first reuse warm\n' +
-      '  coverage, then discover and ensure the owning language project on a miss.\n' +
+      '  Explicitly warm a project root. Normal target-bearing calls discover the\n' +
+      '  owning language project, then reuse or ensure that exact root.\n' +
       '  A covered subroot reuses its enclosing instance; pass --isolate only to force\n' +
       '  a dedicated instance.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
@@ -278,7 +278,7 @@ function printManagementHelp(command: string): void {
     'list-roots':
       'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
     roots: 'cclsp-hub roots [--json]\n  Alias for list-roots.',
-    status: 'cclsp-hub status [--json]\n  Show daemon status (does not start the daemon).',
+    status: 'cclsp-hub status [--json]\n  Show daemon status, roots, and in-flight tool requests (does not start the daemon).',
     shutdown: 'cclsp-hub shutdown\n  Stop all roots and the daemon.',
     describe: 'cclsp-hub describe [--json]\n  List the available cclsp tools.',
   };
@@ -312,6 +312,7 @@ export async function runCli(argv: string[]): Promise<void> {
           pid: number;
           socket: string;
           uptimeSec: number;
+          inFlightRequests?: number;
           roots: string[];
         } | null;
         if (!res) {
@@ -322,6 +323,7 @@ export async function runCli(argv: string[]): Promise<void> {
         out(`daemon: running (pid ${res.pid})`);
         out(`socket: ${res.socket}`);
         out(`uptime: ${res.uptimeSec}s`);
+        out(`in-flight tool requests: ${res.inFlightRequests ?? 'unknown'}`);
         out(`roots:  ${res.roots.length}`);
         for (const r of res.roots) out(`  - ${r}`);
         return;

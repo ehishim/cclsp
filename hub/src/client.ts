@@ -52,22 +52,37 @@ async function getConnection(autoStart: boolean): Promise<Socket> {
 export async function request(
   cmd: string,
   args: Record<string, unknown> = {},
-  opts: { autoStart?: boolean } = {}
+  opts: { autoStart?: boolean; signal?: AbortSignal } = {}
 ): Promise<unknown> {
+  if (opts.signal?.aborted) throw new Error('HUB_ABORTED: request cancelled before send');
   const sock = await getConnection(opts.autoStart ?? true);
-  const id = ++reqId;
+  const id = `${process.pid}-${++reqId}`;
   return new Promise((res, rej) => {
     let settled = false;
-    const fail = (error: Error) => {
+    const fail = (error: Error, cancel = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      sock.destroy();
+      opts.signal?.removeEventListener('abort', onAbort);
+      if (cancel) {
+        try {
+          writeMessage(sock, { id: `${process.pid}-${++reqId}`, cmd: 'cancel', cancelId: id });
+          // Graceful half-close flushes the cancellation frame without retaining a
+          // timed-out one-shot CLI process while the provider settles.
+          sock.end();
+          sock.unref();
+        } catch {
+          sock.destroy();
+        }
+      } else {
+        sock.destroy();
+      }
       rej(error);
     };
+    const onAbort = () => fail(new Error('HUB_ABORTED: request cancelled'), true);
     const timer = setTimeout(
       () =>
-        fail(new Error('HUB_TIMEOUT: response deadline exceeded; inspect effects before retrying')),
+        fail(new Error('HUB_TIMEOUT: response deadline exceeded; provider cancellation requested'), true),
       TOOL_TIMEOUT_MS
     );
     sock.on(
@@ -77,6 +92,7 @@ export async function request(
           if (msg.id !== id) return;
           settled = true;
           clearTimeout(timer);
+          opts.signal?.removeEventListener('abort', onAbort);
           sock.end();
           if (msg.ok) res(msg.result);
           else rej(new Error(msg.error || 'request failed'));
@@ -87,7 +103,8 @@ export async function request(
         }
       )
     );
-    sock.once('error', fail);
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    sock.once('error', (error) => fail(error));
     sock.once('close', () =>
       fail(
         new Error(

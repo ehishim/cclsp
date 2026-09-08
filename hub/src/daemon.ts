@@ -70,6 +70,7 @@ function withRoutingMetadata(result: unknown, route: RoutedRoot): unknown {
 
 async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Promise<unknown> {
   const name = String(args.name);
+  const signal = args.signal instanceof AbortSignal ? args.signal : undefined;
   const cwd = typeof args.cwd === 'string' ? resolve(args.cwd) : process.cwd();
   const rawParams = resolveFilesystemParams((args.params ?? {}) as Record<string, unknown>, cwd);
   const explicitRoot = args.root
@@ -96,7 +97,7 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
     const params = coerceParams(rawParams, schema);
     const answers = await Promise.all(entries.map(async (entry) => ({
       root: entry.root,
-      result: normalizeToolResult(await pool.callTool(entry, name, params), { defaultProvider: 'lsp' }),
+      result: normalizeToolResult(await pool.callTool(entry, name, params, signal), { defaultProvider: 'lsp' }),
     })));
     const failed = answers.some(({ result }) => (result as { outcome?: string }).outcome !== 'ok');
     return { outcome: failed ? 'unavailable' : 'ok', provider: 'lsp', roots: answers,
@@ -129,7 +130,7 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   if (missing.length) {
     throw new Error(`missing required parameter(s) for ${name}: ${missing.join(', ')}`);
   }
-  const answer = await callThroughRoute(pool, route, name, params, pathArg, Boolean(explicitRoot));
+  const answer = await callThroughRoute(pool, route, name, params, pathArg, Boolean(explicitRoot), signal);
   const routed = withRoutingMetadata(answer, route);
   if (args.rawMcp === true) return routed;
   const defaultProvider = name === 'ast_search' || name === 'code_rewrite' ? 'tree-sitter' : 'lsp';
@@ -163,11 +164,10 @@ function resultInitFailure(result: unknown): boolean {
 }
 
 /**
- * Call through the routed root, and recover from the one routing mistake the pool
- * can make: serving a nested request from a warm COVERING root whose server
- * cannot serve it. That covering root is retired from coverage and the requested
- * path gets its own dedicated root, so the caller receives the answer it asked
- * for instead of inheriting an unrelated root's failure.
+ * Call through the routed root and defensively recover if a stale/racing route
+ * still serves a nested request from a warm covering root that cannot serve it.
+ * Normal routing discovers the owner before warm reuse; this fallback retires the
+ * mismatched coverage and retries on the target's dedicated root.
  *
  * `callerPinnedRoot` disables that recovery entirely. An explicit --root is an
  * exact override, so the root the caller NAMED is the one that must answer --
@@ -182,12 +182,13 @@ export async function callThroughRoute(
   params: Record<string, unknown>,
   target?: string,
   callerPinnedRoot = false,
+  signal?: AbortSignal,
 ): Promise<any> {
   const reusedRoot = route.entry.root;
   const absoluteTarget = target ? normalizeRoot(target) : null;
   let firstFailure: unknown;
   try {
-    const result = await pool.callTool(route.entry, name, params);
+    const result = await pool.callTool(route.entry, name, params, signal);
     if (callerPinnedRoot || !route.reused || !resultInitFailure(result)) return result;
     firstFailure = result;
   } catch (error) {
@@ -196,11 +197,8 @@ export async function callThroughRoute(
   }
 
   {
-    // Only NOW ask which project owns the target. Whether this was covering reuse
-    // cannot be read off the route: `routeTarget`'s warm fast-path reports the
-    // covering root as the detected one, so comparing them is false on the DEFAULT
-    // no-explicit-root path — the very path an Agent takes. Discovery is the honest
-    // answer and is paid only here, on a failure that already cost a handshake.
+    // Re-discover after a failed reused route because project markers may have
+    // changed between initial routing and provider initialization.
     const owning = absoluteTarget ? pool.owningRoot(absoluteTarget) : route.detectedRoot;
     // The serving root IS the target's own project, so its failure is the answer:
     // there is no narrower root to fall back to and nothing to retire.
@@ -216,7 +214,7 @@ export async function callThroughRoute(
     route.reused = false;
     const context = `retried on a dedicated root for ${route.detectedRoot} after the covering root ${reusedRoot} could not serve it`;
     try {
-      const retried = await pool.callTool(dedicated, name, params);
+      const retried = await pool.callTool(dedicated, name, params, signal);
       // The DEDICATED root's own failure is the one that describes this request;
       // the covering root's is context. Reporting the retired root's message
       // instead would misattribute the failure -- the defect this retry exists to
@@ -241,6 +239,34 @@ function annotateFailure(result: unknown, context: string): unknown {
       : part
   ));
   return { ...(result as Record<string, unknown>), content: annotated.length > 0 ? annotated : content };
+}
+
+/** Owns exact request-to-cancellation correlation until provider settlement. */
+export class InFlightRequests {
+  private readonly controllers = new Map<string | number, AbortController>();
+
+  start(id: string | number): AbortController {
+    if (this.controllers.has(id)) throw new Error(`HUB_DUPLICATE_REQUEST_ID: ${id}`);
+    const controller = new AbortController();
+    this.controllers.set(id, controller);
+    return controller;
+  }
+
+  cancel(id: string | number | undefined): boolean {
+    if (id === undefined) return false;
+    const controller = this.controllers.get(id);
+    if (!controller || controller.signal.aborted) return false;
+    controller.abort(new Error('Hub request cancelled by caller'));
+    return true;
+  }
+
+  finish(id: string | number, controller: AbortController): void {
+    if (this.controllers.get(id) === controller) this.controllers.delete(id);
+  }
+
+  get size(): number {
+    return this.controllers.size;
+  }
 }
 
 export async function runDaemon(): Promise<void> {
@@ -285,6 +311,7 @@ export async function runDaemon(): Promise<void> {
   const startedAt = Date.now();
   let lastActivity = Date.now();
 
+  const inFlight = new InFlightRequests();
   const server: Server = createServer((sock: Socket) => {
     sock.on('error', () => sock.destroy());
     sock.on(
@@ -300,7 +327,16 @@ export async function runDaemon(): Promise<void> {
     const reply = (ok: boolean, result?: unknown, error?: string) =>
       writeMessage(sock, { id: req.id, ok, result, error });
     const args = req.args ?? {};
+    if (req.cmd === 'cancel') {
+      const cancelId = req.cancelId ?? (typeof args.cancelId === 'string' || typeof args.cancelId === 'number'
+        ? args.cancelId
+        : undefined);
+      reply(true, { cancelled: inFlight.cancel(cancelId), requestId: cancelId });
+      return;
+    }
+    let controller: AbortController | undefined;
     try {
+      if (req.cmd === 'tool') controller = inFlight.start(req.id);
       switch (req.cmd) {
         case 'status':
           reply(true, {
@@ -308,6 +344,7 @@ export async function runDaemon(): Promise<void> {
             pid: process.pid,
             socket: SOCKET_PATH,
             uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+            inFlightRequests: inFlight.size,
             roots: pool.list().map((e) => e.root),
           });
           break;
@@ -352,7 +389,7 @@ export async function runDaemon(): Promise<void> {
           break;
         }
         case 'tool':
-          reply(true, await dispatchTool(pool, args));
+          reply(true, await dispatchTool(pool, { ...args, signal: controller!.signal }));
           break;
         case 'shutdown':
           reply(true, { stopped: true });
@@ -368,6 +405,8 @@ export async function runDaemon(): Promise<void> {
       }
     } catch (err) {
       reply(false, undefined, err instanceof Error ? err.message : String(err));
+    } finally {
+      if (controller) inFlight.finish(req.id, controller);
     }
   }
 

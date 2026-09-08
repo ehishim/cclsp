@@ -1,10 +1,10 @@
-// RootPool routing tests prove warm-first selection and bounded discovery-cache behavior.
+// RootPool routing tests prove owner-first selection and bounded discovery-cache behavior.
 
 import { afterEach, describe, expect, it, mock } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { IDLE_ROOT_MS } from './config.js';
+import { IDLE_ROOT_MS, TOOL_TIMEOUT_MS } from './config.js';
 import { type RootEntry, RootPool, normalizeRoot } from './pool.js';
 
 const fixtures: string[] = [];
@@ -47,11 +47,11 @@ describe('RootPool smart target routing', () => {
     expect(pool.servingRoots(fixture())).toEqual([]);
     expect(pool.list()).toHaveLength(2);
   });
-  it('uses the most-specific warm root without discovery or ensure work', async () => {
-    const discover = mock(() => undefined);
-    const pool = new RootPool({ discoverProjectRoot: discover });
+  it('uses the most-specific warm root after confirming its detected owner', async () => {
     const outer = fixture();
     const nested = join(outer, 'packages/app');
+    const discover = mock(() => nested);
+    const pool = new RootPool({ discoverProjectRoot: discover });
     mkdirSync(join(nested, 'src'), { recursive: true });
     seedWarm(pool, outer);
     const expected = seedWarm(pool, nested);
@@ -61,8 +61,25 @@ describe('RootPool smart target routing', () => {
     const routed = await pool.routeTarget(join(nested, 'src/index.ts'));
 
     expect(routed).toMatchObject({ entry: expected, detectedRoot: nested, servingRoot: nested, reused: true });
-    expect(discover).not.toHaveBeenCalled();
+    expect(discover).toHaveBeenCalledTimes(1);
     expect(ensure).not.toHaveBeenCalled();
+  });
+
+  it('does not let a warm covering root override a nested detected project', async () => {
+    const outer = fixture();
+    const nested = join(outer, 'packages/app');
+    mkdirSync(join(nested, 'src'), { recursive: true });
+    const discover = mock(() => nested);
+    const pool = new RootPool({ discoverProjectRoot: discover });
+    seedWarm(pool, outer);
+    const dedicated = entry(nested);
+    const ensure = mock(async () => ({ entry: dedicated, reused: false }));
+    pool.ensure = ensure;
+
+    const routed = await pool.routeTarget(join(nested, 'src/index.ts'));
+
+    expect(routed).toMatchObject({ entry: dedicated, detectedRoot: nested, servingRoot: nested, reused: false });
+    expect(ensure).toHaveBeenCalledWith(nested, { isolate: true });
   });
 
   it('discovers once on a cold target and reuses the detected root for sibling calls', async () => {
@@ -100,7 +117,7 @@ describe('RootPool smart target routing', () => {
 
     expect(routed.detectedRoot).toBe(root);
     expect(discover).toHaveBeenCalledTimes(1);
-    expect(detected.has(stale)).toBe(false);
+    expect(detected.has(stale)).toBe(true); // Fresh discovery records the stale target owner again.
   });
 
   it('keeps separate cached owners for targets in different repositories', async () => {
@@ -115,6 +132,28 @@ describe('RootPool smart target routing', () => {
     expect((await pool.routeTarget(join(left, 'src/a.ts'))).detectedRoot).toBe(left);
     expect((await pool.routeTarget(join(right, 'src/b.ts'))).detectedRoot).toBe(right);
     expect(discover).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('RootPool tool calls', () => {
+  it('preserves timeout bounds and the caller AbortSignal at the MCP request owner', async () => {
+    const pool = new RootPool();
+    const root = fixture();
+    const controller = new AbortController();
+    let receivedOptions: Record<string, unknown> | undefined;
+    const toolEntry = entry(root);
+    toolEntry.client = {
+      callTool: async (_request: unknown, _schema: unknown, options: Record<string, unknown>) => {
+        receivedOptions = options;
+        return {};
+      },
+    } as unknown as RootEntry['client'];
+
+    await pool.callTool(toolEntry, 'hover', { file: 'src/index.ts' }, controller.signal);
+
+    expect(receivedOptions?.timeout).toBe(TOOL_TIMEOUT_MS);
+    expect(receivedOptions?.maxTotalTimeout).toBe(TOOL_TIMEOUT_MS);
+    expect(receivedOptions?.signal).toBe(controller.signal);
   });
 });
 

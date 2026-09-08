@@ -109,6 +109,9 @@ describe('cclsp-hub semantic ergonomics', () => {
     expect(output).toContain('ast_search');
     expect(output).toContain('--pattern P [--pattern P2 ...] --language L');
     expect(output).toContain('repeat --pattern: exact counts require a complete scan');
+    expect(output).toContain('calls discover the owning language project');
+    expect(output).toContain('a warm parent never overrides a nested project');
+    expect(output).toContain('in-flight tools');
     expect(output).toContain('ast-search');
     expect(output).toContain('code_rewrite');
     expect(output).toContain('code-rewrite');

@@ -2,7 +2,7 @@
 // the caller is told about when the retry also fails.
 
 import { describe, expect, it } from 'bun:test';
-import { callThroughRoute } from './daemon.js';
+import { InFlightRequests, callThroughRoute } from './daemon.js';
 import type { RootEntry, RoutedRoot } from './pool.js';
 
 function entry(root: string, startedAt = Date.now()): RootEntry {
@@ -18,13 +18,7 @@ function firstText(result: unknown): string {
   return content[0]?.text ?? '';
 }
 
-/**
- * The shape `routeTarget`'s WARM FAST-PATH actually produces: it reports the
- * covering root as both detected and serving. A fixture that sets
- * `detectedRoot` to the nested path instead describes a route this path never
- * builds, and a covering-root test written that way passes while the default
- * no-explicit-root case stays broken.
- */
+/** A stale route shape retained only for the defensive post-routing recovery. */
 function coveringRoute(covering: RootEntry): RoutedRoot {
   return { entry: covering, detectedRoot: covering.root, servingRoot: covering.root, reused: true };
 }
@@ -59,6 +53,48 @@ function poolStub(options: {
     },
   };
 }
+
+describe('callThroughRoute cancellation', () => {
+  it('cancels only the correlated request and retains accounting until settlement', () => {
+    const requests = new InFlightRequests();
+    const first = requests.start('client-1');
+    const second = requests.start('client-2');
+
+    expect(requests.cancel('client-1')).toBe(true);
+    expect(first.signal.aborted).toBe(true);
+    expect(requests.cancel('client-1')).toBe(false);
+    expect(second.signal.aborted).toBe(false);
+    expect(requests.size).toBe(2);
+    expect(requests.cancel('missing')).toBe(false);
+    expect(() => requests.start('client-2')).toThrow('HUB_DUPLICATE_REQUEST_ID');
+
+    requests.finish('client-1', first);
+    expect(requests.size).toBe(1);
+    expect(requests.cancel('client-1')).toBe(false);
+    requests.finish('client-2', second);
+    expect(requests.size).toBe(0);
+  });
+
+  it('passes the caller AbortSignal to the MCP request owner', async () => {
+    const root = entry('/repo');
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    const pool = {
+      async callTool(_entry: RootEntry, _name: string, _params: Record<string, unknown>, signal?: AbortSignal) {
+        received = signal;
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+      markCoverageBroken() {},
+      async ensure() { return { entry: root, reused: true }; },
+      owningRoot() { return root.root; },
+    };
+    const route: RoutedRoot = { entry: root, detectedRoot: root.root, servingRoot: root.root, reused: true };
+
+    await callThroughRoute(pool as never, route, 'get_hover', {}, '/repo/a.ts', false, controller.signal);
+
+    expect(received).toBe(controller.signal);
+  });
+});
 
 describe('callThroughRoute covering-root recovery', () => {
   it('retires the covering root and answers from a dedicated one', async () => {
@@ -143,12 +179,10 @@ describe('callThroughRoute covering-root recovery', () => {
   });
 });
 
-describe('callThroughRoute on the DEFAULT no-explicit-root path', () => {
-  it('retries when the warm fast-path served a covering root it reported as detected', async () => {
-    // The regression QA found: routeTarget's warm fast-path sets
-    // detectedRoot = entry.root, so any check comparing those two is false exactly
-    // where an Agent lands by default (no projectRoot, cwd at a Worktree top).
-    // Covering-ness has to come from which project OWNS the target.
+describe('callThroughRoute defensive stale-route recovery', () => {
+  it('re-discovers ownership when a previously routed covering root fails', async () => {
+    // Project markers can change after initial routing. Recovery re-discovers the
+    // owner instead of trusting stale detected/serving metadata.
     const covering = entry('/repo');
     const dedicated = entry('/repo/orqestra');
     const { pool, retired, ensured } = poolStub({

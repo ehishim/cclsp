@@ -42,8 +42,10 @@ keeps it warm, and multiplexes every caller onto the right instance.
   daemon the first time), sends one request, prints the result. Tool subcommands
   are friendly aliases over cclsp's tools; flags map to tool parameters and are
   coerced to the right types from cclsp's own JSON schema.
-- **Router** — every code-intelligence call carries a file; the daemon routes it
-  to the registered root that is the **longest path-prefix** of that file.
+- **Router** — every code-intelligence call carries a file; the daemon discovers
+  the nearest owning language project before warm reuse, so a warm parent cannot
+  override a nested project's semantics. Markerless targets may use the most
+  specific healthy warm covering root.
 
 ## Install / build
 
@@ -98,14 +100,15 @@ cclsp-hub status
 | `list-roots` / `roots` | Show active roots with pid, age, idle time. |
 | `stop-root <path>` | Tear down one root and its language servers. |
 | `restart-root <path>` | Restart warm roots at/below the path and its serving covering root; refuses when none is warm. |
-| `status` | Daemon status (pid, socket, uptime, roots). Does **not** start the daemon. |
+| `status` | Daemon status (pid, socket, uptime, in-flight tool requests, roots). Does **not** start the daemon. |
 | `shutdown` | Stop all roots and the daemon. |
 | `describe` | List the available cclsp tools (and schemas with `--json`). |
 
 ### Code intelligence
 
-Every cclsp tool is exposed **1:1 by its exact name**. Routed to the registered
-root that owns `--file`. Line/character are **1-indexed**.
+Every cclsp tool is exposed **1:1 by its exact name**. The nearest discovered
+language project owns `--file`; the matching warm root is reused or started.
+Line/character are **1-indexed**.
 
 | Tool (exact) | Alias | Required | Optional |
 |---|---|---|---|

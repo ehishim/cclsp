@@ -251,15 +251,7 @@ export class RootPool {
     }
   }
 
-  /**
-   * The project root that OWNS `target`, discovered from the filesystem.
-   *
-   * `routeTarget`'s warm fast-path deliberately answers without this, reporting
-   * the covering root as both detected and serving. That is the right trade while
-   * the covering root works; it is exactly wrong once it has failed, because the
-   * caller then needs the root the target actually belongs to. Discovery is paid
-   * only on that failure path.
-   */
+  /** The project root that owns `target`, discovered from the filesystem. */
   owningRoot(target: string): string | undefined {
     return this.discover(resolve(target));
   }
@@ -284,11 +276,22 @@ export class RootPool {
 
   async routeTarget(target: string): Promise<RoutedRoot> {
     const absoluteTarget = resolve(target);
+    const detectedRoot = this.discover(absoluteTarget);
     const warm = this.resolveRootForFile(absoluteTarget);
-    if (warm) {
+    if (warm && (!detectedRoot || warm.root === detectedRoot)) {
       warm.lastUsed = Date.now();
-      this.rememberDetectedRoot(warm.root);
-      return { entry: warm, detectedRoot: warm.root, servingRoot: warm.root, reused: true };
+      this.rememberDetectedRoot(detectedRoot ?? warm.root);
+      return { entry: warm, detectedRoot: detectedRoot ?? warm.root, servingRoot: warm.root, reused: true };
+    }
+    if (detectedRoot) {
+      this.rememberDetectedRoot(detectedRoot);
+      const exact = this.get(detectedRoot);
+      if (exact) {
+        exact.lastUsed = Date.now();
+        return { entry: exact, detectedRoot, servingRoot: exact.root, reused: true };
+      }
+      const { entry, reused } = await this.ensure(detectedRoot, { isolate: Boolean(warm) });
+      return { entry, detectedRoot, servingRoot: entry.root, reused };
     }
 
     const knownRoot = this.knownRootForTarget(absoluteTarget);
@@ -298,11 +301,7 @@ export class RootPool {
     }
     if (knownRoot) this.forgetDetectedRoot(knownRoot);
 
-    const detectedRoot = this.discover(absoluteTarget);
-    if (!detectedRoot) throw new Error(`no language project owns ${absoluteTarget}`);
-    this.rememberDetectedRoot(detectedRoot);
-    const { entry, reused } = await this.ensure(detectedRoot);
-    return { entry, detectedRoot, servingRoot: entry.root, reused };
+    throw new Error(`no language project owns ${absoluteTarget}`);
   }
 
   // The cclsp tool list is static (returned before any language server starts),
@@ -325,10 +324,12 @@ export class RootPool {
     }
   }
 
-  async callTool(entry: RootEntry, name: string, args: Record<string, unknown>): Promise<any> {
+  async callTool(entry: RootEntry, name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<any> {
     entry.lastUsed = Date.now();
     return entry.client.callTool({ name, arguments: args }, undefined, {
       timeout: TOOL_TIMEOUT_MS,
+      maxTotalTimeout: TOOL_TIMEOUT_MS,
+      signal,
     });
   }
 

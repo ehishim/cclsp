@@ -42,47 +42,53 @@ function sourcePath(value: unknown, inherited: string | null): string | null {
   }
 }
 
-function collectRanges(
-  value: unknown,
-  inheritedPath: string | null,
-  rows: NormalizedRange[],
-  budget: { visited: number },
-  depth = 0,
-): void {
-  if (depth > 8 || rows.length >= 1000 || budget.visited >= 10_000 || !value || typeof value !== 'object') return;
-  budget.visited += 1;
-  if (Array.isArray(value)) {
-    for (const entry of value) collectRanges(entry, inheritedPath, rows, budget, depth + 1);
-    return;
-  }
-  const shape = value as Record<string, unknown>;
-  const path = sourcePath(shape.uri ?? shape.file ?? shape.file_path ?? shape.path, inheritedPath);
-  const rangeValue = shape.range ?? shape.selectionRange;
-  if (path && rangeValue && typeof rangeValue === 'object') {
-    const range = rangeValue as {
-      start?: { line?: unknown; character?: unknown };
-      end?: { line?: unknown; character?: unknown };
-    };
-    const values = [range.start?.line, range.start?.character, range.end?.line, range.end?.character];
-    if (values.every(Number.isInteger)) {
-      rows.push({
-        path,
-        startLine: Number(range.start?.line) + 1,
-        startCharacter: Number(range.start?.character) + 1,
-        endLine: Number(range.end?.line) + 1,
-        endCharacter: Number(range.end?.character) + 1,
-      });
-    }
-  }
-  for (const [key, nested] of Object.entries(shape)) {
-    if (['range', 'selectionRange', 'uri', 'file', 'file_path', 'path'].includes(key)) continue;
-    collectRanges(nested, path, rows, budget, depth + 1);
-  }
-}
-
 function normalizedRanges(structured: Record<string, unknown>): NormalizedRange[] {
   const rows: NormalizedRange[] = [];
-  collectRanges(structured, null, rows, { visited: 0 });
+  const stack: Array<{ value: unknown; inheritedPath: string | null }> = [
+    { value: structured, inheritedPath: null },
+  ];
+  const visited = new WeakSet<object>();
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current?.value || typeof current.value !== 'object' || visited.has(current.value)) continue;
+    visited.add(current.value);
+    if (Array.isArray(current.value)) {
+      for (let index = current.value.length - 1; index >= 0; index -= 1) {
+        stack.push({ value: current.value[index], inheritedPath: current.inheritedPath });
+      }
+      continue;
+    }
+    const shape = current.value as Record<string, unknown>;
+    const path = sourcePath(
+      shape.uri ?? shape.file ?? shape.file_path ?? shape.path,
+      current.inheritedPath,
+    );
+    const rangeValue = shape.range ?? shape.selectionRange;
+    if (path && rangeValue && typeof rangeValue === 'object') {
+      const range = rangeValue as {
+        start?: { line?: unknown; character?: unknown };
+        end?: { line?: unknown; character?: unknown };
+      };
+      const values = [range.start?.line, range.start?.character, range.end?.line, range.end?.character];
+      if (values.every(Number.isInteger)) {
+        rows.push({
+          path,
+          startLine: Number(range.start?.line) + 1,
+          startCharacter: Number(range.start?.character) + 1,
+          endLine: Number(range.end?.line) + 1,
+          endCharacter: Number(range.end?.character) + 1,
+        });
+      }
+    }
+    const entries = Object.entries(shape);
+    for (let index = entries.length - 1; index >= 0; index -= 1) {
+      const entry = entries[index];
+      if (!entry) continue;
+      const [key, nested] = entry;
+      if (['range', 'selectionRange', 'uri', 'file', 'file_path', 'path'].includes(key)) continue;
+      stack.push({ value: nested, inheritedPath: path });
+    }
+  }
   const seen = new Set<string>();
   return rows.filter((row) => {
     const key = `${row.path}\u0000${row.startLine}\u0000${row.startCharacter}\u0000${row.endLine}\u0000${row.endCharacter}`;
