@@ -1,4 +1,9 @@
-import { resolvePath, rethrowToolOutcome } from './helpers.js';
+import {
+  INLINE_RESULT_BYTES,
+  resolvePath,
+  rethrowToolOutcome,
+  spoolFullResult,
+} from './helpers.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -14,6 +19,20 @@ export const getHoverTool: ToolDefinition = {
     type: 'object',
     properties: {
       file_path: { type: 'string', description: 'The path to the file' },
+      positions: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            line: { type: 'integer', minimum: 1 },
+            character: { type: 'integer', minimum: 1 },
+          },
+          required: ['line', 'character'],
+          additionalProperties: false,
+        },
+        description:
+          'Exact 1-indexed positions in this file, returned in order under one freshness check. Excludes query/line/character.',
+      },
       query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
       line: { type: 'number', description: 'The line number (1-indexed)' },
       character: { type: 'number', description: 'The character position (1-indexed)' },
@@ -29,6 +48,96 @@ export const getHoverTool: ToolDefinition = {
     };
     const absolutePath = resolvePath(file_path);
     try {
+      const positions = (args as { positions?: unknown }).positions;
+      if (positions !== undefined) {
+        if (
+          query !== undefined ||
+          line !== undefined ||
+          character !== undefined ||
+          !Array.isArray(positions) ||
+          positions.length === 0 ||
+          positions.some(
+            (p) =>
+              !p ||
+              !Number.isSafeInteger(p.line) ||
+              p.line < 1 ||
+              !Number.isSafeInteger(p.character) ||
+              p.character < 1
+          )
+        ) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: 'Provide nonempty exact positions, without query/line/character.',
+              },
+            ],
+            structuredContent: { outcome: 'rejected', code: 'HOVER_POSITIONS_INVALID' },
+            isError: true,
+          };
+        }
+        const results = await client.hoverBatch(
+          absolutePath,
+          positions.map((p) => ({ line: p.line - 1, character: p.character - 1 }))
+        );
+        const complete = {
+          outcome: 'ok',
+          provider: 'lsp',
+          file: absolutePath,
+          positions,
+          hovers: results,
+          shown: results.length,
+          total: positions.length,
+          omitted: 0,
+        };
+        if (Buffer.byteLength(JSON.stringify(complete), 'utf8') > INLINE_RESULT_BYTES) {
+          const resultFile = spoolFullResult('get_hover', complete);
+          if (!resultFile)
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: 'HOVER_RESULT_SPOOL_FAILED: restore writable result storage and retry.',
+                },
+              ],
+              structuredContent: { outcome: 'unavailable', code: 'HOVER_RESULT_SPOOL_FAILED' },
+              isError: true,
+            };
+          return {
+            content: [{ type: 'text', text: `Complete hover batch: ${resultFile}` }],
+            structuredContent: {
+              ...complete,
+              hovers: [],
+              shown: 0,
+              omitted: results.length,
+              resultFile,
+            },
+          };
+        }
+        return {
+          content: [
+            {
+              type: 'text',
+              text: results
+                .map(
+                  (result, i) =>
+                    `${positions[i].line}:${positions[i].character}\n${result ? (typeof result.contents === 'string' ? result.contents : result.contents.value) : 'No hover information'}`
+                )
+                .join('\n\n'),
+            },
+          ],
+          structuredContent: {
+            outcome: 'ok',
+            provider: 'lsp',
+            file: absolutePath,
+            positions,
+            hovers: results,
+            shown: results.length,
+            total: positions.length,
+            omitted: 0,
+          },
+        };
+      }
       const resolution = await resolveToolPosition(
         absolutePath,
         { query, line, character },
@@ -49,9 +158,13 @@ export const getHoverTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'empty', provider: 'lsp',
+            outcome: 'empty',
+            provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            hover: null, shown: 0, total: 0, omitted: 0,
+            hover: null,
+            shown: 0,
+            total: 0,
+            omitted: 0,
           },
         };
       }
@@ -67,11 +180,14 @@ export const getHoverTool: ToolDefinition = {
           },
         ],
         structuredContent: {
-          outcome: 'ok', provider: 'lsp',
+          outcome: 'ok',
+          provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           position: resolution.position,
           hover: result,
-          shown: 1, total: 1, omitted: 0,
+          shown: 1,
+          total: 1,
+          omitted: 0,
         },
       };
     } catch (error) {

@@ -1195,6 +1195,60 @@ export async function hover(
   return null;
 }
 
+/** Resolve a file's hover positions under one freshness lease, preserving input order. */
+export async function hoverBatch(
+  serverState: ServerState,
+  filePath: string,
+  positions: Position[]
+): Promise<Array<Awaited<ReturnType<typeof hover>>>> {
+  await serverState.initializationPromise;
+  requireMethodSupport(serverState, 'textDocument/hover');
+  return withFreshDocument(serverState, filePath, async () => {
+    const before = readAndSign(filePath);
+    if (!before) throw new Error(`LSP_FRESHNESS_UNKNOWN: cannot read ${filePath}`);
+    const results: Array<Awaited<ReturnType<typeof hover>>> = new Array(positions.length);
+    let next = 0;
+    let failed = false;
+    let failure: unknown;
+    await Promise.all(
+      Array.from({ length: Math.min(8, positions.length) }, async () => {
+        for (;;) {
+          const index = next++;
+          const position = positions[index];
+          if (!position || failed) return;
+          try {
+            const result = await serverState.transport.sendRequest(
+              'textDocument/hover',
+              { textDocument: { uri: pathToUri(filePath) }, position },
+              serverState.adapter?.getTimeout?.('textDocument/hover') ?? 30000
+            );
+            results[index] =
+              result && typeof result === 'object' && 'contents' in result
+                ? (result as NonNullable<Awaited<ReturnType<typeof hover>>>)
+                : null;
+          } catch (error) {
+            if (!failed) failure = error;
+            failed = true;
+          }
+        }
+      })
+    );
+    if (failed) throw failure;
+    const after = readAndSign(filePath);
+    if (!after || after.sig !== before.sig) {
+      throw new LspToolOutcomeError({
+        outcome: 'stale',
+        code: 'LSP_PROJECT_NOT_READY',
+        method: 'textDocument/hover',
+        server: serverState.config.command.join(' '),
+        reason: 'source changed during the hover batch; no mixed-version result is returned',
+        recovery: 'Repeat the batch against the current source.',
+      });
+    }
+    return results;
+  });
+}
+
 export async function workspaceSymbol(
   serverState: ServerState,
   query: string

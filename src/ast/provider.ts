@@ -13,15 +13,14 @@ import { RewriteBuildError, RewriteEngine, type RewriteSourceFile } from './rewr
 import { SearchEngine } from './search-engine.js';
 import { SourceLocator } from './source-locator.js';
 import {
-  AST_DEFAULT_RESULTS,
   AST_FALLBACK_DEFINITION_RESULTS,
   AST_LANGUAGES,
   AST_MAX_FAILED_FILES,
   AST_MAX_FILE_BYTES,
   AST_MAX_PATTERNS,
-  AST_MAX_RESULTS,
   AST_REWRITE_GENERATED_SCAN_CHARACTERS,
   AST_REWRITE_MAX_CHANGES,
+  AST_TREE_CACHE_BYTES,
   type AstLanguage,
   type AstPatternReport,
   type AstQueryOccurrence,
@@ -58,22 +57,16 @@ async function readBoundedSource(path: string): Promise<{ source: string; mtimeM
   const handle = await open(path, 'r');
   try {
     const fileStat = await handle.stat();
-    if (fileStat.size > AST_MAX_FILE_BYTES) {
-      throw new OversizedFileError(fileStat.size, AST_MAX_FILE_BYTES);
-    }
     const chunks: Buffer[] = [];
     let bytes = 0;
     let chunkSize = Math.min(64 * 1024, Math.max(1, fileStat.size + 1));
-    while (bytes <= AST_MAX_FILE_BYTES) {
-      const chunk = Buffer.allocUnsafe(Math.min(chunkSize, AST_MAX_FILE_BYTES + 1 - bytes));
+    for (;;) {
+      const chunk = Buffer.allocUnsafe(chunkSize);
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, bytes);
       if (bytesRead === 0) break;
       chunks.push(chunk.subarray(0, bytesRead));
       bytes += bytesRead;
       if (bytesRead === chunk.length) chunkSize = Math.min(64 * 1024, chunkSize * 2);
-    }
-    if (bytes > AST_MAX_FILE_BYTES) {
-      throw new OversizedFileError(bytes, AST_MAX_FILE_BYTES);
     }
     return { source: Buffer.concat(chunks, bytes).toString('utf8'), mtimeMs: fileStat.mtimeMs };
   } finally {
@@ -232,11 +225,14 @@ export class AstProvider {
         `Unsupported AST language: ${input.language}`
       );
     }
-    const effectiveMaxResults = input.maxResults ?? AST_DEFAULT_RESULTS;
-    if (!Number.isInteger(effectiveMaxResults) || effectiveMaxResults < 1) {
+    const effectiveMaxResults = input.maxResults ?? Number.POSITIVE_INFINITY;
+    if (
+      input.maxResults !== undefined &&
+      (!Number.isSafeInteger(effectiveMaxResults) || effectiveMaxResults < 1)
+    ) {
       return rejected('none', 'AST_ARGUMENT_INVALID', 'max_results must be a positive integer');
     }
-    const boundedMaxResults = Math.min(effectiveMaxResults, AST_MAX_RESULTS);
+    const boundedMaxResults = effectiveMaxResults;
     const index = await this.indexPromise;
     let scope: string;
     try {
@@ -291,7 +287,8 @@ export class AstProvider {
       const scopeStat = await stat(scope);
       const explicitFile = scopeStat.isFile();
       let candidates: IndexedFile[];
-      let filesSkippedOversized = 0;
+      // Search reads every candidate regardless of size; the field stays for result-shape parity.
+      const filesSkippedOversized = 0;
       let indexCapped = false;
       if (scopeStat.isFile()) {
         const language = languageForPath(scope);
@@ -300,17 +297,6 @@ export class AstProvider {
             'none',
             'AST_PATH_INVALID',
             'Requested file does not match the requested language'
-          );
-        }
-        if (scopeStat.size > AST_MAX_FILE_BYTES) {
-          return rejected(
-            'tree-sitter',
-            'AST_FILE_OVERSIZED',
-            'Requested file exceeds the AST file cap',
-            {
-              bytes: scopeStat.size,
-              cap: AST_MAX_FILE_BYTES,
-            }
           );
         }
         candidates = [
@@ -323,7 +309,7 @@ export class AstProvider {
           },
         ];
       } else if (scopeStat.isDirectory()) {
-        const snapshot = await index.ensure();
+        const snapshot = await index.ensureScope(scope);
         candidates = index.allFilesFor(snapshot, scope, input.language);
         indexCapped = snapshot.capped;
       } else {
@@ -341,22 +327,10 @@ export class AstProvider {
       for (let indexInCandidates = 0; indexInCandidates < candidates.length; indexInCandidates++) {
         const file = candidates[indexInCandidates];
         if (!file) continue;
-        let parsed: { tree: TsTree; source: string };
+        let parsed: { tree: TsTree; source: string; release: () => void };
         try {
           parsed = await this.getFreshTree(index, file, input.language);
         } catch (error) {
-          if (error instanceof OversizedFileError) {
-            if (explicitFile) {
-              return rejected(
-                'tree-sitter',
-                'AST_FILE_OVERSIZED',
-                'Requested file exceeds the AST file cap',
-                { bytes: error.bytes, cap: error.cap }
-              );
-            }
-            filesSkippedOversized++;
-            continue;
-          }
           parseFailureCount++;
           if (explicitFile) {
             return rejected(
@@ -375,48 +349,52 @@ export class AstProvider {
         // declarations to a grammar gap, which is the false absence this tier
         // exists to prevent; searching it reports presence while absence over
         // this file stays unproven.
-        const recovered = parsed.tree.rootNode.hasError;
-        if (recovered) {
-          parseFailureCount++;
-          if (failedFiles.length < AST_MAX_FAILED_FILES) {
-            failedFiles.push({ file: file.absolutePath, code: 'AST_PARSE_RECOVERED' });
+        try {
+          const recovered = parsed.tree.rootNode.hasError;
+          if (recovered) {
+            parseFailureCount++;
+            if (failedFiles.length < AST_MAX_FAILED_FILES) {
+              failedFiles.push({ file: file.absolutePath, code: 'AST_PARSE_RECOVERED' });
+            }
           }
-        }
-        filesScanned++;
-        for (let patternIndex = 0; patternIndex < compiledPatterns.length; patternIndex++) {
-          const compiled = compiledPatterns[patternIndex];
-          if (!compiled) continue;
-          const alreadyFound = perPatternCounts[patternIndex] ?? 0;
-          // Each pattern carries its own budget. Sharing one would let a prolific
-          // pattern exhaust the cap and leave a later one reported as absent,
-          // manufacturing the false zero this search exists to make impossible.
-          if (alreadyFound > boundedMaxResults) continue;
-          const remaining = Math.max(1, boundedMaxResults - alreadyFound + 1);
-          const fileMatches = this.searchEngine.search(
-            parsed.tree,
-            parsed.source,
-            compiled,
-            file.absolutePath,
-            remaining
-          );
-          if (fileMatches.length === 0) continue;
-          perPatternCounts[patternIndex] = alreadyFound + fileMatches.length;
-          const storable = Math.max(0, boundedMaxResults - matches.length);
-          if (fileMatches.length > storable) truncated = true;
-          if (storable > 0) {
-            const storing = fileMatches.slice(0, storable);
-            matches.push(
-              ...(recovered
-                ? storing.map((match) => ({ ...match, recovered: true as const }))
-                : storing)
+          filesScanned++;
+          for (let patternIndex = 0; patternIndex < compiledPatterns.length; patternIndex++) {
+            const compiled = compiledPatterns[patternIndex];
+            if (!compiled) continue;
+            const alreadyFound = perPatternCounts[patternIndex] ?? 0;
+            // Each pattern carries its own budget. Sharing one would let a prolific
+            // pattern exhaust the cap and leave a later one reported as absent,
+            // manufacturing the false zero this search exists to make impossible.
+            if (alreadyFound > boundedMaxResults) continue;
+            const remaining = Math.max(1, boundedMaxResults - alreadyFound + 1);
+            const fileMatches = this.searchEngine.search(
+              parsed.tree,
+              parsed.source,
+              compiled,
+              file.absolutePath,
+              remaining
             );
+            if (fileMatches.length === 0) continue;
+            perPatternCounts[patternIndex] = alreadyFound + fileMatches.length;
+            const storable = Math.max(0, boundedMaxResults - matches.length);
+            if (fileMatches.length > storable) truncated = true;
+            if (storable > 0) {
+              const storing = fileMatches.slice(0, storable);
+              matches.push(
+                ...(recovered
+                  ? storing.map((match) => ({ ...match, recovered: true as const }))
+                  : storing)
+              );
+            }
           }
-        }
-        // Stopping early is only safe once every pattern has proven itself
-        // present: a pattern still at zero must be scanned to exhaustion, or its
-        // zero would report the end of the budget rather than the end of the code.
-        if (matches.length >= boundedMaxResults && perPatternCounts.every((count) => count > 0)) {
-          break;
+          // Stopping early is only safe once every pattern has proven itself
+          // present: a pattern still at zero must be scanned to exhaustion, or its
+          // zero would report the end of the budget rather than the end of the code.
+          if (matches.length >= boundedMaxResults && perPatternCounts.every((count) => count > 0)) {
+            break;
+          }
+        } finally {
+          parsed.release();
         }
         if ((indexInCandidates + 1) % 16 === 0) await yieldToEventLoop();
       }
@@ -433,7 +411,7 @@ export class AstProvider {
             ? { pattern: String(raw), matches: found, note }
             : { pattern: String(raw), matches: found };
         });
-      const searchIncomplete = parseFailureCount > 0;
+      const searchIncomplete = parseFailureCount > 0 || filesSkippedOversized > 0 || indexCapped;
       const perPattern: AstPatternReport[] = searchIncomplete
         ? completePerPattern.map((report) =>
             report.matches === 0
@@ -450,11 +428,11 @@ export class AstProvider {
         language: input.language,
         matches,
         truncated,
-        effectiveMaxResults: boundedMaxResults,
+        effectiveMaxResults: Number.isFinite(boundedMaxResults) ? boundedMaxResults : null,
         filesScanned,
         filesSkippedOversized,
         indexCapped,
-        partial: parseFailureCount > 0,
+        partial: searchIncomplete,
         parseFailureCount,
         failedFiles,
         perPattern,
@@ -464,7 +442,7 @@ export class AstProvider {
         outcome: 'partial',
         code: 'AST_SEARCH_PARTIAL',
         recovery:
-          'Retry with a narrower path that parses completely, or resolve parser/source compatibility for the named failed files before retrying.',
+          'The scan has unreadable, oversized or unindexed files. Resolve the reported coverage gaps before treating a missing match as absent.',
         ...result,
       };
     } finally {
@@ -689,14 +667,6 @@ export class AstProvider {
       };
     }
     const fileStat = await stat(canonical);
-    if (fileStat.size > AST_MAX_FILE_BYTES) {
-      return {
-        outcome: 'unavailable',
-        provider: 'none',
-        code: 'AST_FILE_OVERSIZED',
-        reason: `${canonical} exceeds ${AST_MAX_FILE_BYTES} bytes`,
-      };
-    }
     try {
       const parsed = await this.getFreshTree(
         index,
@@ -709,18 +679,22 @@ export class AstProvider {
         },
         language
       );
-      if (parsed.tree.rootNode.hasError) throw new Error('source tree contains parse errors');
-      return {
-        outcome: 'ok',
-        provider: 'tree-sitter',
-        value: extractDeclarations(parsed.tree, parsed.source, language),
-        limitations: LIMITATIONS,
-      };
+      try {
+        if (parsed.tree.rootNode.hasError) throw new Error('source tree contains parse errors');
+        return {
+          outcome: 'ok',
+          provider: 'tree-sitter',
+          value: extractDeclarations(parsed.tree, parsed.source, language),
+          limitations: LIMITATIONS,
+        };
+      } finally {
+        parsed.release();
+      }
     } catch (error) {
       return {
         outcome: 'unavailable',
         provider: 'none',
-        code: error instanceof OversizedFileError ? 'AST_FILE_OVERSIZED' : 'AST_PARSE_FAILED',
+        code: 'AST_PARSE_FAILED',
         reason: String(error),
       };
     }
@@ -741,7 +715,6 @@ export class AstProvider {
     const language = languageForPath(canonical);
     if (!language) return { occurrences: [], truncated: false };
     const fileStat = await stat(canonical);
-    if (fileStat.size > AST_MAX_FILE_BYTES) return { occurrences: [], truncated: false };
     try {
       const parsed = await this.getFreshTree(
         index,
@@ -754,46 +727,50 @@ export class AstProvider {
         },
         language
       );
-      const recovered = parsed.tree.rootNode.hasError;
-      const locator = new SourceLocator(parsed.source);
-      const imports: AstQueryOccurrence[] = [];
-      const other: AstQueryOccurrence[] = [];
-      let otherTruncated = false;
-      const visit = (node: TsNode, importBinding: boolean): void => {
-        const isImportBinding =
-          importBinding ||
-          node.type.includes('import') ||
-          node.type === 'use_declaration' ||
-          node.type === 'use_clause';
-        if (
-          node.isNamed &&
-          node.namedChildCount === 0 &&
-          locator.text(node.startIndex, node.endIndex) === name
-        ) {
-          const occurrence = { range: locator.range(node), importBinding: isImportBinding };
-          if (isImportBinding) {
-            imports.push(occurrence);
-          } else if (other.length < maxResults) {
-            other.push(occurrence);
-          } else {
-            otherTruncated = true;
+      try {
+        const recovered = parsed.tree.rootNode.hasError;
+        const locator = new SourceLocator(parsed.source);
+        const imports: AstQueryOccurrence[] = [];
+        const other: AstQueryOccurrence[] = [];
+        let otherTruncated = false;
+        const visit = (node: TsNode, importBinding: boolean): void => {
+          const isImportBinding =
+            importBinding ||
+            node.type.includes('import') ||
+            node.type === 'use_declaration' ||
+            node.type === 'use_clause';
+          if (
+            node.isNamed &&
+            node.namedChildCount === 0 &&
+            locator.text(node.startIndex, node.endIndex) === name
+          ) {
+            const occurrence = { range: locator.range(node), importBinding: isImportBinding };
+            if (isImportBinding) {
+              imports.push(occurrence);
+            } else if (other.length < maxResults) {
+              other.push(occurrence);
+            } else {
+              otherTruncated = true;
+            }
           }
+          for (const child of node.namedChildren) visit(child, isImportBinding);
+        };
+        visit(parsed.tree.rootNode, false);
+        if (imports.length > 0) {
+          return {
+            occurrences: imports.slice(0, maxResults),
+            truncated: imports.length > maxResults,
+            ...(recovered ? { recovered: true } : {}),
+          };
         }
-        for (const child of node.namedChildren) visit(child, isImportBinding);
-      };
-      visit(parsed.tree.rootNode, false);
-      if (imports.length > 0) {
         return {
-          occurrences: imports.slice(0, maxResults),
-          truncated: imports.length > maxResults,
+          occurrences: other,
+          truncated: otherTruncated,
           ...(recovered ? { recovered: true } : {}),
         };
+      } finally {
+        parsed.release();
       }
-      return {
-        occurrences: other,
-        truncated: otherTruncated,
-        ...(recovered ? { recovered: true } : {}),
-      };
     } catch {
       return { occurrences: [], truncated: false };
     }
@@ -831,26 +808,30 @@ export class AstProvider {
       if (!fileEntry) continue;
       try {
         const parsed = await this.getFreshTree(index, fileEntry, language);
-        recovered ||= parsed.tree.rootNode.hasError;
-        const visit = (symbols: ReturnType<typeof extractDeclarations>): void => {
-          for (const symbol of symbols) {
-            const kindName = normalizeKind(SymbolKind[symbol.kind] ?? String(symbol.kind));
-            const requestedKind = kind ? normalizeKind(kind) : undefined;
-            if (symbol.name === name && (!requestedKind || kindName === requestedKind)) {
-              locations.push({
-                uri: pathToUri(fileEntry.absolutePath),
-                range: symbol.selectionRange,
-              });
-              if (locations.length > AST_FALLBACK_DEFINITION_RESULTS) {
-                truncated = true;
-                return;
+        try {
+          recovered ||= parsed.tree.rootNode.hasError;
+          const visit = (symbols: ReturnType<typeof extractDeclarations>): void => {
+            for (const symbol of symbols) {
+              const kindName = normalizeKind(SymbolKind[symbol.kind] ?? String(symbol.kind));
+              const requestedKind = kind ? normalizeKind(kind) : undefined;
+              if (symbol.name === name && (!requestedKind || kindName === requestedKind)) {
+                locations.push({
+                  uri: pathToUri(fileEntry.absolutePath),
+                  range: symbol.selectionRange,
+                });
+                if (locations.length > AST_FALLBACK_DEFINITION_RESULTS) {
+                  truncated = true;
+                  return;
+                }
               }
+              if (symbol.children) visit(symbol.children);
+              if (truncated) return;
             }
-            if (symbol.children) visit(symbol.children);
-            if (truncated) return;
-          }
-        };
-        visit(extractDeclarations(parsed.tree, parsed.source, language));
+          };
+          visit(extractDeclarations(parsed.tree, parsed.source, language));
+        } finally {
+          parsed.release();
+        }
       } catch {
         continue;
       }
@@ -883,14 +864,17 @@ export class AstProvider {
     index: WorkspaceIndex,
     file: IndexedFile,
     language: AstLanguage
-  ): Promise<{ tree: TsTree; source: string }> {
+  ): Promise<{ tree: TsTree; source: string; release: () => void }> {
     const current = await readBoundedSource(file.absolutePath);
     const { source } = current;
     const contentHash = createHash('sha256').update(source).digest('hex');
     const cached = index.getCachedTree(file.absolutePath, language, contentHash);
-    if (cached) return cached;
+    if (cached) return { ...cached, release: () => {} };
     const tree = await this.grammars.parse(source, language);
-    return index.setCachedTree(
+    // Oversized trees belong to the current read, not an immediately evicted cache entry.
+    if (Buffer.byteLength(source) > AST_TREE_CACHE_BYTES)
+      return { tree, source, release: () => tree.delete() };
+    const entry = index.setCachedTree(
       {
         path: file.absolutePath,
         contentHash,
@@ -901,5 +885,6 @@ export class AstProvider {
       },
       language
     );
+    return { ...entry, release: () => {} };
   }
 }

@@ -12,6 +12,7 @@ interface WrappedPattern {
   text: string;
   start: number;
   end: number;
+  nodeType?: string;
 }
 
 const LITERAL_DOLLAR = 'CCLSP_LITERAL_DOLLAR_7F4E';
@@ -30,7 +31,13 @@ function wrappers(source: string, language: AstLanguage): WrappedPattern[] {
     case 'tsx':
     case 'javascript':
     case 'jsx':
-      return [direct, { text: `(${source});`, start: 1, end: source.length + 1 }];
+      // A bare property also parses as a label. Prefer an exact object pair;
+      // labels with statement bodies still fall through to their direct form.
+      return [
+        { text: `({${source}});`, start: 2, end: source.length + 2, nodeType: 'pair' },
+        direct,
+        { text: `(${source});`, start: 1, end: source.length + 1 },
+      ];
     case 'python': {
       const prefix = 'def _():\n';
       const body = indentPython(source);
@@ -153,6 +160,10 @@ export class PatternCompiler {
       const node = nodeForPattern(tree, wrapped.start, wrapped.end);
       if (
         node &&
+        (!wrapped.nodeType ||
+          (node.type === wrapped.nodeType &&
+            node.startIndex === wrapped.start &&
+            node.endIndex === wrapped.end)) &&
         !node.hasError &&
         !containsMissing(node) &&
         countNodes(node) <= AST_MAX_PATTERN_NODES

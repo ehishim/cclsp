@@ -15,6 +15,34 @@ async function writeInBatches(root: string, paths: string[]): Promise<void> {
 }
 
 describe('WorkspaceIndex maximum representative scope', () => {
+  it('scopes discovery before the project cap and sees later subtree additions', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-index-scope-'));
+    const index = await WorkspaceIndex.create(root);
+    try {
+      await mkdir(join(root, 'selected'));
+      await mkdir(join(root, 'unrelated'));
+      await writeInBatches(
+        join(root, 'unrelated'),
+        Array.from({ length: AST_MAX_FILES + 1 }, (_, i) => `${i}.ts`)
+      );
+      await writeFile(join(root, 'selected', 'a.ts'), 'export const a = 1;');
+      const first = await index.ensureScope(join(root, 'selected'));
+      expect(first.capped).toBe(false);
+      expect(first.files.map((file) => file.relativePath)).toEqual(['selected/a.ts']);
+      expect(
+        [...first.directories.keys()].every((path) => path.startsWith(join(root, 'selected')))
+      ).toBe(true);
+      await writeFile(join(root, 'selected', 'b.ts'), 'export const b = 2;');
+      const next = await index.ensureScope(join(root, 'selected'));
+      expect(next.files.map((file) => file.relativePath)).toEqual([
+        'selected/a.ts',
+        'selected/b.ts',
+      ]);
+    } finally {
+      index.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
   it('fails closed for ignored, symlinked, escaped, and language-mismatched rewrite targets', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cclsp-index-safe-'));
     const outside = await mkdtemp(join(tmpdir(), 'cclsp-index-safe-outside-'));
@@ -75,6 +103,37 @@ describe('WorkspaceIndex maximum representative scope', () => {
     expect(deleted.every((count) => count === 1)).toBe(true);
   });
 
+  it('keeps a recently accessed tree and evicts the least recently used tree', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-index-lru-'));
+    const deleted: number[] = [];
+    const index = await WorkspaceIndex.create(root);
+    try {
+      for (let entry = 0; entry < 129; entry++) {
+        if (entry === 128)
+          expect(index.getCachedTree(join(root, '0.ts'), 'typescript', '0')).toBeDefined();
+        index.setCachedTree(
+          {
+            path: join(root, `${entry}.ts`),
+            contentHash: String(entry),
+            mtimeMs: entry,
+            bytes: 1,
+            source: '',
+            tree: { delete: () => deleted.push(entry) } as unknown as TsTree,
+          },
+          'typescript'
+        );
+      }
+      expect(deleted).toEqual([1]);
+      expect(index.getCachedTree(join(root, '0.ts'), 'typescript', '0')).toBeDefined();
+      expect(index.getCachedTree(join(root, '1.ts'), 'typescript', '1')).toBeUndefined();
+    } finally {
+      index.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+    expect(deleted.length).toBe(129);
+    expect(new Set(deleted).size).toBe(129);
+  });
+
   it('evicts trees when cached source bytes exceed 64 MiB', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cclsp-index-cache-bytes-'));
     let deleted = 0;
@@ -122,7 +181,7 @@ describe('WorkspaceIndex maximum representative scope', () => {
     }
   });
 
-  it('coalesces a deterministic gitignore-aware 5,000-file index and rebuilds its capped prefix', async () => {
+  it('coalesces a complete gitignore-aware index beyond 5,000 files and refreshes deletion', async () => {
     const root = await mkdtemp(join(tmpdir(), 'cclsp-index-max-'));
     const outside = await mkdtemp(join(tmpdir(), 'cclsp-index-outside-'));
     let index: WorkspaceIndex | undefined;
@@ -143,10 +202,10 @@ describe('WorkspaceIndex maximum representative scope', () => {
       index = await WorkspaceIndex.create(root);
       const [first, concurrent] = await Promise.all([index.ensure(), index.ensure()]);
       expect(concurrent).toBe(first);
-      expect(first.capped).toBe(true);
-      expect(first.files).toHaveLength(AST_MAX_FILES - 1);
+      expect(first.capped).toBe(false);
+      expect(first.files).toHaveLength(AST_MAX_FILES + 1);
       expect(first.files[0]?.relativePath).toBe('f00000.ts');
-      expect(first.files.at(-1)?.relativePath).toBe('f04998.ts');
+      expect(first.files.at(-1)?.relativePath).toBe('f05000.ts');
       expect(first.oversizedFiles.map((file) => file.relativePath)).toEqual(['_oversized.ts']);
       expect(first.files.some((file) => file.relativePath.includes('ignored'))).toBe(false);
       expect(first.files.some((file) => file.relativePath === '_escape.ts')).toBe(false);
@@ -154,10 +213,10 @@ describe('WorkspaceIndex maximum representative scope', () => {
       await unlink(join(root, 'f00000.ts'));
       const refreshed = await index.ensure();
       expect(refreshed.generation).toBeGreaterThan(first.generation);
-      expect(refreshed.capped).toBe(true);
-      expect(refreshed.files).toHaveLength(AST_MAX_FILES - 1);
+      expect(refreshed.capped).toBe(false);
+      expect(refreshed.files).toHaveLength(AST_MAX_FILES);
       expect(refreshed.files[0]?.relativePath).toBe('f00001.ts');
-      expect(refreshed.files.at(-1)?.relativePath).toBe('f04999.ts');
+      expect(refreshed.files.at(-1)?.relativePath).toBe('f05000.ts');
     } finally {
       index?.dispose();
       await rm(root, { recursive: true, force: true });

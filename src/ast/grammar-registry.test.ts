@@ -5,6 +5,22 @@ import { readFileSync } from 'node:fs';
 import { GrammarRegistry } from './grammar-registry.js';
 
 describe('owned TypeScript grammars', () => {
+  it('parses a complete large source across chunk boundaries through the final declaration', async () => {
+    const registry = new GrammarRegistry();
+    try {
+      const source = `const large = '${'x'.repeat(700_000)}';\nexport const finalSentinel = 1;\n`;
+      const tree = await registry.parse(source, 'typescript');
+      try {
+        expect(tree.rootNode.hasError).toBe(false);
+        expect(tree.rootNode.endIndex).toBe(source.length);
+        expect(tree.rootNode.lastNamedChild?.text).toBe('export const finalSentinel = 1;');
+      } finally {
+        tree.delete();
+      }
+    } finally {
+      registry.dispose();
+    }
+  });
   it('loads only the asset and patch bytes recorded by the build manifest', () => {
     const manifest = JSON.parse(
       readFileSync(new URL('../../grammars/manifest.json', import.meta.url), 'utf8')

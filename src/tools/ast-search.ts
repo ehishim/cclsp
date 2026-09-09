@@ -1,5 +1,6 @@
 import { AST_LANGUAGES, type AstPatternReport, type AstSearchOutcome } from '../ast/types.js';
 import { codeRewriteTool } from './code-rewrite.js';
+import { INLINE_RESULT_BYTES, spoolFullResult } from './helpers.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
 
 /**
@@ -57,7 +58,7 @@ function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'part
 function renderText(result: AstSearchOutcome): string {
   if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
   if (result.outcome === 'partial') {
-    const header = `${result.code}: AST search (${result.provider}, ${result.language}) searched ${result.filesScanned} file(s) but cannot prove absence: ${result.parseFailureCount} file(s) did not parse completely.`;
+    const header = `${result.code}: AST search (${result.provider}, ${result.language}) searched ${result.filesScanned} file(s) but cannot prove absence: ${result.parseFailureCount} file(s) did not parse completely; ${result.filesSkippedOversized} oversized file(s) skipped; indexCapped=${result.indexCapped}.`;
     const breakdown = result.perPattern.map(renderPatternRow).join('\n');
     const failedFiles = result.failedFiles
       .map(
@@ -86,6 +87,36 @@ function renderText(result: AstSearchOutcome): string {
 }
 
 function toolResult(result: AstSearchOutcome): ToolResult {
+  // Presentation bounds redirect to complete bytes, never trim match/capture text.
+  if (Buffer.byteLength(JSON.stringify(result), 'utf8') > INLINE_RESULT_BYTES) {
+    const resultFile = spoolFullResult('ast_search', result);
+    if (!resultFile) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'AST_RESULT_SPOOL_FAILED: complete search result could not be stored; retry after restoring writable result storage.',
+          },
+        ],
+        structuredContent: { outcome: 'unavailable', code: 'AST_RESULT_SPOOL_FAILED' },
+        isError: true,
+      };
+    }
+    return {
+      content: [
+        { type: 'text', text: `AST search ${result.outcome}: complete result at ${resultFile}` },
+      ],
+      structuredContent: {
+        ...result,
+        ...('matches' in result
+          ? { matches: [], shown: 0, total: result.matches.length, omitted: result.matches.length }
+          : {}),
+        resultFile,
+        recovery: `Read the complete result at ${resultFile}`,
+      },
+      ...(result.outcome !== 'ok' ? { isError: true } : {}),
+    };
+  }
   return {
     content: [{ type: 'text', text: renderText(result) }],
     structuredContent: { ...result },
@@ -104,7 +135,7 @@ export const astSearchTool: ToolDefinition = {
         type: ['string', 'array'],
         items: { type: 'string' },
         description:
-          'Structural pattern with $NAME and $$$NAME metavariables. Pass an array (or repeat --pattern) to search several patterns in one scan; complete scans report exact counts, while an unproven zero in a partial scan reports unknown. Regex syntax is never interpreted, so alternation is expressed as separate patterns, not as "a|b".',
+          'Structural pattern with $NAME and $$$NAME metavariables. Pass an array (or repeat --pattern) to search several patterns in one scan; complete scans report exact counts, while an unproven zero in a partial scan reports unknown. Regex syntax is never interpreted, so alternation is expressed as separate patterns, not as "a|b". In JS/TS, a bare key: value fragment selects an object property; use an explicit statement body for a label.',
       },
       language: {
         type: 'string',
@@ -118,8 +149,8 @@ export const astSearchTool: ToolDefinition = {
       },
       max_results: {
         type: 'number',
-        description: 'Positive result limit (default 100, ceiling 1000)',
-        default: 100,
+        description:
+          'Optional positive result limit. Omit for all matches; large complete results are spooled.',
       },
     },
     required: ['pattern', 'language'],

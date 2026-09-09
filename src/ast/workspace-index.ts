@@ -4,7 +4,6 @@ import type { Ignore } from 'ignore';
 import { loadGitignore } from '../file-scanner.js';
 import {
   AST_LANGUAGE_DEFINITIONS,
-  AST_MAX_FILES,
   AST_MAX_FILE_BYTES,
   AST_TREE_CACHE_BYTES,
   AST_TREE_CACHE_FILES,
@@ -150,11 +149,29 @@ export class WorkspaceIndex {
     if (!scopeStat.isDirectory()) {
       throw new Error('AST_PATH_INVALID:AST path must be a file or directory');
     }
-    const snapshot = await this.ensure();
+    const snapshot = await this.ensureScope(scope);
     return {
       files: this.allFilesFor(snapshot, scope, language),
       capped: snapshot.capped,
       explicitFile: false,
+    };
+  }
+
+  /** Scope discovery before loading unrelated project files into an explicit subtree query. */
+  async ensureScope(scope: string): Promise<WorkspaceSnapshot> {
+    if (resolve(scope) === this.root) return this.ensure();
+    if (!isContained(this.root, resolve(scope)))
+      throw new Error('AST_PATH_ESCAPED:scope is outside root');
+    const scanned = await this.scanSubtree(scope, Number.POSITIVE_INFINITY);
+    const entries = [...scanned.files, ...scanned.oversizedFiles].sort((a, b) =>
+      compareText(a.relativePath, b.relativePath)
+    );
+    return {
+      files: entries.filter((file) => file.bytes <= AST_MAX_FILE_BYTES),
+      oversizedFiles: entries.filter((file) => file.bytes > AST_MAX_FILE_BYTES),
+      directories: scanned.directories,
+      capped: scanned.capped,
+      generation: this.generation,
     };
   }
 
@@ -185,6 +202,8 @@ export class WorkspaceIndex {
     const cached = this.cache.get(key);
     if (!cached || cached.contentHash !== contentHash) return undefined;
     cached.lastUsed = ++this.cacheClock;
+    this.cache.delete(key);
+    this.cache.set(key, cached);
     return cached;
   }
 
@@ -224,16 +243,15 @@ export class WorkspaceIndex {
   }
 
   private async rebuild(): Promise<WorkspaceSnapshot> {
-    const scanned = await this.scanSubtree(this.root, AST_MAX_FILES + 1);
+    const scanned = await this.scanSubtree(this.root, Number.POSITIVE_INFINITY);
     const entries = [...scanned.files, ...scanned.oversizedFiles].sort((a, b) =>
       compareText(a.relativePath, b.relativePath)
     );
-    const admitted = entries.slice(0, AST_MAX_FILES);
     this.snapshot = {
-      files: admitted.filter((file) => file.bytes <= AST_MAX_FILE_BYTES),
-      oversizedFiles: admitted.filter((file) => file.bytes > AST_MAX_FILE_BYTES),
+      files: entries.filter((file) => file.bytes <= AST_MAX_FILE_BYTES),
+      oversizedFiles: entries.filter((file) => file.bytes > AST_MAX_FILE_BYTES),
       directories: scanned.directories,
-      capped: scanned.capped || entries.length > AST_MAX_FILES,
+      capped: scanned.capped,
       generation: ++this.generation,
     };
     return this.snapshot;
@@ -292,7 +310,7 @@ export class WorkspaceIndex {
       }
       let scanned: ScanResult;
       try {
-        scanned = await this.scanSubtree(changedDirectory.absolutePath, AST_MAX_FILES + 1);
+        scanned = await this.scanSubtree(changedDirectory.absolutePath, Number.POSITIVE_INFINITY);
       } catch {
         continue;
       }
@@ -305,11 +323,9 @@ export class WorkspaceIndex {
     const entries = [...files, ...oversizedFiles].sort((a, b) =>
       compareText(a.relativePath, b.relativePath)
     );
-    const admitted = entries.slice(0, AST_MAX_FILES);
-    capped ||= entries.length > AST_MAX_FILES;
     this.snapshot = {
-      files: admitted.filter((file) => file.bytes <= AST_MAX_FILE_BYTES),
-      oversizedFiles: admitted.filter((file) => file.bytes > AST_MAX_FILE_BYTES),
+      files: entries.filter((file) => file.bytes <= AST_MAX_FILE_BYTES),
+      oversizedFiles: entries.filter((file) => file.bytes > AST_MAX_FILE_BYTES),
       directories,
       capped,
       generation: ++this.generation,
@@ -377,10 +393,7 @@ export class WorkspaceIndex {
 
   private evictCache(): void {
     while (this.cache.size > AST_TREE_CACHE_FILES || this.cacheBytes > AST_TREE_CACHE_BYTES) {
-      let oldest: [string, CachedTree] | undefined;
-      for (const entry of this.cache) {
-        if (!oldest || entry[1].lastUsed < oldest[1].lastUsed) oldest = entry;
-      }
+      const oldest = this.cache.entries().next().value;
       if (!oldest) break;
       this.deleteCacheEntry(oldest[0], oldest[1]);
     }

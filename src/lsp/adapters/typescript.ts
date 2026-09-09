@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logger } from '../../logger.js';
 import type { LSPServerConfig } from '../../types.js';
 import { pathToUri } from '../../utils.js';
@@ -119,16 +120,23 @@ export class TypeScriptAdapter implements ServerAdapter {
           {
             command: 'typescript.tsserverRequest',
             arguments: [
-              'semanticDiagnosticsSync',
-              { file: filePath, includeLinePosition: true },
+              'projectInfo',
+              { file: filePath, needFileNameList: false },
               { executionTarget: 0 },
             ],
           },
           timeout
         )) as { success?: boolean; body?: unknown; message?: string } | undefined;
-        if (reply?.success !== true || !Array.isArray(reply.body)) {
+        const body = reply?.body as
+          | { configFileName?: unknown; languageServiceDisabled?: unknown }
+          | undefined;
+        if (
+          reply?.success !== true ||
+          typeof body?.configFileName !== 'string' ||
+          body.languageServiceDisabled !== false
+        ) {
           logger.debug(
-            `[TypeScriptAdapter] Project readiness request failed: ${reply?.message ?? 'missing diagnostic array'}\n`
+            `[TypeScriptAdapter] Project readiness request failed: ${reply?.message ?? 'missing enabled project confirmation'}\n`
           );
           return false;
         }
@@ -327,8 +335,32 @@ export class TypeScriptAdapter implements ServerAdapter {
         ? (capabilities.textDocument as Record<string, unknown>)
         : {};
 
+    const initializationOptions =
+      params.initializationOptions && typeof params.initializationOptions === 'object'
+        ? (params.initializationOptions as Record<string, unknown>)
+        : {};
+    const pluginRoot = fileURLToPath(new URL('./plugins/', import.meta.url));
+    const pluginPath = join(pluginRoot, 'node_modules/cclsp-full-display/index.js');
+    const plugins = Array.isArray(initializationOptions.plugins)
+      ? initializationOptions.plugins
+      : [];
     return {
       ...params,
+      ...(existsSync(pluginPath)
+        ? {
+            initializationOptions: {
+              ...initializationOptions,
+              plugins: [
+                ...plugins,
+                {
+                  name: 'cclsp-full-display',
+                  location: pluginRoot,
+                  languages: ['typescript', 'javascript'],
+                },
+              ],
+            },
+          }
+        : {}),
       capabilities: {
         ...capabilities,
         textDocument: {

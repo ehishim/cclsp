@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
 import { LspToolOutcomeError } from './lsp/capabilities.js';
 import { getDiagnosticsTool } from './tools/diagnostics.js';
+import { getHoverTool } from './tools/hover.js';
 import { getCodeActionsTool, getCompletionsTool } from './tools/language-features.js';
 import { findReferencesTool } from './tools/navigation.js';
 import { renameFileTool } from './tools/refactoring.js';
@@ -20,6 +21,77 @@ function asClient(value: Record<string, unknown>): LSPClient {
 }
 
 describe('capability tool contracts', () => {
+  it('spools the complete hover batch without dropping long signatures', async () => {
+    const contents = `type Huge = ${'x'.repeat(150000)}END`;
+    const client = asClient({ hoverBatch: async () => [{ contents }] });
+    const result = await getHoverTool.handler(
+      { file_path: 'a.ts', positions: [{ line: 1, character: 1 }] },
+      client
+    );
+    const path = result.structuredContent?.resultFile as string;
+    try {
+      const body = JSON.parse(readFileSync(path, 'utf8'));
+      expect(body.hovers).toEqual([{ contents }]);
+      expect(body.positions).toEqual([{ line: 1, character: 1 }]);
+      expect(result.structuredContent).toMatchObject({ total: 1, shown: 0, omitted: 1 });
+      expect(JSON.stringify(result.content).length).toBeLessThan(1024);
+    } finally {
+      if (path) rmSync(path, { force: true });
+    }
+  });
+  it('routes ordered hover positions through one batch and rejects mixed selectors', async () => {
+    const batch = jest.fn().mockResolvedValue([{ contents: 'first' }, null]);
+    const client = asClient({ hoverBatch: batch });
+    const result = await getHoverTool.handler(
+      {
+        file_path: 'a.ts',
+        positions: [
+          { line: 2, character: 3 },
+          { line: 4, character: 5 },
+        ],
+      },
+      client
+    );
+    expect(batch).toHaveBeenCalledTimes(1);
+    expect(batch.mock.calls[0]?.[1]).toEqual([
+      { line: 1, character: 2 },
+      { line: 3, character: 4 },
+    ]);
+    expect(result.structuredContent).toMatchObject({
+      hovers: [{ contents: 'first' }, null],
+      total: 2,
+      omitted: 0,
+    });
+    const bad = await getHoverTool.handler(
+      { file_path: 'a.ts', line: 1, character: 1, positions: [{ line: 2, character: 3 }] },
+      client
+    );
+    expect(bad.isError).toBe(true);
+    expect(batch).toHaveBeenCalledTimes(1);
+  });
+  it('keeps every declaration beyond the old document-symbol ceiling in a complete spool', async () => {
+    const value = Array.from({ length: 5001 }, (_, i) => ({
+      name: `Symbol${i}`,
+      kind: 12,
+      range: { start: { line: i, character: 0 }, end: { line: i, character: 8 } },
+      selectionRange: { start: { line: i, character: 0 }, end: { line: i, character: 8 } },
+      children: [],
+    }));
+    const client = asClient({
+      getDocumentSymbolsWithProvider: async () => ({ outcome: 'ok', provider: 'lsp', value }),
+      symbolKindToString: () => 'function',
+    });
+    const result = await getDocumentSymbolsTool.handler({ file_path: 'many.ts' }, client);
+    const path = result.structuredContent?.resultFile as string;
+    try {
+      const complete = JSON.parse(readFileSync(path, 'utf8'));
+      expect(complete.symbols.length).toBe(5001);
+      expect(complete.symbols.at(-1).name).toBe('Symbol5000');
+      expect(result.structuredContent).toMatchObject({ total: 5001, omitted: 5001, shown: 0 });
+    } finally {
+      if (path) rmSync(path, { force: true });
+    }
+  });
   it('restores import edits when the file move fails after edits were written', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cclsp-rename-rollback-'));
     const oldPath = join(root, 'owner.ts');

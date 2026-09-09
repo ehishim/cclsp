@@ -1,4 +1,5 @@
 import { describe, expect, it, jest } from 'bun:test';
+import { readFile, rm } from 'node:fs/promises';
 import type { LSPClient } from './lsp-client.js';
 import { astSearchTool, astTools } from './tools/ast-search.js';
 
@@ -9,6 +10,41 @@ function client(result: Record<string, unknown>): LSPClient {
 }
 
 describe('ast_search tool', () => {
+  it('spools oversized match bodies without losing their final bytes', async () => {
+    const text = `${'x'.repeat(150_000)}END`;
+    const source = {
+      outcome: 'ok',
+      provider: 'tree-sitter',
+      language: 'typescript',
+      matches: [
+        {
+          file: '/fixture/a.ts',
+          text,
+          captures: [],
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: text.length } },
+        },
+      ],
+      perPattern: [],
+      filesScanned: 1,
+      truncated: false,
+      partial: false,
+      indexCapped: false,
+    };
+    const result = await astSearchTool.handler(
+      { pattern: 'value', language: 'typescript' },
+      client(source)
+    );
+    const path = result.structuredContent?.resultFile as string;
+    expect(typeof path).toBe('string');
+    try {
+      const full = JSON.parse(await readFile(path, 'utf8'));
+      expect(full.matches[0].text).toBe(text);
+      expect(result.structuredContent).toMatchObject({ shown: 0, total: 1, omitted: 1 });
+      expect(JSON.stringify(result.content).length).toBeLessThan(1024);
+    } finally {
+      await rm(path, { force: true });
+    }
+  });
   it('registers structural search and rewrite exactly once', () => {
     expect(astTools.map((tool) => tool.name)).toEqual(['ast_search', 'code_rewrite']);
   });

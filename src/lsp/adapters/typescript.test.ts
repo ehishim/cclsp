@@ -90,7 +90,10 @@ describe('TypeScriptAdapter', () => {
     const first = adapter.waitForProjectReady(state as never, '/project/a.ts', 1000);
     const concurrent = adapter.waitForProjectReady(state as never, '/project/b.ts', 1000);
     expect(calls).toHaveLength(1);
-    finish({ success: true, body: [] });
+    finish({
+      success: true,
+      body: { configFileName: '/project/tsconfig.json', languageServiceDisabled: false },
+    });
     expect(await Promise.all([first, concurrent])).toEqual([true, true]);
     expect(await adapter.waitForProjectReady(state as never, '/project/c.ts', 1000)).toBe(true);
     expect(state).not.toHaveProperty('indexingComplete');
@@ -101,8 +104,8 @@ describe('TypeScriptAdapter', () => {
       input: {
         command: 'typescript.tsserverRequest',
         arguments: [
-          'semanticDiagnosticsSync',
-          { file: '/project/a.ts', includeLinePosition: true },
+          'projectInfo',
+          { file: '/project/a.ts', needFileNameList: false },
           { executionTarget: 0 },
         ],
       },
@@ -124,7 +127,10 @@ describe('TypeScriptAdapter', () => {
       transport: {
         sendRequest: async (_method: string, input: { arguments: [string, { file: string }] }) => {
           calls.push(input.arguments[1].file);
-          return { success: true, body: [] };
+          return {
+            success: true,
+            body: { configFileName: 'tsconfig.json', languageServiceDisabled: false },
+          };
         },
       },
     };
@@ -171,7 +177,10 @@ describe('TypeScriptAdapter', () => {
     const sendRequest = jest
       .fn()
       .mockRejectedValueOnce(new Error('request timeout'))
-      .mockResolvedValueOnce({ success: true, body: [] });
+      .mockResolvedValueOnce({
+        success: true,
+        body: { configFileName: '/project/tsconfig.json', languageServiceDisabled: false },
+      });
     const state = {
       config: { extensions: ['ts'], command: ['typescript-language-server'] },
       serverCapabilities: { executeCommandProvider: { commands: ['typescript.tsserverRequest'] } },

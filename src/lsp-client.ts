@@ -35,6 +35,7 @@ import {
   getDocumentSymbols as opsGetDocumentSymbols,
   getSignatureHelp as opsGetSignatureHelp,
   hover as opsHover,
+  hoverBatch as opsHoverBatch,
   incomingCalls as opsIncomingCalls,
   matchSymbolsByName as opsMatchSymbolsByName,
   outgoingCalls as opsOutgoingCalls,
@@ -803,6 +804,11 @@ export class LSPClient {
 
     const groupResults = await Promise.all(groupPromises);
     return groupResults.flat();
+  }
+
+  async hoverBatch(filePath: string, positions: Position[]) {
+    const serverState = await this.getServer(filePath);
+    return opsHoverBatch(serverState, filePath, positions);
   }
 
   async hover(

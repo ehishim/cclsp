@@ -27,6 +27,75 @@ async function withProject(
   }
 }
 
+it('preserves complete match and capture text beyond old preview limits', async () => {
+  const literal = `'${'complete-'.repeat(1500)}END'`;
+  const statement = `const value = ${literal};`;
+  await withProject({ 'a.ts': statement }, async (_root, provider) => {
+    const result = await provider.search({
+      language: 'typescript',
+      pattern: 'const $NAME = $VALUE',
+      path: 'a.ts',
+    });
+    expect(result.outcome).toBe('ok');
+    if (result.outcome !== 'ok') throw new Error(JSON.stringify(result));
+    expect(result.matches[0]?.text).toBe(statement);
+    expect(result.matches[0]?.captures.find((capture) => capture.name === 'VALUE')?.text).toBe(
+      literal
+    );
+  });
+});
+
+it('searches through a large file to its final declaration without a size refusal', async () => {
+  await withProject(
+    { 'large.ts': `const text = '${'x'.repeat(700_000)}';\nexport const finalSentinel = 1;\n` },
+    async (_root, provider) => {
+      const result = await provider.search({
+        language: 'typescript',
+        pattern: 'finalSentinel',
+        path: 'large.ts',
+      });
+      expect(result.outcome).toBe('ok');
+      if (result.outcome !== 'ok') throw new Error(JSON.stringify(result));
+      expect(result.matches.map((match) => match.text)).toEqual(['finalSentinel']);
+      expect(result.filesSkippedOversized).toBe(0);
+    }
+  );
+});
+
+it('enumerates and searches PHP declarations beyond the old file-size ceiling', async () => {
+  const source = `<?php\n/*${'x'.repeat(700_000)}*/\nclass FinalPhpSentinel {}\n`;
+  await withProject({ 'large.php': source }, async (root, provider) => {
+    const symbols = await provider.documentSymbols(join(root, 'large.php'));
+    expect(symbols.outcome).toBe('ok');
+    if (symbols.outcome !== 'ok') throw new Error(JSON.stringify(symbols));
+    expect(symbols.value.some((symbol) => symbol.name === 'FinalPhpSentinel')).toBe(true);
+    const result = await provider.search({
+      language: 'php',
+      pattern: 'FinalPhpSentinel',
+      path: 'large.php',
+    });
+    expect(result.outcome).toBe('ok');
+    if (result.outcome !== 'ok') throw new Error(JSON.stringify(result));
+    expect(result.matches.map((match) => match.text)).toEqual(['FinalPhpSentinel']);
+  });
+});
+
+it('returns every match by default beyond the former 1,000-result ceiling', async () => {
+  const source = Array.from({ length: 1201 }, (_, i) => `const value${i} = call(${i});`).join('\n');
+  await withProject({ 'a.ts': source }, async (_root, provider) => {
+    const result = await provider.search({
+      language: 'typescript',
+      pattern: 'call($VALUE)',
+      path: 'a.ts',
+    });
+    expect(result.outcome).toBe('ok');
+    if (result.outcome !== 'ok') throw new Error(JSON.stringify(result));
+    expect(result.matches.length).toBe(1201);
+    expect(result.matches.at(-1)?.text).toBe('call(1200)');
+    expect(result.truncated).toBe(false);
+  });
+});
+
 const LANGUAGE_SMOKES = [
   ['typescript', 'sample.ts', 'function f() {}', 'function f() {}'],
   ['tsx', 'sample.tsx', 'const x = <div />;', 'const $NAME = $VALUE'],
@@ -255,7 +324,7 @@ describe('AstProvider', () => {
         expect(clampedWithoutOmission).toMatchObject({
           outcome: 'ok',
           matches: [{}],
-          effectiveMaxResults: 1_000,
+          effectiveMaxResults: 5_000,
           truncated: false,
         });
 
@@ -305,7 +374,7 @@ describe('AstProvider', () => {
     });
   });
 
-  it('enforces the file cap after a pure content edit', async () => {
+  it('searches grown files completely and refreshes after shrinking', async () => {
     await withProject({ 'sample.ts': 'const small = 1;\n' }, async (root, provider) => {
       const searchRoot = () =>
         provider.search({ language: 'typescript', pattern: 'const $NAME = $VALUE' });
@@ -316,8 +385,8 @@ describe('AstProvider', () => {
       expect(directoryResult).toMatchObject({
         outcome: 'ok',
         matches: [],
-        filesScanned: 0,
-        filesSkippedOversized: 1,
+        filesScanned: 1,
+        filesSkippedOversized: 0,
         parseFailureCount: 0,
       });
 
@@ -339,10 +408,9 @@ describe('AstProvider', () => {
         pattern: '$NAME',
       });
       expect(explicitResult).toMatchObject({
-        outcome: 'rejected',
-        code: 'AST_FILE_OVERSIZED',
-        bytes: AST_MAX_FILE_BYTES * 6,
-        cap: AST_MAX_FILE_BYTES,
+        outcome: 'ok',
+        filesScanned: 1,
+        filesSkippedOversized: 0,
       });
     });
   });
@@ -363,7 +431,7 @@ describe('AstProvider', () => {
         pattern: '$NAME',
         path: 'large.ts',
       });
-      expect(oversized.outcome === 'rejected' && oversized.code).toBe('AST_FILE_OVERSIZED');
+      expect(oversized.outcome).toBe('ok');
 
       await writeFile(join(root, 'broken.ts'), 'const = ;');
       const parseFailure = await provider.search({

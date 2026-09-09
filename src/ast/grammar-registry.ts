@@ -48,7 +48,10 @@ export class GrammarRegistry {
     const grammar = await this.getLanguage(language);
     this.parser ??= new Parser();
     this.parser.setLanguage(grammar);
-    const tree = this.parser.parse(source);
+    // Feed bounded chunks to WASM while retaining one continuous syntax tree.
+    // Unlike splitting source into standalone fragments, this preserves tokens
+    // and declarations that cross a chunk boundary.
+    const tree = this.parser.parse((index) => source.slice(index, index + 32 * 1024));
     // The runtime returns null only when parsing was cancelled or the language
     // was never set; neither is reachable here, and a null tree must never be
     // mistaken for a file that contains nothing.

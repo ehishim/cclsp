@@ -23,7 +23,9 @@ const TOOL_RESULT_PREVIEW_BYTES = 16 * 1024;
 
 function resultByteLimit(): number {
   const configured = Number.parseInt(process.env.CCLSP_TOOL_RESULT_MAX_BYTES ?? '', 10);
-  return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_TOOL_RESULT_MAX_BYTES;
+  return Number.isInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_TOOL_RESULT_MAX_BYTES;
 }
 
 function jsonFits(value: unknown, maxBytes: number): boolean {
@@ -65,7 +67,10 @@ function jsonFits(value: unknown, maxBytes: number): boolean {
 function headBytes(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, 'utf8');
   if (buffer.byteLength <= maxBytes) return text;
-  return buffer.subarray(0, maxBytes).toString('utf8').replace(/\uFFFD$/, '');
+  return buffer
+    .subarray(0, maxBytes)
+    .toString('utf8')
+    .replace(/\uFFFD$/, '');
 }
 
 /** Scalar fields survive compaction; the bulk arrays live in the spool file. */
@@ -88,16 +93,37 @@ function scalarFields(value: unknown): Record<string, unknown> {
 export function boundToolResult(result: ToolResult, maxBytes = resultByteLimit()): ToolResult {
   if (jsonFits(result, maxBytes)) return result;
   const resultFile = spoolFullResult('tool_result', result);
+  if (!resultFile) {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: 'TOOL_RESULT_SPOOL_FAILED: complete result could not be stored; restore writable result storage and retry.',
+        },
+      ],
+      structuredContent: {
+        outcome: 'unavailable',
+        provider: 'none',
+        code: 'TOOL_RESULT_SPOOL_FAILED',
+      },
+      isError: true,
+    };
+  }
   const scalars = scalarFields(result.structuredContent);
   const recovery = resultFile
     ? `Read the complete result at ${resultFile}, or narrow the file, symbol query, path, or result limit.`
     : 'Narrow the file, symbol query, path, or result limit and retry.';
-  const head = headBytes(result.content.map((part) => part.text).join('\n'), TOOL_RESULT_PREVIEW_BYTES);
+  const head = headBytes(
+    result.content.map((part) => part.text).join('\n'),
+    TOOL_RESULT_PREVIEW_BYTES
+  );
   return {
-    content: [{
-      type: 'text',
-      text: `${head}\n\n... result bounded at ${maxBytes} bytes; complete result: ${resultFile ?? '(spool unavailable)'}`,
-    }],
+    content: [
+      {
+        type: 'text',
+        text: `${head}\n\n... result bounded at ${maxBytes} bytes; complete result: ${resultFile ?? '(spool unavailable)'}`,
+      },
+    ],
     structuredContent: {
       ...scalars,
       outcome: typeof scalars.outcome === 'string' ? scalars.outcome : 'ok',

@@ -134,7 +134,7 @@ interface AstSearchResult {
   language: AstLanguage;
   matches: AstMatch[];
   truncated: boolean;
-  effectiveMaxResults: number;
+  effectiveMaxResults: number | null;
   filesScanned: number;
   filesSkippedOversized: number;
   indexCapped: boolean;

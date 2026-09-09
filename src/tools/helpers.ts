@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import { LspToolOutcomeError } from '../lsp/capabilities.js';
-import { resultSpoolDir, spoolFullResult } from '../result-spool.js';
 import type { Location } from '../lsp/types.js';
+import { resultSpoolDir, spoolFullResult } from '../result-spool.js';
 import { uriToPath } from '../utils.js';
 import type { ToolResult } from './registry.js';
 
@@ -15,6 +15,9 @@ export const SEMANTIC_DEFAULT_LIMIT = 1_000;
 export const SEMANTIC_MAX_LIMIT = 5_000;
 
 export { resultSpoolDir, spoolFullResult };
+
+/** Inline result budget; larger complete results are spooled untrimmed. */
+export const INLINE_RESULT_BYTES = 120 * 1024;
 
 export function boundedResultLimit(value: unknown): number {
   if (value === undefined) return SEMANTIC_DEFAULT_LIMIT;

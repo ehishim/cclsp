@@ -1,6 +1,7 @@
 import type { DocumentSymbol, SymbolInformation } from '../lsp/types.js';
 import { uriToPath } from '../utils.js';
 import {
+  INLINE_RESULT_BYTES,
   SEMANTIC_DEFAULT_LIMIT,
   SEMANTIC_MAX_LIMIT,
   boundedResultLimit,
@@ -86,13 +87,23 @@ export const getDocumentSymbolsTool: ToolDefinition = {
     type: 'object',
     properties: {
       file_path: { type: 'string', description: 'The path to the file to enumerate' },
-      max_results: { type: 'number', description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})` },
-      include_raw: { type: 'boolean', description: 'Include bounded selected native symbol rows for explicit diagnostics' },
+      max_results: {
+        type: 'number',
+        description: 'Optional positive row limit; omit for all declarations.',
+      },
+      include_raw: {
+        type: 'boolean',
+        description: 'Include bounded selected native symbol rows for explicit diagnostics',
+      },
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, max_results, include_raw } = args as { file_path: string; max_results?: number; include_raw?: boolean };
+    const { file_path, max_results, include_raw } = args as {
+      file_path: string;
+      max_results?: number;
+      include_raw?: boolean;
+    };
     const absolutePath = resolvePath(file_path);
     try {
       const result = await client.getDocumentSymbolsWithProvider(absolutePath);
@@ -111,25 +122,55 @@ export const getDocumentSymbolsTool: ToolDefinition = {
       const hierarchy = hierarchical
         ? (symbols as DocumentSymbol[]).map((symbol) => mapHierarchicalSymbol(symbol, client))
         : (symbols as SymbolInformation[]).map((symbol) => mapFlatSymbol(symbol, client));
-      const limit = boundedResultLimit(max_results);
+      if (max_results !== undefined && (!Number.isSafeInteger(max_results) || max_results < 1)) {
+        throw new Error('max_results must be a positive safe integer');
+      }
+      const limit = max_results ?? Number.POSITIVE_INFINITY;
       const rows = flattenDocumentSymbols(hierarchy);
-      const selected = rows.slice(0, limit);
+      const selected =
+        Buffer.byteLength(JSON.stringify(rows), 'utf8') > INLINE_RESULT_BYTES
+          ? []
+          : rows.slice(0, limit);
       const omitted = rows.length - selected.length;
-      const resultFile = omitted > 0
-        ? spoolFullResult('get_document_symbols', {
-            file: absolutePath, provider: result.provider, total: rows.length, symbols: rows,
-          })
-        : null;
-      const recovery = omitted > 0
-        ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or retry with max_results up to ${DOCUMENT_SYMBOLS_MAX_LIMIT}.`
-        : null;
-      const text = selected.length === 0
-        ? `Document symbols (0/0) in ${file_path} · provider ${result.provider}`
-        : [
-            `Document symbols (${selected.length}/${rows.length}) in ${file_path} · provider ${result.provider}`,
-            ...selected.map(renderDocumentSymbol),
-            ...(omitted > 0 ? [`... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`] : []),
-          ].join('\n');
+      const resultFile =
+        omitted > 0
+          ? spoolFullResult('get_document_symbols', {
+              file: absolutePath,
+              provider: result.provider,
+              total: rows.length,
+              symbols: rows,
+            })
+          : null;
+      if (omitted > 0 && !resultFile) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'SYMBOL_RESULT_SPOOL_FAILED: complete declarations could not be stored; restore writable result storage and retry.',
+            },
+          ],
+          structuredContent: {
+            outcome: 'unavailable',
+            provider: result.provider,
+            code: 'SYMBOL_RESULT_SPOOL_FAILED',
+            file: absolutePath,
+          },
+          isError: true,
+        };
+      }
+      const recovery = omitted > 0 ? `Read the complete result at ${resultFile}.` : null;
+      const text =
+        selected.length === 0
+          ? `Document symbols (0/0) in ${file_path} · provider ${result.provider}`
+          : [
+              `Document symbols (${selected.length}/${rows.length}) in ${file_path} · provider ${result.provider}`,
+              ...selected.map(renderDocumentSymbol),
+              ...(omitted > 0
+                ? [
+                    `... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`,
+                  ]
+                : []),
+            ].join('\n');
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
@@ -171,7 +212,10 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
     type: 'object',
     properties: {
       query: { type: 'string', description: 'The symbol name or pattern' },
-      max_results: { type: 'number', description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})` },
+      max_results: {
+        type: 'number',
+        description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})`,
+      },
     },
     required: ['query'],
   },
@@ -181,19 +225,25 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
       const { symbols, readinessConfirmed } = await client.workspaceSymbol(query);
       const selected = symbols.slice(0, boundedResultLimit(max_results));
       const omitted = symbols.length - selected.length;
-      const resultFile = omitted > 0
-        ? spoolFullResult('find_workspace_symbols', { query, total: symbols.length, symbols })
-        : null;
-      const text = selected.length === 0
-        ? `Workspace symbols (0/0) matching "${query}" · searched LOADED files only`
-        : [
-            `Workspace symbols (${selected.length}/${symbols.length}) matching "${query}" · provider lsp`,
-            ...selected.map((symbol) => {
-              const start = symbol.location.range.start;
-              return `${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1} · ${client.symbolKindToString(symbol.kind)} · ${symbol.name}`;
-            }),
-            ...(omitted > 0 ? [`... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`] : []),
-          ].join('\n');
+      const resultFile =
+        omitted > 0
+          ? spoolFullResult('find_workspace_symbols', { query, total: symbols.length, symbols })
+          : null;
+      const text =
+        selected.length === 0
+          ? `Workspace symbols (0/0) matching "${query}" · searched LOADED files only`
+          : [
+              `Workspace symbols (${selected.length}/${symbols.length}) matching "${query}" · provider lsp`,
+              ...selected.map((symbol) => {
+                const start = symbol.location.range.start;
+                return `${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1} · ${client.symbolKindToString(symbol.kind)} · ${symbol.name}`;
+              }),
+              ...(omitted > 0
+                ? [
+                    `... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`,
+                  ]
+                : []),
+            ].join('\n');
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
@@ -210,13 +260,14 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
           shown: selected.length,
           total: symbols.length,
           omitted,
-          recovery: omitted > 0
-            ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
-            : selected.length === 0
-              ? NO_MATCH_RECOVERY
-              : readinessConfirmed
-                ? null
-                : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
+          recovery:
+            omitted > 0
+              ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
+              : selected.length === 0
+                ? NO_MATCH_RECOVERY
+                : readinessConfirmed
+                  ? null
+                  : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
           ...(resultFile ? { resultFile } : {}),
         },
       };
@@ -234,7 +285,10 @@ const positionSchema = {
     query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
     line: { type: 'number', description: 'The line number (1-indexed)' },
     character: { type: 'number', description: 'The character position (1-indexed)' },
-    max_results: { type: 'number', description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})` },
+    max_results: {
+      type: 'number',
+      description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
+    },
   },
   required: ['file_path'],
 };
@@ -265,9 +319,14 @@ export const prepareCallHierarchyTool: ToolDefinition = {
       }
       const allItems = await client.prepareCallHierarchy(absolutePath, resolution.position);
       const items = allItems.slice(0, boundedResultLimit(max_results));
-      const itemsFile = allItems.length > items.length
-        ? spoolFullResult('prepare_call_hierarchy', { file: absolutePath, total: allItems.length, items: allItems })
-        : null;
+      const itemsFile =
+        allItems.length > items.length
+          ? spoolFullResult('prepare_call_hierarchy', {
+              file: absolutePath,
+              total: allItems.length,
+              items: allItems,
+            })
+          : null;
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
       if (items.length === 0) {
@@ -279,9 +338,13 @@ export const prepareCallHierarchyTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'empty', provider: 'lsp',
+            outcome: 'empty',
+            provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            items: [], shown: 0, total: 0, omitted: 0,
+            items: [],
+            shown: 0,
+            total: 0,
+            omitted: 0,
           },
         };
       }
@@ -294,19 +357,23 @@ export const prepareCallHierarchyTool: ToolDefinition = {
                 const start = item.selectionRange.start;
                 return `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${uriToPath(item.uri)}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`;
               })
-              .join('\n')}${allItems.length > items.length ? `\n... ${allItems.length - items.length} omitted; complete result: ${itemsFile ?? '(spool unavailable)'}` : ''}`,
+              .join(
+                '\n'
+              )}${allItems.length > items.length ? `\n... ${allItems.length - items.length} omitted; complete result: ${itemsFile ?? '(spool unavailable)'}` : ''}`,
           },
         ],
         structuredContent: {
-          outcome: 'ok', provider: 'lsp',
+          outcome: 'ok',
+          provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           items,
           shown: items.length,
           total: allItems.length,
           omitted: allItems.length - items.length,
-          recovery: allItems.length > items.length
-            ? `Read the complete result at ${itemsFile ?? '(spool unavailable)'} or narrow the selector.`
-            : null,
+          recovery:
+            allItems.length > items.length
+              ? `Read the complete result at ${itemsFile ?? '(spool unavailable)'} or narrow the selector.`
+              : null,
           ...(itemsFile ? { resultFile: itemsFile } : {}),
         },
       };
@@ -343,9 +410,13 @@ async function callHierarchyResult(
         },
       ],
       structuredContent: {
-        outcome: 'empty', provider: 'lsp',
+        outcome: 'empty',
+        provider: 'lsp',
         ...(resolvedFrom ? { resolvedFrom } : {}),
-        calls: [], shown: 0, total: 0, omitted: 0,
+        calls: [],
+        shown: 0,
+        total: 0,
+        omitted: 0,
       },
     };
   }
@@ -355,9 +426,10 @@ async function callHierarchyResult(
   const allCalls: unknown[] = [];
   let total = 0;
   for (const item of items) {
-    const itemCalls = direction === 'incoming'
-      ? await client.incomingCalls(item)
-      : await client.outgoingCalls(item);
+    const itemCalls =
+      direction === 'incoming'
+        ? await client.incomingCalls(item)
+        : await client.outgoingCalls(item);
     for (const call of itemCalls) {
       total += 1;
       allCalls.push(call);
@@ -366,20 +438,26 @@ async function callHierarchyResult(
       if (direction === 'incoming' && 'from' in call) {
         const start = call.from.selectionRange.start;
         selectedLines.push(
-          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`,
+          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`
         );
       } else if (direction === 'outgoing' && 'to' in call) {
         const start = call.to.selectionRange.start;
         selectedLines.push(
-          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`,
+          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`
         );
       }
     }
   }
   const omitted = total - selectedCalls.length;
-  const callsFile = omitted > 0
-    ? spoolFullResult(`get_${direction}_calls`, { file: absolutePath, direction, total, calls: allCalls })
-    : null;
+  const callsFile =
+    omitted > 0
+      ? spoolFullResult(`get_${direction}_calls`, {
+          file: absolutePath,
+          direction,
+          total,
+          calls: allCalls,
+        })
+      : null;
   return {
     content: [
       {
@@ -391,15 +469,17 @@ async function callHierarchyResult(
       },
     ],
     structuredContent: {
-      outcome: selectedCalls.length > 0 ? 'ok' : 'empty', provider: 'lsp',
+      outcome: selectedCalls.length > 0 ? 'ok' : 'empty',
+      provider: 'lsp',
       ...(resolvedFrom ? { resolvedFrom } : {}),
       calls: selectedCalls,
       shown: selectedCalls.length,
       total,
       omitted,
-      recovery: omitted > 0
-        ? `Read the complete result at ${callsFile ?? '(spool unavailable)'} or narrow the selector.`
-        : null,
+      recovery:
+        omitted > 0
+          ? `Read the complete result at ${callsFile ?? '(spool unavailable)'} or narrow the selector.`
+          : null,
       ...(callsFile ? { resultFile: callsFile } : {}),
     },
   };

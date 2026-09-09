@@ -47,6 +47,40 @@ function ok(result: AstRewriteOutcome) {
 }
 
 describe('code_rewrite', () => {
+  it('rewrites object-property fragments without confusing them with labels', async () => {
+    await withClient(
+      { 'a.js': "const opts = { view: 'detail' };\nlabel: while (false) { break label; }\n" },
+      async (root, client) => {
+        const input = {
+          language: 'javascript',
+          path: 'a.js',
+          pattern: "view: 'detail'",
+          replacement: "view: 'full'",
+        };
+        const preview = ok(await client.codeRewrite(input));
+        expect(preview.changesPlanned).toBe(1);
+        ok(await client.codeRewrite({ ...input, dryRun: false, candidateId: preview.candidateId }));
+        expect(await readFile(join(root, 'a.js'), 'utf8')).toBe(
+          "const opts = { view: 'full' };\nlabel: while (false) { break label; }\n"
+        );
+        const label = await client.astSearch({
+          language: 'javascript',
+          path: 'a.js',
+          pattern: 'label: while (false) { break label; }',
+        });
+        expect(label).toMatchObject({ outcome: 'ok', matches: [{}] });
+        const labelRewrite = ok(
+          await client.codeRewrite({
+            language: 'javascript',
+            path: 'a.js',
+            pattern: 'label: while (false) { break label; }',
+            replacement: 'label: while (0) { break label; }',
+          })
+        );
+        expect(labelRewrite.changesPlanned).toBe(1);
+      }
+    );
+  });
   it('defaults to stable dry-run and applies the inspected multi-file candidate', async () => {
     await withClient(
       { 'src/a.ts': 'const a = foo(1);\n', 'src/b.ts': 'const b = foo(2);\n' },
@@ -323,7 +357,7 @@ describe('code_rewrite', () => {
     });
   });
 
-  it('scans a complete 5,000-file scope and refuses the same scope when capped', async () => {
+  it('scans the complete scope including matches beyond 5,000 files', async () => {
     const files = Object.fromEntries(
       Array.from({ length: 5_000 }, (_, index) => [
         `f${String(index).padStart(4, '0')}.ts`,
@@ -341,10 +375,11 @@ describe('code_rewrite', () => {
         filesMatched: 1,
         changesPlanned: 1,
       });
-      await writeFile(join(root, 'overflow.ts'), 'const overflow = 1;\n');
+      await writeFile(join(root, 'overflow.ts'), 'const overflow = foo(2);\n');
       expect(await client.codeRewrite(input)).toMatchObject({
-        outcome: 'rejected',
-        code: 'AST_REWRITE_SCOPE_INCOMPLETE',
+        outcome: 'ok',
+        filesMatched: 2,
+        changesPlanned: 2,
       });
     });
   }, 30_000);

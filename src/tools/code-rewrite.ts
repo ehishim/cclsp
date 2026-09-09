@@ -44,7 +44,8 @@ export const codeRewriteTool: ToolDefinition = {
     properties: {
       pattern: {
         type: 'string',
-        description: 'Structural pattern with $NAME and $$$NAME metavariables',
+        description:
+          'Structural pattern with $NAME and $$$NAME metavariables. In JS/TS, a bare key: value fragment selects an object property; use an explicit statement body for a label.',
       },
       replacement: {
         type: 'string',

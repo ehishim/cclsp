@@ -1,12 +1,10 @@
 import type { Node as TsNode, Tree as TsTree } from 'web-tree-sitter';
 import { SourceLocator } from './source-locator.js';
-import {
-  AST_MAX_CAPTURE_TEXT_BYTES,
-  AST_MAX_MATCH_TEXT_BYTES,
-  type AstMatch,
-  type CompiledPattern,
-  type ExactStructuralMatch,
-  type PatternMetavariable,
+import type {
+  AstMatch,
+  CompiledPattern,
+  ExactStructuralMatch,
+  PatternMetavariable,
 } from './types.js';
 
 interface BoundCapture {
@@ -22,18 +20,6 @@ interface BoundCapture {
 
 const IGNORED_ANONYMOUS = new Set(['(', ')', '{', '}', '[', ']', ',', ';', ':']);
 
-function truncateUtf8(text: string, maxBytes: number): string {
-  let bytes = 0;
-  let result = '';
-  for (const point of text) {
-    const width = Buffer.byteLength(point);
-    if (bytes + width > maxBytes) break;
-    result += point;
-    bytes += width;
-  }
-  return result;
-}
-
 function anonymousSignature(node: TsNode): string[] {
   return node.children
     .filter((child) => !child.isNamed && !child.isExtra && !IGNORED_ANONYMOUS.has(child.type))
@@ -45,6 +31,23 @@ function captureFingerprint(bindings: Map<string, BoundCapture>): string {
     .sort((a, b) => a.name.localeCompare(b.name))
     .map((capture) => `${capture.name}:${capture.text}`)
     .join('\u0001');
+}
+
+/** Cursor traversal avoids recursive stack growth and child-array allocation. */
+function walkNamedNodes(tree: TsTree, visit: (node: TsNode) => boolean): void {
+  const cursor = tree.walk();
+  try {
+    for (;;) {
+      const node = cursor.currentNode;
+      if (node.isNamed && !visit(node)) return;
+      if (cursor.gotoFirstChild()) continue;
+      while (!cursor.gotoNextSibling()) {
+        if (!cursor.gotoParent()) return;
+      }
+    }
+  } finally {
+    cursor.delete();
+  }
 }
 
 export class SearchEngine {
@@ -68,23 +71,22 @@ export class SearchEngine {
         'shorthand_property_identifier',
         'shorthand_property_identifier_pattern',
       ]);
-      const visit = (node: TsNode): void => {
-        if (matches.length >= maxResults) return;
+      walkNamedNodes(tree, (node) => {
+        if (matches.length >= maxResults) return false;
         if (nameKinds.has(node.type) && node.text === compiled.node.text) {
           matches.push({ file, range: locator.range(node), text: node.text, captures: [] });
         }
-        for (const child of node.namedChildren) visit(child);
-      };
-      visit(tree.rootNode);
+        return matches.length < maxResults;
+      });
       return matches;
     }
     return this.searchExact(tree, source, compiled, file, maxResults).map((match) => ({
       file: match.file,
       range: match.range,
-      text: truncateUtf8(match.matchedText, AST_MAX_MATCH_TEXT_BYTES),
+      text: match.matchedText,
       captures: match.captures.map(({ startIndex: _start, endIndex: _end, ...capture }) => ({
         ...capture,
-        text: truncateUtf8(capture.text, AST_MAX_CAPTURE_TEXT_BYTES),
+        text: capture.text,
       })),
     }));
   }
@@ -102,8 +104,8 @@ export class SearchEngine {
       compiled.metavariables.map((variable) => [variable.sentinel, variable])
     );
 
-    const visit = (node: TsNode): void => {
-      if (results.length >= maxResults) return;
+    walkNamedNodes(tree, (node) => {
+      if (results.length >= maxResults) return false;
       const bindings = this.matchNode(compiled.node, node, locator, variables, new Map());
       if (bindings) {
         const captures = [...bindings.values()]
@@ -130,10 +132,8 @@ export class SearchEngine {
           captures,
         });
       }
-      for (const child of node.namedChildren) visit(child);
-    };
-
-    visit(tree.rootNode);
+      return results.length < maxResults;
+    });
     return results;
   }
 
