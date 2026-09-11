@@ -5,6 +5,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { logger } from './src/logger.js';
 import { LSPClient } from './src/lsp-client.js';
 import { astTools } from './src/tools/ast-search.js';
+import { callHierarchyTools } from './src/tools/call-hierarchy.js';
 import { diagnosticsTools } from './src/tools/diagnostics.js';
 import { hoverTools } from './src/tools/hover.js';
 import { languageFeatureTools } from './src/tools/language-features.js';
@@ -57,6 +58,7 @@ const allTools = [
   ...hoverTools,
   ...languageFeatureTools,
   ...symbolTools,
+  ...callHierarchyTools,
   ...serverTools,
 ];
 

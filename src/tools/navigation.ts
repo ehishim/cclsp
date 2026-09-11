@@ -10,6 +10,14 @@ import {
   withWarning,
 } from './helpers.js';
 import {
+  NAMED_QUERY_SCHEMA,
+  boundNamedRows,
+  namedQueryOutcome,
+  namedQueryResolutionFailed,
+  normalizeNamedQueries,
+  normalizeNamedQuerySelector,
+} from './named-query.js';
+import {
   positionResolutionResult,
   resolveToolPosition,
   resolvedFromMetadata,
@@ -46,16 +54,11 @@ function selectNavigationArgs(args: {
     // One name or several, asked in one request. Entries are kept as given,
     // duplicates included, so the answer's breakdown lines up with the array the
     // caller sent; collapsing them would return fewer rows than it listed.
-    const entries = Array.isArray(args.symbol_name) ? args.symbol_name : [args.symbol_name];
-    if (entries.length === 0) {
-      return { outcome: 'invalid', reason: 'symbol_name must name at least one symbol' };
-    }
-    const symbolNames: string[] = [];
-    for (const entry of entries) {
-      if (typeof entry !== 'string' || entry.trim().length === 0) {
-        return { outcome: 'invalid', reason: 'symbol_name must not be empty' };
-      }
-      symbolNames.push(entry.trim());
+    let symbolNames: string[];
+    try {
+      symbolNames = normalizeNamedQueries(args.symbol_name, 'symbol_name');
+    } catch (error) {
+      return { outcome: 'invalid', reason: error instanceof Error ? error.message : String(error) };
     }
     if (args.symbol_kind !== undefined && typeof args.symbol_kind !== 'string') {
       return { outcome: 'invalid', reason: 'symbol_kind must be a string' };
@@ -130,35 +133,32 @@ async function findDefinitionsForNames(
     throw error;
   }
 
-  // The bound is spent in asked order, so a later name reports omitted rather
-  // than a zero it never earned.
-  let remaining = maxResults;
-  const perQuery = answers.map((answer) => {
-    const selected = answer.value.slice(0, Math.max(remaining, 0));
-    remaining -= selected.length;
-    const incomplete = answer.provider === 'lsp' && answer.incomplete === true;
-    const matchedSymbols = answer.provider === 'lsp' ? (answer.matchedSymbols ?? 0) : null;
-    return {
+  const bounded = boundNamedRows(
+    answers.map((answer) => ({
       query: answer.name,
-      provider: answer.provider,
-      locations: selected,
-      shown: selected.length,
-      total: answer.value.length,
-      omitted: answer.value.length - selected.length,
-      matchedSymbols,
-      incomplete,
-      outcome: incomplete
+      rows: answer.value,
+      metadata: {
+        provider: answer.provider,
+        matchedSymbols: answer.provider === 'lsp' ? (answer.matchedSymbols ?? 0) : null,
+        incomplete: answer.provider === 'lsp' && answer.incomplete === true,
+      },
+    })),
+    maxResults
+  );
+  const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+    ...row,
+    locations: rows,
+    outcome: row.incomplete
+      ? ('partial' as const)
+      : row.total > 0 && row.shown === 0
         ? ('partial' as const)
-        : selected.length > 0
+        : row.shown > 0
           ? ('ok' as const)
-          : answer.value.length > 0
-            ? ('partial' as const)
-            : ('empty' as const),
-    };
-  });
-  const selected = perQuery.flatMap((row) => row.locations);
-  const total = answers.reduce((sum, answer) => sum + answer.value.length, 0);
-  const omitted = total - selected.length;
+          : ('empty' as const),
+  }));
+  const selected = bounded.rows;
+  const total = bounded.total;
+  const omitted = bounded.omitted;
   const incomplete = perQuery.some((row) => row.incomplete);
   const warning = answers
     .map((answer) => (answer.provider === 'lsp' ? answer.warning : undefined))
@@ -233,7 +233,7 @@ export const findDefinitionTool: ToolDefinition = {
         description: 'The path to the file',
       },
       symbol_name: {
-        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        ...NAMED_QUERY_SCHEMA,
         description:
           'The name of the symbol. Pass an array to ask several names in one request; each reports its own definition count, so a zero among them is attributable and the row bound is spent in asked order.',
       },
@@ -416,7 +416,7 @@ export const findReferencesTool: ToolDefinition = {
         description: 'The path to the file where the symbol is defined',
       },
       symbol_name: {
-        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        ...NAMED_QUERY_SCHEMA,
         description:
           'The name of the symbol. Pass an array to ask several names in one request; each reports its own reference count, so a zero among them is attributable and the row bound is spent in asked order.',
       },
@@ -569,34 +569,31 @@ export const findReferencesTool: ToolDefinition = {
       });
     }
 
-    // The bound is spent in asked order, so a later name reports omitted rather
-    // than a zero it never earned.
-    let remaining = maxResults;
-    const perQuery = answers.map((answer) => {
-      const selected = answer.locations.slice(0, Math.max(remaining, 0));
-      remaining -= selected.length;
-      return {
+    const bounded = boundNamedRows(
+      answers.map((answer) => ({
         query: answer.name,
-        locations: selected,
-        shown: selected.length,
-        total: answer.locations.length,
-        omitted: answer.locations.length - selected.length,
-        symbolMatches: answer.symbolMatches,
-        incomplete: answer.incomplete,
-        outcome:
-          selected.length > 0
+        rows: answer.locations,
+        metadata: {
+          symbolMatches: answer.symbolMatches,
+          incomplete: answer.incomplete,
+        },
+      })),
+      maxResults
+    );
+    const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+      ...row,
+      locations: rows,
+      outcome:
+        row.incomplete || (row.total > 0 && row.shown === 0)
+          ? ('partial' as const)
+          : row.shown > 0
             ? ('ok' as const)
-            : answer.locations.length > 0
-              ? ('partial' as const)
-              : answer.incomplete
-                ? ('partial' as const)
-                : ('empty' as const),
-      };
-    });
+            : ('empty' as const),
+    }));
 
-    const selected = perQuery.flatMap((row) => row.locations);
-    const total = answers.reduce((sum, answer) => sum + answer.locations.length, 0);
-    const omitted = total - selected.length;
+    const selected = bounded.rows;
+    const total = bounded.total;
+    const omitted = bounded.omitted;
     const incomplete = answers.some((answer) => answer.incomplete);
     const warning = answers.find((answer) => answer.warning)?.warning;
     const single = selector.symbolNames.length === 1 ? perQuery[0] : null;
@@ -671,14 +668,108 @@ export const findReferencesTool: ToolDefinition = {
   },
 };
 
+async function findImplementationsForNames(
+  client: LSPClient,
+  absolutePath: string,
+  filePath: string,
+  queries: string[],
+  maxResults: number,
+  window: ReturnType<typeof createSourcePreview>
+): Promise<ToolResult> {
+  const answers = [];
+  for (const query of queries) {
+    const resolution = await resolveToolPosition(absolutePath, { query }, client);
+    if (resolution.outcome !== 'resolved') {
+      const rendered = positionResolutionResult(resolution, filePath);
+      answers.push({
+        query,
+        rows: [],
+        metadata: {
+          resolution: resolution.outcome,
+          reason: rendered.content[0]?.text ?? 'Symbol could not be resolved',
+        },
+      });
+      continue;
+    }
+    const rows = await client.findImplementation(absolutePath, resolution.position);
+    answers.push({
+      query,
+      rows,
+      metadata: {
+        resolution: 'resolved',
+        resolvedFrom: resolvedFromMetadata(resolution) ?? null,
+      },
+    });
+  }
+  const bounded = boundNamedRows(answers, maxResults);
+  const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+    ...row,
+    locations: rows,
+    outcome: namedQueryOutcome(row.resolution, row.total, row.shown),
+  }));
+  const resultFile =
+    bounded.omitted > 0
+      ? spoolFullResult('find_implementation', {
+          file: absolutePath,
+          queries,
+          total: bounded.total,
+          perQuery: answers.map((answer) => ({
+            query: answer.query,
+            total: answer.rows.length,
+            locations: answer.rows,
+            ...answer.metadata,
+          })),
+        })
+      : null;
+  const unresolved = perQuery.some((row) => namedQueryResolutionFailed(row.resolution));
+  const text = [
+    `Implementations (${bounded.rows.length}/${bounded.total}) for ${queries.length} names:`,
+    ...perQuery.map(
+      (row) =>
+        `  "${row.query}": ${row.total} implementation(s)${row.resolution !== 'resolved' ? ` — ${row.reason}` : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
+    ),
+    ...perQuery
+      .filter((row) => row.shown > 0)
+      .flatMap((row) => ['', `"${row.query}"`, formatLocations(row.locations, window)]),
+    ...(bounded.omitted > 0
+      ? [`... ${bounded.omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`]
+      : []),
+  ].join('\n');
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: {
+      outcome: unresolved ? 'partial' : bounded.rows.length > 0 ? 'ok' : 'empty',
+      ...(unresolved ? { partial: true } : {}),
+      provider: 'lsp',
+      locations: bounded.rows,
+      shown: bounded.rows.length,
+      total: bounded.total,
+      omitted: bounded.omitted,
+      queries,
+      perQuery,
+      recovery:
+        bounded.omitted > 0
+          ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the implementation query.`
+          : null,
+      ...(resultFile ? { resultFile } : {}),
+    },
+    ...(unresolved ? { isError: true } : {}),
+  };
+}
+
 export const findImplementationTool: ToolDefinition = {
   name: 'find_implementation',
-  description: 'Find implementations by symbol query or 1-indexed position.',
+  description:
+    'Find implementations by one symbol query or an array of names (each count attributable), or by one exact 1-indexed position.',
   inputSchema: {
     type: 'object',
     properties: {
       file_path: { type: 'string', description: 'The path to the file' },
-      query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+      query: {
+        ...NAMED_QUERY_SCHEMA,
+        description:
+          'Symbol query (alternative to line/character). Pass an array to ask several names in one request; each reports its own implementation count.',
+      },
       line: { type: 'number', description: 'The line number (1-indexed)' },
       character: { type: 'number', description: 'The character position (1-indexed)' },
       max_results: {
@@ -692,7 +783,7 @@ export const findImplementationTool: ToolDefinition = {
   handler: async (args, client) => {
     const { file_path, query, line, character, max_results, preview } = args as {
       file_path: string;
-      query?: string;
+      query?: string | string[];
       line?: number;
       character?: number;
       max_results?: number;
@@ -702,9 +793,28 @@ export const findImplementationTool: ToolDefinition = {
     const window = createSourcePreview(preview);
     const absolutePath = resolvePath(file_path);
     try {
+      let queries: string[] | null;
+      try {
+        queries = normalizeNamedQuerySelector(query, line, character);
+      } catch (error) {
+        return positionResolutionResult(
+          { outcome: 'invalid', reason: error instanceof Error ? error.message : String(error) },
+          file_path
+        );
+      }
+      if (queries && queries.length > 1) {
+        return await findImplementationsForNames(
+          client,
+          absolutePath,
+          file_path,
+          queries,
+          boundedResultLimit(max_results),
+          window
+        );
+      }
       const resolution = await resolveToolPosition(
         absolutePath,
-        { query, line, character },
+        { query: queries?.[0], line, character },
         client
       );
       if (resolution.outcome !== 'resolved') {

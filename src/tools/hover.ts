@@ -1,9 +1,22 @@
+import type { LSPClient } from '../lsp-client.js';
+import type { Position } from '../lsp/types.js';
 import {
   INLINE_RESULT_BYTES,
+  SEMANTIC_DEFAULT_LIMIT,
+  SEMANTIC_MAX_LIMIT,
+  boundedResultLimit,
   resolvePath,
   rethrowToolOutcome,
   spoolFullResult,
 } from './helpers.js';
+import {
+  NAMED_QUERY_SCHEMA,
+  type NamedRows,
+  boundNamedRows,
+  namedQueryOutcome,
+  namedQueryResolutionFailed,
+  normalizeNamedQuerySelector,
+} from './named-query.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -12,9 +25,135 @@ import {
 } from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
 
+function hoverContents(result: NonNullable<Awaited<ReturnType<LSPClient['hover']>>>): string {
+  return typeof result.contents === 'string'
+    ? result.contents
+    : result.contents?.value || JSON.stringify(result.contents);
+}
+
+async function hoverForNames(
+  client: LSPClient,
+  absolutePath: string,
+  filePath: string,
+  queries: string[],
+  maxResults: number
+) {
+  const resolutions = [];
+  for (const query of queries) {
+    resolutions.push({
+      query,
+      resolution: await resolveToolPosition(absolutePath, { query }, client),
+    });
+  }
+  const resolved = resolutions.filter(
+    (
+      entry
+    ): entry is typeof entry & {
+      resolution: Extract<typeof entry.resolution, { outcome: 'resolved' }>;
+    } => entry.resolution.outcome === 'resolved'
+  );
+  const hovers =
+    resolved.length > 0
+      ? await client.hoverBatch(
+          absolutePath,
+          resolved.map((entry) => entry.resolution.position)
+        )
+      : [];
+  let hoverIndex = 0;
+  type HoverResult = NonNullable<Awaited<ReturnType<LSPClient['hover']>>>;
+  type HoverMetadata = {
+    resolution: 'resolved' | 'unavailable' | 'ambiguous' | 'not_found' | 'invalid';
+    reason: string | null;
+    position: Position | null;
+  };
+  const answers: Array<NamedRows<HoverResult, HoverMetadata>> = resolutions.map((entry) => {
+    if (entry.resolution.outcome !== 'resolved') {
+      const rendered = positionResolutionResult(entry.resolution, filePath);
+      return {
+        query: entry.query,
+        rows: [] as HoverResult[],
+        metadata: {
+          resolution: entry.resolution.outcome,
+          reason: rendered.content[0]?.text ?? 'Symbol could not be resolved',
+          position: null,
+        },
+      };
+    }
+    const hover = hovers[hoverIndex++];
+    return {
+      query: entry.query,
+      rows: hover ? [hover] : [],
+      metadata: {
+        resolution: 'resolved' as const,
+        reason: null,
+        position: entry.resolution.position,
+      },
+    };
+  });
+  const bounded = boundNamedRows(answers, maxResults);
+  const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+    ...row,
+    hover: rows[0] ?? null,
+    outcome: namedQueryOutcome(row.resolution, row.total, row.shown),
+  }));
+  const unresolved = perQuery.some((row) => namedQueryResolutionFailed(row.resolution));
+  const resultFile =
+    bounded.omitted > 0
+      ? spoolFullResult('get_hover', {
+          file: absolutePath,
+          queries,
+          total: bounded.total,
+          perQuery: answers.map((answer) => ({
+            query: answer.query,
+            total: answer.rows.length,
+            hovers: answer.rows,
+            ...answer.metadata,
+          })),
+        })
+      : null;
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: [
+          `Hover (${bounded.rows.length}/${bounded.total}) for ${queries.length} names:`,
+          ...perQuery.flatMap((row) => [
+            `  "${row.query}": ${row.total} hover result(s)${row.resolution !== 'resolved' ? ` — ${row.reason}` : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`,
+            ...(row.hover ? [hoverContents(row.hover)] : []),
+          ]),
+          ...(bounded.omitted > 0
+            ? [
+                `... ${bounded.omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`,
+              ]
+            : []),
+        ].join('\n'),
+      },
+    ],
+    structuredContent: {
+      outcome: unresolved ? 'partial' : bounded.rows.length > 0 ? 'ok' : 'empty',
+      ...(unresolved ? { partial: true } : {}),
+      provider: 'lsp',
+      file: absolutePath,
+      hovers: bounded.rows,
+      shown: bounded.rows.length,
+      total: bounded.total,
+      omitted: bounded.omitted,
+      queries,
+      perQuery,
+      recovery:
+        bounded.omitted > 0
+          ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the hover query.`
+          : null,
+      ...(resultFile ? { resultFile } : {}),
+    },
+    ...(unresolved ? { isError: true } : {}),
+  };
+}
+
 export const getHoverTool: ToolDefinition = {
   name: 'get_hover',
-  description: 'Get hover information by symbol query or 1-indexed position.',
+  description:
+    'Get hover information by one symbol query or an array of names under one freshness batch, or by exact 1-indexed position(s).',
   inputSchema: {
     type: 'object',
     properties: {
@@ -33,18 +172,27 @@ export const getHoverTool: ToolDefinition = {
         description:
           'Exact 1-indexed positions in this file, returned in order under one freshness check. Excludes query/line/character.',
       },
-      query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+      query: {
+        ...NAMED_QUERY_SCHEMA,
+        description:
+          'Symbol query (alternative to line/character). Pass an array to ask several names in one freshness-checked batch.',
+      },
       line: { type: 'number', description: 'The line number (1-indexed)' },
       character: { type: 'number', description: 'The character position (1-indexed)' },
+      max_results: {
+        type: 'number',
+        description: `Hover results to return across every name (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
+      },
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, query, line, character } = args as {
+    const { file_path, query, line, character, max_results } = args as {
       file_path: string;
-      query?: string;
+      query?: string | string[];
       line?: number;
       character?: number;
+      max_results?: number;
     };
     const absolutePath = resolvePath(file_path);
     try {
@@ -138,9 +286,27 @@ export const getHoverTool: ToolDefinition = {
           },
         };
       }
+      let queries: string[] | null;
+      try {
+        queries = normalizeNamedQuerySelector(query, line, character);
+      } catch (error) {
+        return positionResolutionResult(
+          { outcome: 'invalid', reason: error instanceof Error ? error.message : String(error) },
+          file_path
+        );
+      }
+      if (queries && queries.length > 1) {
+        return await hoverForNames(
+          client,
+          absolutePath,
+          file_path,
+          queries,
+          boundedResultLimit(max_results)
+        );
+      }
       const resolution = await resolveToolPosition(
         absolutePath,
-        { query, line, character },
+        { query: queries?.[0], line, character },
         client
       );
       if (resolution.outcome !== 'resolved') {
@@ -168,10 +334,7 @@ export const getHoverTool: ToolDefinition = {
           },
         };
       }
-      const hoverText =
-        typeof result.contents === 'string'
-          ? result.contents
-          : result.contents?.value || JSON.stringify(result.contents);
+      const hoverText = hoverContents(result);
       return {
         content: [
           {

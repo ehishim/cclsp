@@ -6,19 +6,26 @@ import { join } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
 import { LspToolOutcomeError } from './lsp/capabilities.js';
 import { astSearchTool } from './tools/ast-search.js';
-import { getDiagnosticsTool } from './tools/diagnostics.js';
-import { getHoverTool } from './tools/hover.js';
-import { getCodeActionsTool, getCompletionsTool } from './tools/language-features.js';
-import { findDefinitionTool, findReferencesTool } from './tools/navigation.js';
-import { renameFileTool } from './tools/refactoring.js';
-import { type ToolDefinition, boundToolResult, registerTools } from './tools/registry.js';
 import {
-  findWorkspaceSymbolsTool,
-  getDocumentSymbolsTool,
   getIncomingCallsTool,
   getOutgoingCallsTool,
   prepareCallHierarchyTool,
-} from './tools/symbols.js';
+} from './tools/call-hierarchy.js';
+import { getDiagnosticsTool } from './tools/diagnostics.js';
+import { getHoverTool } from './tools/hover.js';
+import {
+  getCodeActionsTool,
+  getCompletionsTool,
+  getSignatureHelpTool,
+} from './tools/language-features.js';
+import {
+  findDefinitionTool,
+  findImplementationTool,
+  findReferencesTool,
+} from './tools/navigation.js';
+import { renameFileTool } from './tools/refactoring.js';
+import { type ToolDefinition, boundToolResult, registerTools } from './tools/registry.js';
+import { findWorkspaceSymbolsTool, getDocumentSymbolsTool } from './tools/symbols.js';
 import { pathToUri } from './utils.js';
 
 function asClient(value: Record<string, unknown>): LSPClient {
@@ -77,6 +84,251 @@ describe('capability tool contracts', () => {
     expect(bad.isError).toBe(true);
     expect(batch).toHaveBeenCalledTimes(1);
   });
+  it('answers several hover names under one freshness batch', async () => {
+    const hoverBatch = jest.fn(async (_file: string, positions: Array<{ line: number }>) =>
+      positions.map((position) => ({ contents: `hover-${position.line}` }))
+    );
+    const client = asClient({
+      getDocumentSymbolsWithProvider: async () => ({
+        outcome: 'ok' as const,
+        provider: 'lsp' as const,
+        value: [
+          {
+            name: 'alpha',
+            kind: 12,
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+            selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+          },
+          {
+            name: 'beta',
+            kind: 12,
+            range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+            selectionRange: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+          },
+        ],
+      }),
+      hoverBatch,
+      symbolKindToString: () => 'function',
+    });
+
+    const result = await getHoverTool.handler(
+      { file_path: '/workspace/src/a.ts', query: ['alpha', 'beta'] },
+      client
+    );
+
+    expect(hoverBatch).toHaveBeenCalledTimes(1);
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'ok',
+      shown: 2,
+      total: 2,
+      omitted: 0,
+      queries: ['alpha', 'beta'],
+      perQuery: [
+        { query: 'alpha', shown: 1, total: 1, outcome: 'ok' },
+        { query: 'beta', shown: 1, total: 1, outcome: 'ok' },
+      ],
+    });
+    const limited = await getHoverTool.handler(
+      { file_path: '/workspace/src/a.ts', query: ['alpha', 'beta'], max_results: 1 },
+      client
+    );
+    const resultFile = limited.structuredContent?.resultFile as string;
+    try {
+      expect(limited.structuredContent).toMatchObject({ shown: 1, total: 2, omitted: 1 });
+      expect(JSON.parse(readFileSync(resultFile, 'utf8')).perQuery).toHaveLength(2);
+    } finally {
+      if (resultFile) rmSync(resultFile, { force: true });
+    }
+  });
+
+  it('applies signature max_results to the single-name form too', async () => {
+    const result = await getSignatureHelpTool.handler(
+      { file_path: '/workspace/src/a.ts', line: 1, character: 1, max_results: 1 },
+      asClient({
+        getSignatureHelp: async () => ({
+          signatures: [{ label: 'first' }, { label: 'second' }],
+          activeSignature: 1,
+        }),
+      })
+    );
+    expect(result.structuredContent).toMatchObject({
+      signatures: [{ label: 'first' }],
+      activeSignature: null,
+      shown: 1,
+      total: 2,
+      omitted: 1,
+    });
+    const resultFile = result.structuredContent?.resultFile as string;
+    try {
+      expect(JSON.parse(readFileSync(resultFile, 'utf8')).signatures).toHaveLength(2);
+    } finally {
+      if (resultFile) rmSync(resultFile, { force: true });
+    }
+  });
+
+  it('uses one attributed batch pattern for implementation, signature and call hierarchy', async () => {
+    const file = '/workspace/src/a.ts';
+    const getDocumentSymbolsWithProvider = async () => ({
+      outcome: 'ok' as const,
+      provider: 'lsp' as const,
+      value: [
+        {
+          name: 'alpha',
+          kind: 12,
+          range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+          selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+        },
+        {
+          name: 'beta',
+          kind: 12,
+          range: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+          selectionRange: { start: { line: 1, character: 0 }, end: { line: 1, character: 4 } },
+        },
+      ],
+    });
+    const item = (line: number, name: string) => ({
+      name,
+      kind: 12,
+      uri: pathToUri(file),
+      range: { start: { line, character: 0 }, end: { line, character: 5 } },
+      selectionRange: { start: { line, character: 0 }, end: { line, character: 5 } },
+    });
+    const client = asClient({
+      getDocumentSymbolsWithProvider,
+      findImplementation: async (_file: string, position: { line: number }) => [
+        {
+          uri: pathToUri(file),
+          range: { start: position, end: { ...position, character: 5 } },
+        },
+      ],
+      getSignatureHelp: async (_file: string, position: { line: number }) => ({
+        signatures: [{ label: `signature-${position.line}` }],
+      }),
+      prepareCallHierarchy: async (_file: string, position: { line: number }) => [
+        item(position.line, position.line === 0 ? 'alpha' : 'beta'),
+      ],
+      incomingCalls: async (target: { name: string }) => [
+        { from: item(target.name === 'alpha' ? 2 : 3, `from-${target.name}`), fromRanges: [] },
+      ],
+      outgoingCalls: async (target: { name: string }) => [
+        { to: item(target.name === 'alpha' ? 4 : 5, `to-${target.name}`), fromRanges: [] },
+      ],
+      symbolKindToString: () => 'function',
+    });
+
+    const implementation = await findImplementationTool.handler(
+      { file_path: file, query: ['alpha', 'beta'] },
+      client
+    );
+    expect(implementation.structuredContent).toMatchObject({
+      shown: 2,
+      total: 2,
+      perQuery: [
+        { query: 'alpha', total: 1 },
+        { query: 'beta', total: 1 },
+      ],
+    });
+
+    const signature = await getSignatureHelpTool.handler(
+      { file_path: file, query: ['alpha', 'beta'], max_results: 1 },
+      client
+    );
+    expect(signature.structuredContent).toMatchObject({
+      shown: 1,
+      total: 2,
+      omitted: 1,
+      perQuery: [
+        { query: 'alpha', total: 1 },
+        { query: 'beta', total: 1 },
+      ],
+    });
+    const signatureFile = signature.structuredContent?.resultFile as string;
+    try {
+      expect(JSON.parse(readFileSync(signatureFile, 'utf8')).perQuery).toHaveLength(2);
+    } finally {
+      if (signatureFile) rmSync(signatureFile, { force: true });
+    }
+
+    const prepared = await prepareCallHierarchyTool.handler(
+      { file_path: file, query: ['alpha', 'beta'], max_results: 1, preview: false },
+      client
+    );
+    expect(prepared.structuredContent).toMatchObject({
+      shown: 1,
+      total: 2,
+      omitted: 1,
+      perQuery: [
+        { query: 'alpha', total: 1 },
+        { query: 'beta', total: 1 },
+      ],
+    });
+    const preparedFile = prepared.structuredContent?.resultFile as string;
+    try {
+      expect(JSON.parse(readFileSync(preparedFile, 'utf8')).perQuery).toHaveLength(2);
+    } finally {
+      if (preparedFile) rmSync(preparedFile, { force: true });
+    }
+
+    for (const [tool, label] of [
+      [getIncomingCallsTool, 'from'],
+      [getOutgoingCallsTool, 'to'],
+    ] as const) {
+      const calls = await tool.handler(
+        { file_path: file, query: ['alpha', 'beta'], preview: false },
+        client
+      );
+      expect(calls.structuredContent).toMatchObject({
+        shown: 2,
+        total: 2,
+        perQuery: [
+          { query: 'alpha', total: 1 },
+          { query: 'beta', total: 1 },
+        ],
+      });
+      expect(calls.content[0]?.text).toContain(`${label}-alpha`);
+      expect(calls.content[0]?.text).toContain(`${label}-beta`);
+    }
+
+    // If the first name spends the shared limit and the second has exactly one
+    // row, that omitted row still exists in the one aggregate spool.
+    const limited = await getOutgoingCallsTool.handler(
+      { file_path: file, query: ['alpha', 'beta'], max_results: 1, preview: false },
+      client
+    );
+    expect(limited.structuredContent).toMatchObject({ shown: 1, total: 2, omitted: 1 });
+    const resultFile = limited.structuredContent?.resultFile as string;
+    try {
+      const complete = JSON.parse(readFileSync(resultFile, 'utf8'));
+      expect(complete.perQuery).toMatchObject([
+        { query: 'alpha', total: 1, calls: [{ to: { name: 'to-alpha' } }] },
+        { query: 'beta', total: 1, calls: [{ to: { name: 'to-beta' } }] },
+      ]);
+    } finally {
+      if (resultFile) rmSync(resultFile, { force: true });
+    }
+  });
+
+  it('refuses a name list mixed with position before any provider request', async () => {
+    const getDocumentSymbolsWithProvider = jest.fn();
+    const client = asClient({ getDocumentSymbolsWithProvider });
+    for (const tool of [
+      findImplementationTool,
+      getHoverTool,
+      getSignatureHelpTool,
+      prepareCallHierarchyTool,
+      getIncomingCallsTool,
+      getOutgoingCallsTool,
+    ]) {
+      const result = await tool.handler(
+        { file_path: '/workspace/src/a.ts', query: ['alpha', 'beta'], line: 1, character: 1 },
+        client
+      );
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain('provide query or line/character, not both');
+    }
+    expect(getDocumentSymbolsWithProvider).not.toHaveBeenCalled();
+  });
+
   it('keeps every declaration beyond the old document-symbol ceiling in a complete spool', async () => {
     const value = Array.from({ length: 5001 }, (_, i) => ({
       name: `Symbol${i}`,

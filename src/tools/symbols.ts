@@ -9,19 +9,12 @@ import {
   rethrowToolOutcome,
   spoolFullResult,
 } from './helpers.js';
-import {
-  positionResolutionResult,
-  resolveToolPosition,
-  resolvedFromMetadata,
-  resolvedFromText,
-} from './position-resolver.js';
+import { NAMED_QUERY_SCHEMA, boundNamedRows, normalizeNamedQueries } from './named-query.js';
 import type { ToolDefinition } from './registry.js';
 import {
   PREVIEW_SCHEMA,
-  type PreviewOption,
   type SourcePreview,
   createSourcePreview,
-  previewWindow,
   renderLocationRow,
 } from './source-preview.js';
 
@@ -223,30 +216,6 @@ interface WorkspaceQueryAnswer {
   readinessConfirmed: boolean;
 }
 
-/**
- * The protocol takes one string and defines no alternation, so `"a|b"` is matched
- * literally and finds nothing. Several names are therefore several requests whose
- * answers stay SEPARATE: a merged list would hide which name found nothing, which
- * is the false absence the caller asked several names to avoid.
- */
-function normalizeWorkspaceQueries(value: unknown): string[] {
-  const entries = Array.isArray(value) ? value : [value];
-  if (entries.length === 0) throw new Error('query must name at least one symbol');
-  const queries: string[] = [];
-  for (const entry of entries) {
-    if (typeof entry !== 'string' || entry.trim().length === 0) {
-      throw new Error('every query entry must be a non-empty string');
-    }
-    // Entries are kept exactly as asked, duplicates included. Collapsing them
-    // would save one request and silently change the answer: the breakdown would
-    // carry fewer rows than the caller listed, and the shared row bound would be
-    // spent differently, so a caller comparing its array with the result would
-    // find them misaligned with nothing saying why.
-    queries.push(entry);
-  }
-  return queries;
-}
-
 function renderWorkspaceRow(
   symbol: SymbolInformation,
   client: Parameters<ToolDefinition['handler']>[1],
@@ -269,7 +238,7 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
     type: 'object',
     properties: {
       query: {
-        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        ...NAMED_QUERY_SCHEMA,
         description:
           'The symbol name or pattern. Pass an array to ask several names in one call; each reports its own count, so a zero among them is attributable. The answer is bounded by max_results, not by a name count. Alternation is never interpreted: express several names as separate entries, not as "a|b".',
       },
@@ -291,45 +260,38 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
       // Both admissions run before any workspace/symbol request: an invalid width
       // or name list must cost nothing, not be refused after the scan is paid for.
       const previewCache = createSourcePreview(preview);
-      const queries = normalizeWorkspaceQueries(query);
+      const queries = normalizeNamedQueries(query);
       const limit = boundedResultLimit(max_results);
       const answers: WorkspaceQueryAnswer[] = await Promise.all(
         queries.map(async (name) => ({ query: name, ...(await client.workspaceSymbol(name)) }))
       );
 
-      // The bound applies to the answer as a whole, and it is spent in the order the
-      // caller asked, so a later name is reported as omitted rather than as zero.
-      let remaining = limit;
-      const perQuery = answers.map((answer) => {
-        const selected = answer.symbols.slice(0, Math.max(remaining, 0));
-        remaining -= selected.length;
-        return {
+      const bounded = boundNamedRows(
+        answers.map((answer) => ({
           query: answer.query,
-          symbols: selected,
-          shown: selected.length,
-          total: answer.symbols.length,
-          omitted: answer.symbols.length - selected.length,
-          readinessConfirmed: answer.readinessConfirmed,
-          // Per name, because the provider answers each request on its own state.
-          // The order matters: a name whose rows exist but were cut by the shared
-          // row bound is `partial`, NEVER `empty` -- calling that zero would be the
-          // false absence this breakdown exists to prevent. Only a name that truly
-          // matched nothing is a scoped negative, and only once its provider is
-          // confirmed answering; before that it is `stale`.
-          outcome:
-            selected.length > 0
-              ? ('ok' as const)
-              : answer.symbols.length > 0
-                ? ('partial' as const)
-                : answer.readinessConfirmed
-                  ? ('empty' as const)
-                  : ('stale' as const),
-        };
-      });
+          rows: answer.symbols,
+          metadata: { readinessConfirmed: answer.readinessConfirmed },
+        })),
+        limit
+      );
+      const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+        ...row,
+        symbols: rows,
+        // Per name, because the provider answers each request on its own state.
+        // A name cut by the shared row bound is `partial`, never a false zero.
+        outcome:
+          row.shown > 0
+            ? ('ok' as const)
+            : row.total > 0
+              ? ('partial' as const)
+              : row.readinessConfirmed
+                ? ('empty' as const)
+                : ('stale' as const),
+      }));
 
-      const selected = perQuery.flatMap((row) => row.symbols);
-      const total = answers.reduce((sum, answer) => sum + answer.symbols.length, 0);
-      const omitted = total - selected.length;
+      const selected = bounded.rows;
+      const total = bounded.total;
+      const omitted = bounded.omitted;
       const readinessConfirmed = answers.every((answer) => answer.readinessConfirmed);
       // One name keeps the payload it always spooled; several names spool the same
       // breakdown the answer reports, so the complete result stays attributable too.
@@ -416,266 +378,4 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
   },
 };
 
-const positionSchema = {
-  type: 'object',
-  properties: {
-    file_path: { type: 'string', description: 'The path to the file' },
-    query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
-    line: { type: 'number', description: 'The line number (1-indexed)' },
-    character: { type: 'number', description: 'The character position (1-indexed)' },
-    max_results: {
-      type: 'number',
-      description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
-    },
-    preview: PREVIEW_SCHEMA,
-  },
-  required: ['file_path'],
-};
-
-type PositionArgs = {
-  file_path: string;
-  query?: string;
-  line?: number;
-  character?: number;
-  max_results?: number;
-  preview?: PreviewOption;
-};
-
-export const prepareCallHierarchyTool: ToolDefinition = {
-  name: 'prepare_call_hierarchy',
-  description: 'Get call hierarchy items by symbol query or 1-indexed position.',
-  inputSchema: positionSchema,
-  handler: async (args, client) => {
-    const {
-      file_path,
-      query,
-      line,
-      character,
-      max_results,
-      preview: previewOption,
-    } = args as PositionArgs;
-    const absolutePath = resolvePath(file_path);
-    // Before the position lookup and the provider call: an invalid width costs nothing.
-    const preview = createSourcePreview(previewOption);
-    try {
-      const resolution = await resolveToolPosition(
-        absolutePath,
-        { query, line, character },
-        client
-      );
-      if (resolution.outcome !== 'resolved') {
-        return positionResolutionResult(resolution, file_path);
-      }
-      const allItems = await client.prepareCallHierarchy(absolutePath, resolution.position);
-      const items = allItems.slice(0, boundedResultLimit(max_results));
-      const itemsFile =
-        allItems.length > items.length
-          ? spoolFullResult('prepare_call_hierarchy', {
-              file: absolutePath,
-              total: allItems.length,
-              items: allItems,
-            })
-          : null;
-      const resolved = resolvedFromText(resolution);
-      const resolvedFrom = resolvedFromMetadata(resolution);
-      if (items.length === 0) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: `${resolved ? `${resolved}\n\n` : ''}No call hierarchy item found at ${file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}`,
-            },
-          ],
-          structuredContent: {
-            outcome: 'empty',
-            provider: 'lsp',
-            ...(resolvedFrom ? { resolvedFrom } : {}),
-            items: [],
-            shown: 0,
-            total: 0,
-            omitted: 0,
-          },
-        };
-      }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `${resolved ? `${resolved}\n\n` : ''}Call hierarchy item(s):\n\n${items
-              .map((item) => {
-                const start = item.selectionRange.start;
-                const file = uriToPath(item.uri);
-                return [
-                  `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${file}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`,
-                  ...previewWindow(preview, file, start.line),
-                ].join('\n');
-              })
-              .join(
-                '\n'
-              )}${allItems.length > items.length ? `\n... ${allItems.length - items.length} omitted; complete result: ${itemsFile ?? '(spool unavailable)'}` : ''}`,
-          },
-        ],
-        structuredContent: {
-          outcome: 'ok',
-          provider: 'lsp',
-          ...(resolvedFrom ? { resolvedFrom } : {}),
-          items,
-          shown: items.length,
-          total: allItems.length,
-          omitted: allItems.length - items.length,
-          recovery:
-            allItems.length > items.length
-              ? `Read the complete result at ${itemsFile ?? '(spool unavailable)'} or narrow the selector.`
-              : null,
-          ...(itemsFile ? { resultFile: itemsFile } : {}),
-        },
-      };
-    } catch (error) {
-      rethrowToolOutcome(error);
-      throw error;
-    }
-  },
-};
-
-async function callHierarchyResult(
-  direction: 'incoming' | 'outgoing',
-  args: PositionArgs,
-  client: Parameters<ToolDefinition['handler']>[1]
-) {
-  const absolutePath = resolvePath(args.file_path);
-  // Admitted before the position lookup and both provider requests: an invalid
-  // width must cost nothing in either direction, and one owner per call keeps
-  // every row after the first in a file free.
-  const preview = createSourcePreview(args.preview);
-  const resolution = await resolveToolPosition(
-    absolutePath,
-    { query: args.query, line: args.line, character: args.character },
-    client
-  );
-  if (resolution.outcome !== 'resolved') {
-    return positionResolutionResult(resolution, args.file_path);
-  }
-  const items = await client.prepareCallHierarchy(absolutePath, resolution.position);
-  const resolved = resolvedFromText(resolution);
-  const resolvedFrom = resolvedFromMetadata(resolution);
-  if (items.length === 0) {
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: `${resolved ? `${resolved}\n\n` : ''}No call hierarchy item found at ${args.file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}`,
-        },
-      ],
-      structuredContent: {
-        outcome: 'empty',
-        provider: 'lsp',
-        ...(resolvedFrom ? { resolvedFrom } : {}),
-        calls: [],
-        shown: 0,
-        total: 0,
-        omitted: 0,
-      },
-    };
-  }
-  const limit = boundedResultLimit(args.max_results);
-  const selectedCalls: unknown[] = [];
-  const selectedLines: string[] = [];
-  const allCalls: unknown[] = [];
-  let total = 0;
-  for (const item of items) {
-    const itemCalls =
-      direction === 'incoming'
-        ? await client.incomingCalls(item)
-        : await client.outgoingCalls(item);
-    for (const call of itemCalls) {
-      total += 1;
-      allCalls.push(call);
-      if (selectedCalls.length >= limit) continue;
-      selectedCalls.push(call);
-      const end =
-        direction === 'incoming' && 'from' in call ? call.from : 'to' in call ? call.to : null;
-      if (end) {
-        const start = end.selectionRange.start;
-        const file = uriToPath(end.uri);
-        const window = previewWindow(preview, file, start.line);
-        selectedLines.push(
-          [
-            `• ${end.name} (${client.symbolKindToString(end.kind)}) at ${file}:${start.line + 1}:${start.character + 1}`,
-            ...window,
-          ].join('\n')
-        );
-      }
-    }
-  }
-  const omitted = total - selectedCalls.length;
-  const callsFile =
-    omitted > 0
-      ? spoolFullResult(`get_${direction}_calls`, {
-          file: absolutePath,
-          direction,
-          total,
-          calls: allCalls,
-        })
-      : null;
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text:
-          selectedLines.length === 0
-            ? `${resolved ? `${resolved}\n\n` : ''}No ${direction} calls found`
-            : `${resolved ? `${resolved}\n\n` : ''}Found ${selectedLines.length}/${total} ${direction} call(s):\n\n${selectedLines.join('\n')}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${callsFile ?? '(spool unavailable)'}` : ''}`,
-      },
-    ],
-    structuredContent: {
-      outcome: selectedCalls.length > 0 ? 'ok' : 'empty',
-      provider: 'lsp',
-      ...(resolvedFrom ? { resolvedFrom } : {}),
-      calls: selectedCalls,
-      shown: selectedCalls.length,
-      total,
-      omitted,
-      recovery:
-        omitted > 0
-          ? `Read the complete result at ${callsFile ?? '(spool unavailable)'} or narrow the selector.`
-          : null,
-      ...(callsFile ? { resultFile: callsFile } : {}),
-    },
-  };
-}
-
-export const getIncomingCallsTool: ToolDefinition = {
-  name: 'get_incoming_calls',
-  description: 'Find incoming calls by symbol query or 1-indexed position.',
-  inputSchema: positionSchema,
-  handler: async (args, client) => {
-    try {
-      return await callHierarchyResult('incoming', args as PositionArgs, client);
-    } catch (error) {
-      rethrowToolOutcome(error);
-      throw error;
-    }
-  },
-};
-
-export const getOutgoingCallsTool: ToolDefinition = {
-  name: 'get_outgoing_calls',
-  description: 'Find outgoing calls by symbol query or 1-indexed position.',
-  inputSchema: positionSchema,
-  handler: async (args, client) => {
-    try {
-      return await callHierarchyResult('outgoing', args as PositionArgs, client);
-    } catch (error) {
-      rethrowToolOutcome(error);
-      throw error;
-    }
-  },
-};
-
-export const symbolTools: ToolDefinition[] = [
-  getDocumentSymbolsTool,
-  findWorkspaceSymbolsTool,
-  prepareCallHierarchyTool,
-  getIncomingCallsTool,
-  getOutgoingCallsTool,
-];
+export const symbolTools: ToolDefinition[] = [getDocumentSymbolsTool, findWorkspaceSymbolsTool];

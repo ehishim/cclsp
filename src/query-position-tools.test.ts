@@ -13,7 +13,7 @@ import {
   getIncomingCallsTool,
   getOutgoingCallsTool,
   prepareCallHierarchyTool,
-} from './tools/symbols.js';
+} from './tools/call-hierarchy.js';
 
 const POSITION = { line: 3, character: 7 };
 

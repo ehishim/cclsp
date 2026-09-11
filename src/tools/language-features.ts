@@ -2,10 +2,26 @@ import { applyWorkspaceEdit } from '../file-editor.js';
 import type {
   CodeActionResult,
   CompletionItemResult,
+  SignatureHelpResult,
   TextDocumentEditResult,
   WorkspaceEditResult,
 } from '../lsp/operations.js';
-import { resolvePath, rethrowToolOutcome } from './helpers.js';
+import {
+  SEMANTIC_DEFAULT_LIMIT,
+  SEMANTIC_MAX_LIMIT,
+  boundedResultLimit,
+  resolvePath,
+  rethrowToolOutcome,
+  spoolFullResult,
+} from './helpers.js';
+import {
+  NAMED_QUERY_SCHEMA,
+  type NamedRows,
+  boundNamedRows,
+  namedQueryOutcome,
+  namedQueryResolutionFailed,
+  normalizeNamedQuerySelector,
+} from './named-query.js';
 import {
   positionResolutionResult,
   resolveToolPosition,
@@ -211,33 +227,185 @@ export const getCompletionsTool: ToolDefinition = {
   },
 };
 
+async function signaturesForNames(
+  client: Parameters<ToolDefinition['handler']>[1],
+  absolutePath: string,
+  filePath: string,
+  queries: string[],
+  triggerCharacter: string | undefined,
+  maxResults: number
+): Promise<ToolResult> {
+  type SignatureMetadata = {
+    resolution: 'resolved' | 'unavailable' | 'ambiguous' | 'not_found' | 'invalid';
+    reason: string | null;
+    activeSignature: number | null;
+    activeParameter: number | null;
+  };
+  const answers: Array<NamedRows<SignatureHelpResult['signatures'][number], SignatureMetadata>> =
+    [];
+  for (const query of queries) {
+    const resolution = await resolveToolPosition(absolutePath, { query }, client);
+    if (resolution.outcome !== 'resolved') {
+      const rendered = positionResolutionResult(resolution, filePath);
+      answers.push({
+        query,
+        rows: [],
+        metadata: {
+          resolution: resolution.outcome,
+          reason: rendered.content[0]?.text ?? 'Symbol could not be resolved',
+          activeSignature: null,
+          activeParameter: null,
+        },
+      });
+      continue;
+    }
+    const result = await client.getSignatureHelp(
+      absolutePath,
+      resolution.position,
+      triggerCharacter
+    );
+    answers.push({
+      query,
+      rows: result?.signatures ?? [],
+      metadata: {
+        resolution: 'resolved',
+        reason: null,
+        activeSignature: result?.activeSignature ?? null,
+        activeParameter: result?.activeParameter ?? null,
+      },
+    });
+  }
+  const bounded = boundNamedRows(answers, maxResults);
+  const perQuery = bounded.perQuery.map(({ rows, ...row }) => ({
+    ...row,
+    signatures: rows,
+    // activeSignature indexes the original signature array. Once its row is
+    // omitted it cannot truthfully point into the displayed subset.
+    activeSignature:
+      row.activeSignature !== null && row.activeSignature < row.shown ? row.activeSignature : null,
+    outcome: namedQueryOutcome(row.resolution, row.total, row.shown),
+  }));
+  const unresolved = perQuery.some((row) => namedQueryResolutionFailed(row.resolution));
+  const resultFile =
+    bounded.omitted > 0
+      ? spoolFullResult('get_signature_help', {
+          file: absolutePath,
+          queries,
+          total: bounded.total,
+          perQuery: answers.map((answer) => ({
+            query: answer.query,
+            total: answer.rows.length,
+            signatures: answer.rows,
+            ...answer.metadata,
+          })),
+        })
+      : null;
+  return {
+    content: [
+      {
+        type: 'text',
+        text: [
+          `Signature help (${bounded.rows.length}/${bounded.total}) for ${queries.length} names:`,
+          ...perQuery.flatMap((row) => [
+            `  "${row.query}": ${row.total} signature(s)${row.resolution !== 'resolved' ? ` — ${row.reason}` : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`,
+            ...(row.signatures.length > 0
+              ? [
+                  JSON.stringify(
+                    {
+                      signatures: row.signatures,
+                      activeSignature: row.activeSignature,
+                      activeParameter: row.activeParameter,
+                    },
+                    null,
+                    2
+                  ),
+                ]
+              : []),
+          ]),
+          ...(bounded.omitted > 0
+            ? [
+                `... ${bounded.omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`,
+              ]
+            : []),
+        ].join('\n'),
+      },
+    ],
+    structuredContent: {
+      outcome: unresolved ? 'partial' : bounded.rows.length > 0 ? 'ok' : 'empty',
+      ...(unresolved ? { partial: true } : {}),
+      provider: 'lsp',
+      signatures: bounded.rows,
+      shown: bounded.rows.length,
+      total: bounded.total,
+      omitted: bounded.omitted,
+      queries,
+      perQuery,
+      recovery:
+        bounded.omitted > 0
+          ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the signature query.`
+          : null,
+      ...(resultFile ? { resultFile } : {}),
+    },
+    ...(unresolved ? { isError: true } : {}),
+  };
+}
+
 export const getSignatureHelpTool: ToolDefinition = {
   name: 'get_signature_help',
-  description: 'Get signature and parameter help by symbol query or 1-indexed position.',
+  description:
+    'Get signature and parameter help by one symbol query or an array of names (each count attributable), or by one exact 1-indexed position.',
   inputSchema: {
     type: 'object',
     properties: {
       file_path: { type: 'string', description: 'The path to the file' },
-      query: { type: 'string', description: 'Symbol query (alternative to line/character)' },
+      query: {
+        ...NAMED_QUERY_SCHEMA,
+        description:
+          'Symbol query (alternative to line/character). Pass an array to ask several names in one request.',
+      },
       line: { type: 'number', description: 'The line number (1-indexed)' },
       character: { type: 'number', description: 'The character position (1-indexed)' },
       trigger_character: { type: 'string', description: 'Optional signature trigger character' },
+      max_results: {
+        type: 'number',
+        description: `Signatures to return across every name (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
+      },
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, query, line, character, trigger_character } = args as {
+    const { file_path, query, line, character, trigger_character, max_results } = args as {
       file_path: string;
-      query?: string;
+      query?: string | string[];
       line?: number;
       character?: number;
       trigger_character?: string;
+      max_results?: number;
     };
     const absolutePath = resolvePath(file_path);
     try {
+      let queries: string[] | null;
+      try {
+        queries = normalizeNamedQuerySelector(query, line, character);
+      } catch (error) {
+        return positionResolutionResult(
+          { outcome: 'invalid', reason: error instanceof Error ? error.message : String(error) },
+          file_path
+        );
+      }
+      if (queries && queries.length > 1) {
+        return await signaturesForNames(
+          client,
+          absolutePath,
+          file_path,
+          queries,
+          trigger_character,
+          boundedResultLimit(max_results)
+        );
+      }
       const resolution = await resolveToolPosition(
         absolutePath,
-        { query, line, character },
+        { query: queries?.[0], line, character },
         client
       );
       if (resolution.outcome !== 'resolved') {
@@ -259,26 +427,56 @@ export const getSignatureHelpTool: ToolDefinition = {
             },
           ],
           structuredContent: {
-            outcome: 'empty', provider: 'lsp',
+            outcome: 'empty',
+            provider: 'lsp',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            signatures: [], shown: 0, total: 0, omitted: 0,
+            signatures: [],
+            shown: 0,
+            total: 0,
+            omitted: 0,
           },
         };
       }
+      const limit = boundedResultLimit(max_results);
+      const signatures = result.signatures.slice(0, limit);
+      const omitted = result.signatures.length - signatures.length;
+      const activeSignature =
+        result.activeSignature !== undefined && result.activeSignature < signatures.length
+          ? result.activeSignature
+          : undefined;
+      const resultFile =
+        omitted > 0
+          ? spoolFullResult('get_signature_help', {
+              file: absolutePath,
+              position: resolution.position,
+              ...result,
+            })
+          : null;
+      const displayed = {
+        ...result,
+        signatures,
+        ...(activeSignature === undefined ? { activeSignature: null } : { activeSignature }),
+      };
       return {
         content: [
           {
             type: 'text',
-            text: `${resolved ? `${resolved}\n\n` : ''}Signature help at ${file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}:\n${JSON.stringify(result, null, 2)}`,
+            text: `${resolved ? `${resolved}\n\n` : ''}Signature help at ${file_path}:${resolution.position.line + 1}:${resolution.position.character + 1}:\n${JSON.stringify(displayed, null, 2)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`,
           },
         ],
         structuredContent: {
-          outcome: 'ok', provider: 'lsp',
+          outcome: 'ok',
+          provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
-          ...result,
-          shown: result.signatures.length,
+          ...displayed,
+          shown: signatures.length,
           total: result.signatures.length,
-          omitted: 0,
+          omitted,
+          recovery:
+            omitted > 0
+              ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the signature query.`
+              : null,
+          ...(resultFile ? { resultFile } : {}),
         },
       };
     } catch (error) {
