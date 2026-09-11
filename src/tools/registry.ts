@@ -29,12 +29,24 @@ function resultByteLimit(): number {
 }
 
 function jsonFits(value: unknown, maxBytes: number): boolean {
-  const stack: unknown[] = [value];
-  const seen = new WeakSet<object>();
+  type Frame = { value: unknown; leave?: object };
+  const stack: Frame[] = [{ value }];
+  // Only an object already on the CURRENT ancestor path is a cycle. A result
+  // commonly projects the same row object into both `symbols` and
+  // `perQuery[].symbols`; JSON.stringify serializes that shared reference twice,
+  // so a process-wide `seen` set falsely classified a 2 KB answer as cyclic and
+  // spooled it behind the 3 MiB recovery path.
+  const activeAncestors = new WeakSet<object>();
   let bytes = 0;
   let nodes = 0;
   while (stack.length > 0) {
-    const current = stack.pop();
+    const frame = stack.pop();
+    if (!frame) break;
+    if (frame.leave) {
+      activeAncestors.delete(frame.leave);
+      continue;
+    }
+    const current = frame.value;
     nodes += 1;
     if (nodes > TOOL_RESULT_MAX_NODES) return false;
     if (current === null || current === undefined) {
@@ -44,18 +56,22 @@ function jsonFits(value: unknown, maxBytes: number): boolean {
     } else if (typeof current === 'number' || typeof current === 'boolean') {
       bytes += String(current).length;
     } else if (typeof current === 'object') {
-      if (seen.has(current)) return false;
-      seen.add(current);
+      if (activeAncestors.has(current)) return false;
+      activeAncestors.add(current);
+      // Pushed first so it is popped AFTER every child of this object.
+      stack.push({ value: undefined, leave: current });
       if (Array.isArray(current)) {
         bytes += 2 + Math.max(0, current.length - 1);
-        for (let index = current.length - 1; index >= 0; index -= 1) stack.push(current[index]);
+        for (let index = current.length - 1; index >= 0; index -= 1) {
+          stack.push({ value: current[index] });
+        }
       } else {
         const entries = Object.entries(current as Record<string, unknown>);
         bytes += 2 + Math.max(0, entries.length - 1);
         for (let index = entries.length - 1; index >= 0; index -= 1) {
           const [key, nested] = entries[index] ?? [];
           bytes += Buffer.byteLength(JSON.stringify(key)) + 1;
-          stack.push(nested);
+          stack.push({ value: nested });
         }
       }
     }

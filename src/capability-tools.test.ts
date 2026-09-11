@@ -1503,6 +1503,47 @@ describe('capability tool contracts', () => {
     });
   });
 
+  it('keeps a small result inline when two projections share the same row object', () => {
+    // workspace_symbols deliberately projects one provider row into the aggregate
+    // symbols list and its per-query list. That is a shared reference, not a JSON
+    // cycle: JSON.stringify emits it twice and the size guard must count it twice.
+    const shared = { name: 'alpha', location: { line: 1, character: 1 } };
+    const result = boundToolResult(
+      {
+        content: [{ type: 'text', text: 'one small answer' }],
+        structuredContent: {
+          outcome: 'ok',
+          provider: 'lsp',
+          symbols: [shared],
+          perQuery: [{ query: 'alpha', symbols: [shared] }],
+        },
+      },
+      4_096
+    );
+
+    expect(result.structuredContent).not.toHaveProperty('bounded');
+    expect(result.structuredContent).not.toHaveProperty('resultFile');
+    expect(result.content[0]?.text).toBe('one small answer');
+  });
+
+  it('still refuses a real JSON cycle without looping', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const result = boundToolResult(
+      {
+        content: [{ type: 'text', text: 'cyclic' }],
+        structuredContent: { outcome: 'ok', provider: 'lsp', cyclic },
+      },
+      4_096
+    );
+
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({
+      outcome: 'unavailable',
+      code: 'TOOL_RESULT_SPOOL_FAILED',
+    });
+  });
+
   it('spools an oversized result and points at it instead of refusing the answer', () => {
     const rows = Array.from({ length: 2_000 }, (_, index) => ({
       name: `symbol${index}`,
