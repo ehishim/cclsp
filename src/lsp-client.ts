@@ -132,6 +132,8 @@ export class LSPClient {
   private astProvider: AstProvider;
   private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
   private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<boolean>>();
+  /** One known-present name per seeded project, kept to strengthen an empty answer. */
+  private workspaceSymbolCanaries = new WeakMap<ServerState, string[]>();
   private rewriteApplyTail: Promise<void> = Promise.resolve();
 
   constructor(configPath?: string, root = process.cwd()) {
@@ -884,9 +886,23 @@ export class LSPClient {
 
     const results = perServer.flatMap((entry) => entry.symbols);
     // One unconfirmed server is enough to make the WORKSPACE answer incomplete.
-    const readinessConfirmed = perServer.every((entry) => entry.confirmed);
+    let readinessConfirmed = perServer.every((entry) => entry.confirmed);
     if (results.length > 0) {
       return { symbols: results, readinessConfirmed };
+    }
+
+    // Nothing matched, so this answer is about to be read as absence. Before it may
+    // mean that, every seeded project must be answering: one loaded program says
+    // nothing about a sibling package that is still cold. Paid only on a zero.
+    if (readinessConfirmed) {
+      for (const serverState of servers) {
+        if (!serverState) continue;
+        if (!supportsMethod(serverState, 'workspace/symbol')) continue;
+        if (!(await this.allSeededProjectsAnswer(serverState))) {
+          readinessConfirmed = false;
+          break;
+        }
+      }
     }
 
     if (errors.length > 0) {
@@ -910,10 +926,10 @@ export class LSPClient {
     }
 
     const run = (async () => {
-      // One seed file per sub-project root is enough to make a lazy-loading server
-      // (tsserver, gopls) load that project; workspace/symbol then searches the whole
-      // program. This replaces the old "open up to 500 files" warm-up that caused the
-      // first workspace-symbol call to time out.
+      // One seed per source directory of every project root: opening a file is what
+      // makes a lazy-loading server (tsserver, gopls) load the program that contains
+      // it, and a single seed leaves every other program cold. This stays far from
+      // the old "open up to 500 files" warm-up that made the first call time out.
       const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
 
       const seedLeases = (
@@ -959,12 +975,13 @@ export class LSPClient {
    * Bounded wait until a server can answer workspace/symbol completely. Returns
    * whether readiness was confirmed (vs. bailed on the budget mid-index).
    *
-   * - Workspace-indexing servers (intelephense): wait for the async index to
-   *   finish, signalled by the adapter via serverState.indexingComplete.
-   * - Lazy-loading servers (tsserver, gopls): opening a seed triggers project
-   *   load; the seed's publishDiagnostics settling confirms the project is ready.
+   * - An adapter that announces a finished index (intelephense) is believed at once.
+   * - Everything else is confirmed by BEHAVIOUR: each seeded project must answer
+   *   workspace/symbol for a name taken from its own seed. Silence is not readiness,
+   *   and settled diagnostics witness only the seed's own file.
    *
-   * Always capped so priming can never hang.
+   * Always capped so priming can never hang; an unconfirmed result makes the caller
+   * report `stale` rather than claiming the symbol is absent.
    */
   private async waitForWorkspaceSymbolReady(
     serverState: ServerState,
@@ -1059,22 +1076,66 @@ export class LSPClient {
     seedFiles: string[],
     deadline: number
   ): Promise<boolean> {
-    const canary = await this.findWorkspaceSymbolCanary(serverState, seedFiles, deadline);
-    if (!canary) {
+    // Wait for the FIRST canary only. Measured: polling every seed's canary in
+    // parallel floods the server with repeated navto while it is still building
+    // the program -- 34s and an empty answer, against 10s and the right answer
+    // when one canary is awaited. Proving every project up front also pays for
+    // loading programs the caller may never ask about.
+    //
+    // The residual is real and is handled where it costs nothing: one answering
+    // project does not prove a sibling package is loaded, so a NON-EMPTY answer
+    // is confirmed here, and an EMPTY one is strengthened by the caller before it
+    // is allowed to mean absence.
+    const canaries = await this.findWorkspaceSymbolCanaries(serverState, seedFiles, deadline);
+    if (canaries.length === 0) {
       // No seed declared a name to ask for. Nothing is provable either way, and
       // refusing every answer would be worse than admitting the uncertainty.
       logger.debug('[workspaceSymbol] No canary symbol available; proceeding unconfirmed\n');
       return false;
     }
+    for (const canary of canaries) {
+      if (await this.waitForCanaryAnswer(serverState, canary, deadline)) {
+        logger.debug(`[workspaceSymbol] Index answering (canary "${canary}")\n`);
+        this.workspaceSymbolCanaries.set(serverState, canaries);
+        return true;
+      }
+    }
+    logger.debug('[workspaceSymbol] No canary answered within budget\n');
+    return false;
+  }
+
+  /**
+   * A zero is only an absence if every seeded project could have answered. Run
+   * once, and only when the answer was empty: a match already proves the index is
+   * live, and paying for cold sibling programs on every call would spend the time
+   * this tier exists to save.
+   */
+  private async allSeededProjectsAnswer(serverState: ServerState): Promise<boolean> {
+    const canaries = this.workspaceSymbolCanaries.get(serverState);
+    if (!canaries || canaries.length === 0) return false;
+    const deadline = Date.now() + 10000;
+    for (const canary of canaries) {
+      // Sequential on purpose: the parallel version is what starved the server.
+      if (!(await this.waitForCanaryAnswer(serverState, canary, deadline))) {
+        logger.debug(`[workspaceSymbol] Seeded project still cold (canary "${canary}")\n`);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /** Polls one known-present name until the server answers for it or the budget ends. */
+  private async waitForCanaryAnswer(
+    serverState: ServerState,
+    canary: string,
+    deadline: number
+  ): Promise<boolean> {
     while (Date.now() < deadline) {
       try {
         const rows = await opsWorkspaceSymbol(serverState, canary);
-        if (rows.length > 0) {
-          logger.debug(`[workspaceSymbol] Index answering (canary "${canary}")\n`);
-          return true;
-        }
+        if (rows.length > 0) return true;
       } catch (error) {
-        logger.debug(`[workspaceSymbol] Canary probe failed: ${error}\n`);
+        logger.debug(`[workspaceSymbol] Canary probe failed for "${canary}": ${error}\n`);
         return false;
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
@@ -1083,23 +1144,30 @@ export class LSPClient {
     return false;
   }
 
-  /** First named declaration of any opened seed; the name we know the workspace has. */
-  private async findWorkspaceSymbolCanary(
+  /** One known-present name per seeded project, deduplicated across seeds. */
+  private async findWorkspaceSymbolCanaries(
     serverState: ServerState,
     seedFiles: string[],
     deadline: number
-  ): Promise<string | null> {
-    for (const seedFile of seedFiles) {
-      if (Date.now() >= deadline) return null;
-      try {
-        const symbols = await opsGetDocumentSymbols(serverState, seedFile);
-        const name = firstDocumentSymbolName(symbols);
-        if (name) return name;
-      } catch (error) {
-        logger.debug(`[workspaceSymbol] Canary lookup failed for ${seedFile}: ${error}\n`);
-      }
+  ): Promise<string[]> {
+    const canaries: string[] = [];
+    const found = await Promise.all(
+      seedFiles.map(async (seedFile) => {
+        if (Date.now() >= deadline) return null;
+        try {
+          return firstDocumentSymbolName(await opsGetDocumentSymbols(serverState, seedFile));
+        } catch (error) {
+          logger.debug(`[workspaceSymbol] Canary lookup failed for ${seedFile}: ${error}\n`);
+          return null;
+        }
+      })
+    );
+    for (const name of found) {
+      // A name shared by two seeds proves one thing once; asking twice costs a
+      // round trip and confirms nothing new.
+      if (name && !canaries.includes(name)) canaries.push(name);
     }
-    return null;
+    return canaries;
   }
 
   private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {

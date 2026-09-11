@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, jest, spyOn } from 'bun:test';
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, sep } from 'node:path';
 import { LSPClient } from './lsp-client.js';
 import { LspToolOutcomeError } from './lsp/capabilities.js';
 import * as operations from './lsp/operations.js';
@@ -1564,6 +1564,80 @@ describe('LSPClient', () => {
       // Its refusal must neither surface as the answer nor make it look incomplete.
       expect(result.readinessConfirmed).toBe(true);
     });
+
+    it('confirms readiness only when EVERY seeded project answers, not the first one', async () => {
+      // A server like tsserver loads one program per project. Confirming from a
+      // single canary proves that project answers and says nothing about the rest,
+      // so a symbol in a sibling package would still come back as a CONFIRMED zero
+      // — the same false absence, one corner narrower.
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const loadedDir = join(TEST_DIR, 'loaded');
+      const coldDir = join(TEST_DIR, 'cold');
+      await mkdir(loadedDir, { recursive: true });
+      await mkdir(coldDir, { recursive: true });
+      await writeFile(join(loadedDir, 'a.ts'), 'export const loadedSymbol = 1;');
+      await writeFile(join(coldDir, 'b.ts'), 'export const coldSymbol = 2;');
+
+      const serverState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport(),
+        initialized: true,
+        adapter: undefined,
+        documentManager: createMockDocumentManager(),
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: {
+          extensions: ['ts'],
+          command: ['typescript-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
+      };
+      (client as any).serverManager.getRunningServers().set('ts', serverState);
+
+      // Each seed declares its own name; only the loaded project answers navto.
+      const documentSymbolsSpy = spyOn(operations, 'getDocumentSymbols').mockImplementation(
+        async (_state: unknown, filePath: string) => {
+          const name = filePath.includes(`${sep}cold${sep}`) ? 'coldSymbol' : 'loadedSymbol';
+          return [
+            {
+              name,
+              kind: 13,
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+              selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+            },
+          ] as never;
+        }
+      );
+      const workspaceSymbolSpy = spyOn(operations, 'workspaceSymbol').mockImplementation(
+        async (_state: unknown, query: string) =>
+          query === 'loadedSymbol'
+            ? ([
+                {
+                  name: 'loadedSymbol',
+                  kind: 13,
+                  location: {
+                    uri: pathToUri(join(loadedDir, 'a.ts')),
+                    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+                  },
+                },
+              ] as never)
+            : ([] as never)
+      );
+
+      try {
+        const result = await client.workspaceSymbol('anythingAtAll');
+        // The cold project never answered, so the zero is NOT a confirmed absence.
+        expect(result.readinessConfirmed).toBe(false);
+        const asked = workspaceSymbolSpy.mock.calls.map((call) => call[1]);
+        expect(asked).toContain('coldSymbol');
+      } finally {
+        documentSymbolsSpy.mockRestore();
+        workspaceSymbolSpy.mockRestore();
+        await rm(loadedDir, { recursive: true, force: true });
+        await rm(coldDir, { recursive: true, force: true });
+      }
+    }, 45000);
 
     it('never primes a server that cannot answer workspace/symbol', async () => {
       // Priming opens seed documents and waits for the project to warm. Doing that
