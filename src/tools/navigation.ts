@@ -16,11 +16,7 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
-import {
-  PREVIEW_SCHEMA,
-  type PreviewOption,
-  createSourcePreview,
-} from './source-preview.js';
+import { PREVIEW_SCHEMA, type PreviewOption, createSourcePreview } from './source-preview.js';
 
 type NavigationSelector =
   | { outcome: 'name'; symbolName: string; symbolNames: string[]; symbolKind?: string }
@@ -96,6 +92,135 @@ function invalidNavigationSelector(
   return positionResolutionResult(selector, file);
 }
 
+/**
+ * Several names in one request. A caller mapping an unfamiliar area asks where
+ * three or four symbols are defined at once; one call per name costs a whole
+ * turn each. Names stay separate in the answer for the same reason references
+ * and symbol search keep them separate: a merged list cannot say which name was
+ * not found. Provider provenance is per name, because each is resolved on its own.
+ */
+async function findDefinitionsForNames(
+  client: LSPClient,
+  absolutePath: string,
+  file_path: string,
+  names: string[],
+  symbolKind: string | undefined,
+  maxResults: number,
+  window: ReturnType<typeof createSourcePreview>
+): Promise<ToolResult> {
+  const answers: Array<
+    Extract<Awaited<ReturnType<LSPClient['findDefinitionsWithProvider']>>, { outcome: 'ok' }> & {
+      name: string;
+    }
+  > = [];
+  try {
+    for (const name of names) {
+      const result = await client.findDefinitionsWithProvider(absolutePath, name, symbolKind);
+      if (result.outcome !== 'ok') {
+        return {
+          content: [{ type: 'text', text: `${result.code}: ${result.reason}` }],
+          structuredContent: result,
+          isError: true,
+        };
+      }
+      answers.push({ ...result, name });
+    }
+  } catch (error) {
+    rethrowToolOutcome(error);
+    throw error;
+  }
+
+  // The bound is spent in asked order, so a later name reports omitted rather
+  // than a zero it never earned.
+  let remaining = maxResults;
+  const perQuery = answers.map((answer) => {
+    const selected = answer.value.slice(0, Math.max(remaining, 0));
+    remaining -= selected.length;
+    const incomplete = answer.provider === 'lsp' && answer.incomplete === true;
+    const matchedSymbols = answer.provider === 'lsp' ? (answer.matchedSymbols ?? 0) : null;
+    return {
+      query: answer.name,
+      provider: answer.provider,
+      locations: selected,
+      shown: selected.length,
+      total: answer.value.length,
+      omitted: answer.value.length - selected.length,
+      matchedSymbols,
+      incomplete,
+      outcome: incomplete
+        ? ('partial' as const)
+        : selected.length > 0
+          ? ('ok' as const)
+          : answer.value.length > 0
+            ? ('partial' as const)
+            : ('empty' as const),
+    };
+  });
+  const selected = perQuery.flatMap((row) => row.locations);
+  const total = answers.reduce((sum, answer) => sum + answer.value.length, 0);
+  const omitted = total - selected.length;
+  const incomplete = perQuery.some((row) => row.incomplete);
+  const warning = answers
+    .map((answer) => (answer.provider === 'lsp' ? answer.warning : undefined))
+    .find((value) => value !== undefined);
+  const resultFile =
+    omitted > 0
+      ? spoolFullResult('find_definition', {
+          file: absolutePath,
+          symbols: names,
+          total,
+          perQuery: answers.map((answer) => ({
+            query: answer.name,
+            total: answer.value.length,
+            locations: answer.value,
+          })),
+        })
+      : null;
+  const omittedLine =
+    omitted > 0
+      ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`
+      : '';
+  const text = withWarning(
+    warning,
+    [
+      `Definitions (${selected.length}/${total}) for ${names.length} names:`,
+      ...perQuery.map(
+        (row) =>
+          `  "${row.query}": ${row.total} definition(s) (${row.provider})${row.matchedSymbols === 0 ? ` — no such symbol in ${file_path}` : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
+      ),
+      ...perQuery
+        .filter((row) => row.shown > 0)
+        .flatMap((row) => ['', `"${row.query}"`, formatLocations(row.locations, window)]),
+    ].join('\n') + omittedLine
+  );
+  return {
+    content: [{ type: 'text', text }],
+    structuredContent: {
+      outcome: incomplete ? 'partial' : selected.length > 0 ? 'ok' : 'empty',
+      ...(incomplete ? { code: 'LSP_SYMBOL_QUERY_INCOMPLETE', partial: true } : {}),
+      // One provider when every name resolved through the same one; otherwise the
+      // per-name rows carry provenance and the aggregate says so.
+      provider:
+        new Set(perQuery.map((row) => row.provider)).size === 1
+          ? (perQuery[0]?.provider ?? 'lsp')
+          : 'mixed',
+      locations: selected,
+      shown: selected.length,
+      total,
+      omitted,
+      queries: names,
+      perQuery,
+      recovery: incomplete
+        ? 'Use an exact line/character with a position-based semantic tool; the by-name occurrence bound was exceeded.'
+        : omitted > 0
+          ? `Read the complete result at ${resultFile ?? '(spool unavailable)'} or narrow the definition query.`
+          : null,
+      ...(resultFile ? { resultFile } : {}),
+    },
+    ...(incomplete ? { isError: true } : {}),
+  };
+}
+
 export const findDefinitionTool: ToolDefinition = {
   name: 'find_definition',
   description:
@@ -108,8 +233,9 @@ export const findDefinitionTool: ToolDefinition = {
         description: 'The path to the file',
       },
       symbol_name: {
-        type: 'string',
-        description: 'The name of the symbol',
+        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        description:
+          'The name of the symbol. Pass an array to ask several names in one request; each reports its own definition count, so a zero among them is attributable and the row bound is spent in asked order.',
       },
       symbol_kind: {
         type: 'string',
@@ -134,7 +260,7 @@ export const findDefinitionTool: ToolDefinition = {
   handler: async (args, client) => {
     const { file_path, symbol_name, symbol_kind, line, character, preview } = args as {
       file_path: string;
-      symbol_name?: string;
+      symbol_name?: string | string[];
       symbol_kind?: string;
       line?: number;
       character?: number;
@@ -197,8 +323,19 @@ export const findDefinitionTool: ToolDefinition = {
       }
     }
 
-    const symbolName = selector.symbolName;
     const symbolKind = selector.symbolKind;
+    if (selector.symbolNames.length > 1) {
+      return await findDefinitionsForNames(
+        client,
+        absolutePath,
+        file_path,
+        selector.symbolNames,
+        symbolKind,
+        maxResults,
+        window
+      );
+    }
+    const symbolName = selector.symbolName;
     try {
       const result = await client.findDefinitionsWithProvider(absolutePath, symbolName, symbolKind);
       if (result.outcome !== 'ok') {
@@ -446,13 +583,14 @@ export const findReferencesTool: ToolDefinition = {
         omitted: answer.locations.length - selected.length,
         symbolMatches: answer.symbolMatches,
         incomplete: answer.incomplete,
-        outcome: selected.length > 0
-          ? ('ok' as const)
-          : answer.locations.length > 0
-            ? ('partial' as const)
-            : answer.incomplete
+        outcome:
+          selected.length > 0
+            ? ('ok' as const)
+            : answer.locations.length > 0
               ? ('partial' as const)
-              : ('empty' as const),
+              : answer.incomplete
+                ? ('partial' as const)
+                : ('empty' as const),
       };
     });
 

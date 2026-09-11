@@ -203,14 +203,19 @@ export const getDocumentSymbolsTool: ToolDefinition = {
 };
 
 /**
- * A language server answers `workspace/symbol` from the files it has LOADED, not
- * from the repository: measured on typescript-language-server 5.3.0, a symbol in
- * an unopened file returns nothing, and the identical query returns it once that
- * file is opened. So zero rows here is never evidence that a symbol does not
- * exist, and the caller has to be told which tool can actually answer that.
+ * A language server answers `workspace/symbol` from the program(s) it has
+ * LOADED, not from the repository. Priming proves those programs answer before a
+ * zero is reported, so a confirmed zero means "not in the loaded program graph":
+ * a real negative for project source, still silent about excluded folders,
+ * scripts and other languages. Before that proof the zero is `stale`, and the
+ * only correct act is to retry, not to search elsewhere.
  */
 const NO_MATCH_RECOVERY =
-  'Not absence: only loaded files were searched. Repository-wide: ast_search. Or open the file with get_document_symbols, then repeat.';
+  'No match in the loaded program graph. Repository-wide (excluded folders, scripts, other languages): ast_search.';
+const STALE_RECOVERY =
+  'The project graph is still loading, so this zero is not an answer yet. Retry the same call once it finishes.';
+const zeroNote = (confirmed: boolean) =>
+  confirmed ? 'no match in the loaded program graph' : 'index still loading — retry';
 
 interface WorkspaceQueryAnswer {
   query: string;
@@ -350,17 +355,17 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
       const single = queries.length === 1 ? perQuery[0] : null;
       const text = single
         ? single.shown === 0
-          ? `Workspace symbols (0/0) matching "${single.query}" · searched LOADED files only`
+          ? `Workspace symbols (0/0) matching "${single.query}" · ${zeroNote(single.readinessConfirmed)}`
           : [
               `Workspace symbols (${single.shown}/${single.total}) matching "${single.query}" · provider lsp`,
               ...single.symbols.map((symbol) => renderWorkspaceRow(symbol, client, previewCache)),
               ...omittedLine,
             ].join('\n')
         : [
-            `Workspace symbols (${selected.length}/${total}) matching ${queries.length} names · provider lsp · searched LOADED files only`,
+            `Workspace symbols (${selected.length}/${total}) matching ${queries.length} names · provider lsp`,
             ...perQuery.map(
               (row) =>
-                `  "${row.query}": ${row.total} match(es)${row.total === 0 ? ' — no match among LOADED files' : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
+                `  "${row.query}": ${row.total} match(es)${row.total === 0 ? ` — ${zeroNote(row.readinessConfirmed)}` : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
             ),
             ...perQuery
               .filter((row) => row.shown > 0)
@@ -375,12 +380,9 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
-          // `empty` is a SCOPED negative: no match among the files this provider
-          // has loaded. It never asserts the symbol is absent from the repository,
-          // because this provider answers only from loaded documents -- an
-          // existing symbol in an unopened file returns zero here. Repository-wide
-          // absence belongs to the structural tier, which needs no language server.
-          // Before the provider is answering at all, zero rows is `stale` instead.
+          // `empty` is a SCOPED negative: no match in the loaded program graph,
+          // proven answering. Repository-wide absence belongs to the structural
+          // tier. Before the provider is proven answering, zero rows is `stale`.
           outcome: selected.length > 0 ? 'ok' : readinessConfirmed ? 'empty' : 'stale',
           readinessConfirmed,
           provider: 'lsp',
@@ -394,16 +396,16 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
           recovery:
             omitted > 0
               ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
-              : selected.length === 0
-                ? NO_MATCH_RECOVERY
-                : perQuery.some((row) => row.total === 0)
-                  ? `Some names matched nothing among LOADED files: ${perQuery
-                      .filter((row) => row.total === 0)
-                      .map((row) => `"${row.query}"`)
-                      .join(', ')}. ${NO_MATCH_RECOVERY}`
-                  : readinessConfirmed
-                    ? null
-                    : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
+              : !readinessConfirmed
+                ? STALE_RECOVERY
+                : selected.length === 0
+                  ? NO_MATCH_RECOVERY
+                  : perQuery.some((row) => row.total === 0)
+                    ? `No match for ${perQuery
+                        .filter((row) => row.total === 0)
+                        .map((row) => `"${row.query}"`)
+                        .join(', ')}. ${NO_MATCH_RECOVERY}`
+                    : null,
           ...(resultFile ? { resultFile } : {}),
         },
       };
@@ -590,7 +592,8 @@ async function callHierarchyResult(
       allCalls.push(call);
       if (selectedCalls.length >= limit) continue;
       selectedCalls.push(call);
-      const end = direction === 'incoming' && 'from' in call ? call.from : 'to' in call ? call.to : null;
+      const end =
+        direction === 'incoming' && 'from' in call ? call.from : 'to' in call ? call.to : null;
       if (end) {
         const start = end.selectionRange.start;
         const file = uriToPath(end.uri);

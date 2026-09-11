@@ -1565,26 +1565,74 @@ describe('LSPClient', () => {
       expect(result.readinessConfirmed).toBe(true);
     });
 
-    it('confirms readiness only when EVERY seeded project answers, not the first one', async () => {
-      // A server like tsserver loads one program per project. Confirming from a
-      // single canary proves that project answers and says nothing about the rest,
-      // so a symbol in a sibling package would still come back as a CONFIRMED zero
-      // — the same false absence, one corner narrower.
+    it('confirms a workspace-wide index through its adapter and answers once', async () => {
+      // intelephense announces the end of its index; that adapter answer is the
+      // readiness, and one request covers the workspace. No seed is touched per
+      // query and nothing is polled.
       const client = new LSPClient(TEST_CONFIG_PATH);
-      const loadedDir = join(TEST_DIR, 'loaded');
-      const coldDir = join(TEST_DIR, 'cold');
-      await mkdir(loadedDir, { recursive: true });
-      await mkdir(coldDir, { recursive: true });
-      await writeFile(join(loadedDir, 'a.ts'), 'export const loadedSymbol = 1;');
-      await writeFile(join(coldDir, 'b.ts'), 'export const coldSymbol = 2;');
-
+      const seedPath = join(TEST_DIR, 'seed.ts');
+      await writeFile(seedPath, 'export const seedSymbol = true;');
+      const waitForProjectReady = jest.fn(async () => true);
       const serverState = {
         serverCapabilities: MOCK_SERVER_CAPABILITIES,
         initializationPromise: Promise.resolve(),
         process: { stdin: { write: jest.fn() } },
         transport: createMockTransport(),
         initialized: true,
-        adapter: undefined,
+        adapter: { waitForProjectReady },
+        documentManager: createMockDocumentManager(),
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: { extensions: ['ts'], command: ['intelephense', '--stdio'], rootDir: TEST_DIR },
+      };
+      (client as any).serverManager.getRunningServers().set('php', serverState);
+      const workspaceSymbolSpy = spyOn(operations, 'workspaceSymbol').mockResolvedValue([]);
+
+      try {
+        const result = await client.workspaceSymbol('NoSuchSymbolAnywhere');
+        expect(result).toEqual({ symbols: [], readinessConfirmed: true });
+        expect(waitForProjectReady).toHaveBeenCalledTimes(1);
+        expect(workspaceSymbolSpy).toHaveBeenCalledTimes(1);
+        // Confirmed once per server: the second name pays one request, no re-check.
+        await client.workspaceSymbol('AnotherName');
+        expect(waitForProjectReady).toHaveBeenCalledTimes(1);
+        expect(workspaceSymbolSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        workspaceSymbolSpy.mockRestore();
+        await rm(seedPath, { force: true });
+      }
+    });
+
+    /**
+     * A fake of the measured typescript-language-server contract: `workspace/symbol`
+     * answers only from the project of the document the last request touched.
+     * Two seed directories are two projects; `symbolsByProject` says what each
+     * declares, and `readyProjects` says which the server confirms as loaded.
+     */
+    async function scopedWorkspaceServer(
+      symbolsByProject: Record<string, string[]>,
+      readyProjects: string[] = ['loaded', 'cold']
+    ) {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const dirs = ['loaded', 'cold'].map((name) => join(TEST_DIR, name));
+      for (const dir of dirs) await mkdir(dir, { recursive: true });
+      await writeFile(join(TEST_DIR, 'loaded', 'a.ts'), 'export const loadedSymbol = 1;');
+      await writeFile(join(TEST_DIR, 'cold', 'b.ts'), 'export const coldSymbol = 2;');
+      const projectOf = (filePath: string) =>
+        filePath.includes(`${sep}cold${sep}`) ? 'cold' : 'loaded';
+      const readiness: string[] = [];
+      const serverState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport(),
+        initialized: true,
+        adapter: {
+          workspaceSymbolScope: (_state: unknown, filePath: string) => projectOf(filePath),
+          waitForProjectReady: async (_state: unknown, filePath: string) => {
+            readiness.push(projectOf(filePath));
+            return readyProjects.includes(projectOf(filePath));
+          },
+        },
         documentManager: createMockDocumentManager(),
         diagnosticsCache: createMockDiagnosticsCache(),
         config: {
@@ -1594,50 +1642,111 @@ describe('LSPClient', () => {
         },
       };
       (client as any).serverManager.getRunningServers().set('ts', serverState);
-
-      // Each seed declares its own name; only the loaded project answers navto.
+      let lastTouched = 'loaded';
       const documentSymbolsSpy = spyOn(operations, 'getDocumentSymbols').mockImplementation(
         async (_state: unknown, filePath: string) => {
-          const name = filePath.includes(`${sep}cold${sep}`) ? 'coldSymbol' : 'loadedSymbol';
-          return [
-            {
-              name,
-              kind: 13,
-              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
-              selectionRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
-            },
-          ] as never;
+          lastTouched = projectOf(filePath);
+          return [] as never;
         }
       );
+      const asked: Array<{ scope: string; query: string }> = [];
       const workspaceSymbolSpy = spyOn(operations, 'workspaceSymbol').mockImplementation(
-        async (_state: unknown, query: string) =>
-          query === 'loadedSymbol'
-            ? ([
-                {
-                  name: 'loadedSymbol',
-                  kind: 13,
-                  location: {
-                    uri: pathToUri(join(loadedDir, 'a.ts')),
-                    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
-                  },
-                },
-              ] as never)
-            : ([] as never)
+        async (_state: unknown, query: string) => {
+          asked.push({ scope: lastTouched, query });
+          const names = symbolsByProject[lastTouched] ?? [];
+          return names
+            .filter((name) => name.toLowerCase().includes(query.toLowerCase()))
+            .map((name) => ({
+              name,
+              kind: 13,
+              location: {
+                uri: pathToUri(
+                  join(TEST_DIR, lastTouched, lastTouched === 'cold' ? 'b.ts' : 'a.ts')
+                ),
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 10 } },
+              },
+            })) as never;
+        }
       );
-
-      try {
-        const result = await client.workspaceSymbol('anythingAtAll');
-        // The cold project never answered, so the zero is NOT a confirmed absence.
-        expect(result.readinessConfirmed).toBe(false);
-        const asked = workspaceSymbolSpy.mock.calls.map((call) => call[1]);
-        expect(asked).toContain('coldSymbol');
-      } finally {
+      const cleanup = async () => {
         documentSymbolsSpy.mockRestore();
         workspaceSymbolSpy.mockRestore();
-        await rm(loadedDir, { recursive: true, force: true });
-        await rm(coldDir, { recursive: true, force: true });
+        for (const dir of dirs) await rm(dir, { recursive: true, force: true });
+      };
+      return { client, asked, readiness, cleanup };
+    }
+
+    it('asks a last-document-scoped server once per project scope and merges', async () => {
+      // The measured false zero: tsls scopes navto to the last touched file's
+      // project, so a symbol in a sibling project answered nothing. Steering the
+      // scope through one seed per project makes the answer cover the workspace.
+      const { client, asked, readiness, cleanup } = await scopedWorkspaceServer({
+        loaded: ['loadedSymbol', 'sharedName'],
+        cold: ['coldSymbol', 'sharedName', 'onlyInCold'],
+      });
+      try {
+        const result = await client.workspaceSymbol('onlyInCold');
+        expect(result.readinessConfirmed).toBe(true);
+        expect(result.symbols.map((symbol) => symbol.name)).toEqual(['onlyInCold']);
+        // Exactly one request per scope, each after its own touch and readiness.
+        expect(asked.map((row) => `${row.scope}:${row.query}`).sort()).toEqual([
+          'cold:onlyInCold',
+          'loaded:onlyInCold',
+        ]);
+        expect(new Set(readiness)).toEqual(new Set(['loaded', 'cold']));
+        // A name both projects declare yields one row per declaration, none twice.
+        const shared = await client.workspaceSymbol('sharedName');
+        expect(shared.symbols.map((symbol) => symbol.location.uri)).toHaveLength(2);
+        expect(new Set(shared.symbols.map((symbol) => symbol.location.uri)).size).toBe(2);
+      } finally {
+        await cleanup();
       }
-    }, 45000);
+    });
+
+    it('reports a last-document-scoped answer unconfirmed while any project scope is not ready', async () => {
+      // One loaded program says nothing about a sibling still loading: rows from
+      // the loaded scope are returned, but the answer is not called complete.
+      const { client, cleanup } = await scopedWorkspaceServer(
+        { loaded: ['loadedSymbol'], cold: ['coldSymbol'] },
+        ['loaded']
+      );
+      try {
+        const result = await client.workspaceSymbol('Symbol');
+        expect(result.readinessConfirmed).toBe(false);
+        expect(result.symbols.map((symbol) => symbol.name).sort()).toEqual([
+          'coldSymbol',
+          'loadedSymbol',
+        ]);
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it('serializes concurrent names on a scoped server so touches never interleave', async () => {
+      const { client, asked, cleanup } = await scopedWorkspaceServer({
+        loaded: ['alphaOne'],
+        cold: ['betaTwo'],
+      });
+      try {
+        const [alpha, beta] = await Promise.all([
+          client.workspaceSymbol('alphaOne'),
+          client.workspaceSymbol('betaTwo'),
+        ]);
+        expect(alpha.symbols.map((symbol) => symbol.name)).toEqual(['alphaOne']);
+        expect(beta.symbols.map((symbol) => symbol.name)).toEqual(['betaTwo']);
+        // Each query saw both scopes, and no scope was asked the wrong name mid-touch.
+        for (const query of ['alphaOne', 'betaTwo']) {
+          expect(
+            asked
+              .filter((row) => row.query === query)
+              .map((row) => row.scope)
+              .sort()
+          ).toEqual(['cold', 'loaded']);
+        }
+      } finally {
+        await cleanup();
+      }
+    });
 
     it('never primes a server that cannot answer workspace/symbol', async () => {
       // Priming opens seed documents and waits for the project to warm. Doing that

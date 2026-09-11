@@ -9,7 +9,7 @@ import { astSearchTool } from './tools/ast-search.js';
 import { getDiagnosticsTool } from './tools/diagnostics.js';
 import { getHoverTool } from './tools/hover.js';
 import { getCodeActionsTool, getCompletionsTool } from './tools/language-features.js';
-import { findReferencesTool } from './tools/navigation.js';
+import { findDefinitionTool, findReferencesTool } from './tools/navigation.js';
 import { renameFileTool } from './tools/refactoring.js';
 import { type ToolDefinition, boundToolResult, registerTools } from './tools/registry.js';
 import {
@@ -357,12 +357,65 @@ describe('capability tool contracts', () => {
     }
   });
 
+  it('answers several definition names in one request, each count attributable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-multidef-'));
+    const file = join(dir, 'multi.ts');
+    writeFileSync(file, 'export const alpha = 1;\nexport const beta = alpha;\n');
+    try {
+      const asked: string[] = [];
+      const client = asClient({
+        findDefinitionsWithProvider: jest.fn(async (_file: string, name: string) => {
+          asked.push(name);
+          return name === 'missing'
+            ? { outcome: 'ok', provider: 'lsp', value: [], matchedSymbols: 0 }
+            : {
+                outcome: 'ok',
+                provider: 'lsp',
+                value: [
+                  {
+                    uri: pathToUri(file),
+                    range: { start: { line: 0, character: 13 }, end: { line: 0, character: 18 } },
+                  },
+                ],
+                matchedSymbols: 1,
+              };
+        }),
+        symbolKindToString: () => 'variable',
+      });
+
+      const result = await findDefinitionTool.handler(
+        { file_path: file, symbol_name: ['alpha', 'missing'] },
+        client
+      );
+
+      expect(asked).toEqual(['alpha', 'missing']);
+      expect((result.structuredContent as any).perQuery).toMatchObject([
+        { query: 'alpha', shown: 1, total: 1, outcome: 'ok' },
+        { query: 'missing', shown: 0, total: 0, matchedSymbols: 0, outcome: 'empty' },
+      ]);
+      expect(result.content[0]?.text).toContain('"missing": 0 definition(s)');
+      expect(result.content[0]?.text).toContain('  1: export const alpha = 1;');
+      // One name keeps the shape it always had: no breakdown.
+      const single = await findDefinitionTool.handler(
+        { file_path: file, symbol_name: 'alpha' },
+        client
+      );
+      expect((single.structuredContent as any).perQuery).toBeUndefined();
+      expect(single.content[0]?.text).toContain('Found 1/1 definition(s) for "alpha"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('follows every reference row with its source window, so no follow-up read is needed', async () => {
     // The measured shape this replaces: 100 reference rows, each a bare position,
     // and the very next action was a Read of the file they pointed at.
     const dir = mkdtempSync(join(tmpdir(), 'cclsp-refs-'));
     const file = join(dir, 'caller.ts');
-    writeFileSync(file, 'import { answer } from "./a.js";\n\nexport const used = answer();\nconst tail = 1;\n');
+    writeFileSync(
+      file,
+      'import { answer } from "./a.js";\n\nexport const used = answer();\nconst tail = 1;\n'
+    );
     try {
       const locations = [
         {
@@ -460,12 +513,15 @@ describe('capability tool contracts', () => {
     expect((result.structuredContent as any).recovery).toContain('ast_search');
   });
 
-  it('carries each row\'s declaration line by default, and drops it only on request', async () => {
+  it("carries each row's declaration line by default, and drops it only on request", async () => {
     // Without the line, a row says only WHERE a name the caller already knew is,
     // so choosing between candidates costs a file read each. One line answers it.
     const dir = mkdtempSync(join(tmpdir(), 'cclsp-preview-'));
     const file = join(dir, 'health.ts');
-    writeFileSync(file, 'const other = 1;\nexport function HealthView(props: Props) {\n  return null;\n}\n');
+    writeFileSync(
+      file,
+      'const other = 1;\nexport function HealthView(props: Props) {\n  return null;\n}\n'
+    );
     try {
       const symbols = [
         {
@@ -502,7 +558,10 @@ describe('capability tool contracts', () => {
     // exactly the drift this owner exists to prevent, so the format is pinned here.
     const dir = mkdtempSync(join(tmpdir(), 'cclsp-window-'));
     const file = join(dir, 'shape.ts');
-    writeFileSync(file, 'const before = 1;\n\nexport function target() {\n  return 2;\n}\n\nconst after = 3;\n');
+    writeFileSync(
+      file,
+      'const before = 1;\n\nexport function target() {\n  return 2;\n}\n\nconst after = 3;\n'
+    );
     try {
       const symbols = [
         {
@@ -560,7 +619,7 @@ describe('capability tool contracts', () => {
     expect(result.content[0]?.text).toContain('/workspace/does-not-exist.ts:5:1');
   });
 
-  it('keeps duplicate names as asked, so the breakdown lines up with the caller\'s array', async () => {
+  it("keeps duplicate names as asked, so the breakdown lines up with the caller's array", async () => {
     // Collapsing ['same','same'] would save one request and silently return fewer
     // rows than the caller listed, spending the shared bound differently. A caller
     // comparing its array with the answer would find them misaligned and nothing
@@ -695,10 +754,12 @@ describe('capability tool contracts', () => {
       })
     );
     expect(result.structuredContent).toMatchObject({ outcome: 'empty', shown: 0, total: 0 });
-    // Zero rows must never read as proof of absence: this searches loaded files,
-    // so the caller is routed to the tool that searches the repository.
+    // A confirmed zero is a real negative for the loaded program graph and says
+    // so; repository-wide absence (excluded folders, other languages) is routed
+    // to the structural tier rather than to a second LSP call.
     expect((result.structuredContent as any).recovery).toContain('ast_search');
-    expect(result.content[0]?.text).toContain('LOADED files only');
+    expect((result.structuredContent as any).recovery).not.toContain('Retry');
+    expect(result.content[0]?.text).toContain('no match in the loaded program graph');
   });
 
   it('reports zero rows as STALE while the provider is not confirmed answering', async () => {
@@ -712,7 +773,10 @@ describe('capability tool contracts', () => {
       })
     );
     expect(result.structuredContent).toMatchObject({ outcome: 'stale', shown: 0 });
-    expect((result.structuredContent as any).recovery).toContain('ast_search');
+    // Stale means "not an answer yet": the act is to retry, not to search elsewhere.
+    expect((result.structuredContent as any).recovery).toContain('Retry');
+    expect((result.structuredContent as any).recovery).not.toContain('ast_search');
+    expect(result.content[0]?.text).toContain('index still loading');
   });
 
   it('keeps rows found while unconfirmed, but does not call the answer complete', async () => {
@@ -743,11 +807,22 @@ describe('capability tool contracts', () => {
     // still cost ONE read: the window owner is created per call, not per row.
     const dir = mkdtempSync(join(tmpdir(), 'cclsp-diag-'));
     const file = join(dir, 'broken.ts');
-    writeFileSync(file, 'const a = 1;\nconst b: string = 2;\nconst c: number = "x";\nconst d = 4;\n');
+    writeFileSync(
+      file,
+      'const a = 1;\nconst b: string = 2;\nconst c: number = "x";\nconst d = 4;\n'
+    );
     try {
       const diagnostics = [
-        { severity: 1, message: 'not assignable', range: { start: { line: 1, character: 6 }, end: { line: 1, character: 7 } } },
-        { severity: 1, message: 'not assignable', range: { start: { line: 2, character: 6 }, end: { line: 2, character: 7 } } },
+        {
+          severity: 1,
+          message: 'not assignable',
+          range: { start: { line: 1, character: 6 }, end: { line: 1, character: 7 } },
+        },
+        {
+          severity: 1,
+          message: 'not assignable',
+          range: { start: { line: 2, character: 6 }, end: { line: 2, character: 7 } },
+        },
       ];
       const result = await getDiagnosticsTool.handler(
         { file_path: file },
@@ -857,10 +932,7 @@ describe('capability tool contracts', () => {
         }),
       });
 
-      const ok = await astSearchTool.handler(
-        { pattern: 'target', language: 'typescript' },
-        client
-      );
+      const ok = await astSearchTool.handler({ pattern: 'target', language: 'typescript' }, client);
       // A bare name matches the identifier node, so its text is the name the caller
       // already typed; the window is what makes the row worth reading.
       expect(ok.content[0]?.text).toContain('  2: export const target = 1;');
@@ -915,7 +987,9 @@ describe('capability tool contracts', () => {
           filesScanned: 1,
           truncated: false,
           indexCapped: false,
-          perPattern: [{ pattern: 'function $NAME() { $$$BODY }', matches: 1, completeness: 'exact' }],
+          perPattern: [
+            { pattern: 'function $NAME() { $$$BODY }', matches: 1, completeness: 'exact' },
+          ],
           matches: [
             {
               file,

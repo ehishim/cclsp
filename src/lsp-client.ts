@@ -77,17 +77,8 @@ import type {
 import { pathToUri, uriToPath } from './utils.js';
 
 const MAX_QUERY_OCCURRENCES = 32;
-
-/** First named declaration of a document-symbol answer, hierarchical or flat. */
-function firstDocumentSymbolName(
-  symbols: DocumentSymbol[] | SymbolInformation[]
-): string | null {
-  for (const symbol of symbols) {
-    const name = symbol?.name;
-    if (typeof name === 'string' && name.trim().length > 0) return name;
-  }
-  return null;
-}
+/** Bound on confirming one project/index is loaded; priming can never hang. */
+const WORKSPACE_SYMBOL_READY_BUDGET_MS = 30000;
 
 export interface SymbolQueryMatchResult {
   matches: SymbolMatch[];
@@ -130,10 +121,12 @@ export class LSPClient {
   private config: Config;
   private serverManager = new ServerManager();
   private astProvider: AstProvider;
-  private workspaceSymbolPrimedServers = new WeakSet<ServerState>();
-  private workspaceSymbolPrimingInFlight = new WeakMap<ServerState, Promise<boolean>>();
-  /** One known-present name per seeded project, kept to strengthen an empty answer. */
-  private workspaceSymbolCanaries = new WeakMap<ServerState, string[]>();
+  /** One seed per source directory; on a last-document-scoped server each selects a query scope. */
+  private workspaceSymbolSeeds = new WeakMap<ServerState, string[]>();
+  /** Per-server chain that keeps touch-then-ask pairs from interleaving. */
+  private workspaceSymbolScopeTail = new WeakMap<ServerState, Promise<void>>();
+  private workspaceSymbolConfirmedServers = new WeakSet<ServerState>();
+  private workspaceSymbolConfirmInFlight = new WeakMap<ServerState, Promise<boolean>>();
   private rewriteApplyTail: Promise<void> = Promise.resolve();
 
   constructor(configPath?: string, root = process.cwd()) {
@@ -837,9 +830,10 @@ export class LSPClient {
 
   /**
    * Search the workspace, and report whether the answer may be trusted as
-   * COMPLETE. `readinessConfirmed: false` means the servers could not be shown to
-   * be answering within the budget, so zero rows is "not answering yet" rather
-   * than "no such symbol" — a distinction only this layer can still make.
+   * COMPLETE. `readinessConfirmed: false` means a server could not be shown to
+   * be answering from a loaded project within the budget, so zero rows is "not
+   * answering yet" rather than "no such symbol" — a distinction only this layer
+   * can still make.
    */
   async workspaceSymbol(
     query: string
@@ -855,22 +849,19 @@ export class LSPClient {
       }
     }
 
-    // Query every language server concurrently: priming + the workspace/symbol call
-    // for each server run in parallel, so a multi-language workspace (e.g. TS + PHP)
+    // Every language server concurrently, so a multi-language workspace (TS + PHP)
     // isn't gated by the slowest server one-at-a-time.
     const errors: unknown[] = [];
     const perServer = await Promise.all(
       servers.map(async (serverState) => {
         if (!serverState) return { symbols: [] as SymbolInformation[], confirmed: true };
-        // Skipped before priming, which opens seed documents to warm a project this
-        // server is going to refuse anyway. A YAML or JSON server sharing the root
+        // Skipped before any seed is opened: a YAML or JSON server sharing the root
         // would otherwise make every name search fail with ITS refusal.
         if (!supportsMethod(serverState, 'workspace/symbol')) {
           return { symbols: [] as SymbolInformation[], confirmed: true };
         }
         try {
-          const confirmed = await this.primeWorkspaceSymbolProject(serverState);
-          return { symbols: await opsWorkspaceSymbol(serverState, query), confirmed };
+          return await this.queryWorkspaceSymbol(serverState, query);
         } catch (error) {
           // Same rule for a server that advertises the capability and refuses only
           // when asked: unsupported is a fact about that server, never about the symbol.
@@ -885,289 +876,189 @@ export class LSPClient {
     );
 
     const results = perServer.flatMap((entry) => entry.symbols);
-    // One unconfirmed server is enough to make the WORKSPACE answer incomplete.
-    let readinessConfirmed = perServer.every((entry) => entry.confirmed);
-    if (results.length > 0) {
-      return { symbols: results, readinessConfirmed };
-    }
-
-    // Nothing matched, so this answer is about to be read as absence. Before it may
-    // mean that, every seeded project must be answering: one loaded program says
-    // nothing about a sibling package that is still cold. Paid only on a zero.
-    if (readinessConfirmed) {
-      for (const serverState of servers) {
-        if (!serverState) continue;
-        if (!supportsMethod(serverState, 'workspace/symbol')) continue;
-        if (!(await this.allSeededProjectsAnswer(serverState))) {
-          readinessConfirmed = false;
-          break;
-        }
-      }
-    }
-
-    if (errors.length > 0) {
+    if (results.length === 0 && errors.length > 0) {
       throw errors[0];
     }
-
-    return { symbols: [], readinessConfirmed };
+    // One unconfirmed server is enough to make the WORKSPACE answer incomplete.
+    return { symbols: results, readinessConfirmed: perServer.every((entry) => entry.confirmed) };
   }
 
-  /** Returns whether this server was confirmed able to answer workspace/symbol completely. */
-  private async primeWorkspaceSymbolProject(serverState: ServerState): Promise<boolean> {
-    if (this.workspaceSymbolPrimedServers.has(serverState)) {
-      return true;
+  /**
+   * One `workspace/symbol` per scope the server actually searches.
+   *
+   * A workspace-wide provider (intelephense, gopls) is asked once, after its
+   * index/package load is confirmed. A provider that scopes the request to its
+   * most recently touched document (tsserver: navto searches only that file's
+   * project) is steered through every seeded project: touch one seed per scope,
+   * confirm that project is loaded, ask, merge. Without that, one query answers
+   * for ONE project and reads as absence for every other — the measured false
+   * zero. The seeds are discovered once per server; the program loads they
+   * trigger are paid once per process, and every later call costs one cheap
+   * request per scope.
+   */
+  private async queryWorkspaceSymbol(
+    serverState: ServerState,
+    query: string
+  ): Promise<{ symbols: SymbolInformation[]; confirmed: boolean }> {
+    const seeds = await this.workspaceSymbolSeedsFor(serverState);
+    const scopeOf = serverState.adapter?.workspaceSymbolScope?.bind(serverState.adapter);
+    if (!scopeOf) {
+      const confirmed = await this.confirmWorkspaceWideReady(serverState, seeds);
+      return { symbols: await opsWorkspaceSymbol(serverState, query), confirmed };
     }
-    // Coalesce concurrent workspace/symbol calls: only one priming pass runs per
-    // server; overlapping callers await the same in-flight promise and receive the
-    // same verdict, so a cold root costs one warm-up no matter how many Agents ask.
-    const inFlight = this.workspaceSymbolPrimingInFlight.get(serverState);
-    if (inFlight) {
-      return await inFlight;
+
+    // One seed per distinct scope: eleven source directories under one tsconfig
+    // are one project and one request, not eleven.
+    const seedByScope = new Map<string, string>();
+    for (const seed of seeds) {
+      const key = scopeOf(serverState, seed);
+      if (!seedByScope.has(key)) seedByScope.set(key, seed);
     }
+    if (seedByScope.size === 0) {
+      return { symbols: await opsWorkspaceSymbol(serverState, query), confirmed: false };
+    }
+
+    const merged: SymbolInformation[] = [];
+    const seen = new Set<string>();
+    let confirmed = true;
+    for (const seed of seedByScope.values()) {
+      const answer = await this.askInScope(serverState, seed, query);
+      confirmed &&= answer.ready;
+      for (const symbol of answer.symbols) {
+        const start = symbol.location.range.start;
+        const key = `${symbol.location.uri}\u0000${start.line}\u0000${start.character}\u0000${symbol.name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(symbol);
+      }
+    }
+    return { symbols: merged, confirmed };
+  }
+
+  /**
+   * Touch one seed, confirm its project, then ask. Serialized per server: the
+   * scope is "the last touched document", so two names asked concurrently would
+   * race each other's touch and answer from the wrong project.
+   */
+  private askInScope(
+    serverState: ServerState,
+    seed: string,
+    query: string
+  ): Promise<{ symbols: SymbolInformation[]; ready: boolean }> {
+    const previous = this.workspaceSymbolScopeTail.get(serverState) ?? Promise.resolve();
+    const run = previous
+      .catch(() => undefined)
+      .then(async () => {
+        // documentSymbol both selects the scope and makes a lazy server load the
+        // project that contains the seed; readiness is then asked, never assumed.
+        let ready = true;
+        try {
+          await opsGetDocumentSymbols(serverState, seed);
+        } catch (error) {
+          logger.debug(`[workspaceSymbol] Could not touch scope seed ${seed}: ${error}\n`);
+          ready = false;
+        }
+        if (ready && serverState.adapter?.waitForProjectReady) {
+          ready = await serverState.adapter.waitForProjectReady(
+            serverState,
+            seed,
+            WORKSPACE_SYMBOL_READY_BUDGET_MS
+          );
+        }
+        return { symbols: await opsWorkspaceSymbol(serverState, query), ready };
+      });
+    this.workspaceSymbolScopeTail.set(
+      serverState,
+      run.then(
+        () => undefined,
+        () => undefined
+      )
+    );
+    return run;
+  }
+
+  /**
+   * A workspace-wide provider is ready once its adapter says so (intelephense
+   * announces the end of its index). Without an adapter, opening the seeds and
+   * letting their diagnostics settle is the only available evidence of a package
+   * load (gopls); it witnesses the seeds' own packages, and is accepted as it
+   * always was. Paid once per server.
+   */
+  private async confirmWorkspaceWideReady(
+    serverState: ServerState,
+    seeds: string[]
+  ): Promise<boolean> {
+    if (this.workspaceSymbolConfirmedServers.has(serverState)) return true;
+    const inFlight = this.workspaceSymbolConfirmInFlight.get(serverState);
+    if (inFlight) return await inFlight;
 
     const run = (async () => {
-      // One seed per source directory of every project root: opening a file is what
-      // makes a lazy-loading server (tsserver, gopls) load the program that contains
-      // it, and a single seed leaves every other program cold. This stays far from
-      // the old "open up to 500 files" warm-up that made the first call time out.
-      const seedFiles = await this.findWorkspaceSymbolSeedFiles(serverState.config);
-
       const seedLeases = (
         await Promise.all(
-          seedFiles.map((seedFile) =>
-            serverState.documentManager.acquire(seedFile).catch((error) => {
-              logger.debug(`[workspaceSymbol] Failed to open seed ${seedFile}: ${error}\n`);
+          seeds.map((seed) =>
+            serverState.documentManager.acquire(seed).catch((error) => {
+              logger.debug(`[workspaceSymbol] Failed to open seed ${seed}: ${error}\n`);
               return undefined;
             })
           )
         )
       ).filter((lease) => lease !== undefined);
-
-      let confirmed: boolean;
       try {
-        confirmed = await this.waitForWorkspaceSymbolReady(serverState, seedFiles);
+        const [firstSeed] = seeds;
+        if (serverState.adapter?.waitForProjectReady && firstSeed) {
+          return await serverState.adapter.waitForProjectReady(
+            serverState,
+            firstSeed,
+            WORKSPACE_SYMBOL_READY_BUDGET_MS
+          );
+        }
+        const deadline = Date.now() + WORKSPACE_SYMBOL_READY_BUDGET_MS;
+        await Promise.all(
+          seeds.map((seed) =>
+            opsGetDocumentSymbols(serverState, seed).catch((error) => {
+              logger.debug(`[workspaceSymbol] Seed documentSymbol failed for ${seed}: ${error}\n`);
+              return [];
+            })
+          )
+        );
+        await Promise.all(
+          seeds.map((seed) =>
+            serverState.diagnosticsCache
+              .waitForIdle(pathToUri(seed), {
+                maxWaitTime: Math.min(15000, Math.max(0, deadline - Date.now())),
+                idleTime: 300,
+                checkInterval: 50,
+              })
+              .catch(() => undefined)
+          )
+        );
+        return true;
       } finally {
         for (const lease of seedLeases) lease.release();
       }
-
-      // Only treat the server as permanently primed when readiness was confirmed.
-      // An indexing server whose index didn't finish in the budget is left unprimed
-      // so a later call re-checks (by then the index is usually complete) instead of
-      // sticking with an empty index for the rest of the process lifetime.
-      if (confirmed) {
-        this.workspaceSymbolPrimedServers.add(serverState);
-      }
-      logger.debug(
-        `[workspaceSymbol] Primed workspace symbols with ${seedFiles.length} seed file(s) (confirmed=${confirmed})\n`
-      );
-      return confirmed;
     })();
 
-    this.workspaceSymbolPrimingInFlight.set(serverState, run);
+    this.workspaceSymbolConfirmInFlight.set(serverState, run);
     try {
-      return await run;
+      const confirmed = await run;
+      // Only a confirmed server stays confirmed; an index that did not finish in
+      // the budget is re-checked next call instead of sticking as "ready".
+      if (confirmed) this.workspaceSymbolConfirmedServers.add(serverState);
+      logger.debug(`[workspaceSymbol] Workspace-wide readiness confirmed=${confirmed}\n`);
+      return confirmed;
     } finally {
-      this.workspaceSymbolPrimingInFlight.delete(serverState);
+      this.workspaceSymbolConfirmInFlight.delete(serverState);
     }
   }
 
-  /**
-   * Bounded wait until a server can answer workspace/symbol completely. Returns
-   * whether readiness was confirmed (vs. bailed on the budget mid-index).
-   *
-   * - An adapter that announces a finished index (intelephense) is believed at once.
-   * - Everything else is confirmed by BEHAVIOUR: each seeded project must answer
-   *   workspace/symbol for a name taken from its own seed. Silence is not readiness,
-   *   and settled diagnostics witness only the seed's own file.
-   *
-   * Always capped so priming can never hang; an unconfirmed result makes the caller
-   * report `stale` rather than claiming the symbol is absent.
-   */
-  private async waitForWorkspaceSymbolReady(
-    serverState: ServerState,
-    seedFiles: string[]
-  ): Promise<boolean> {
-    const BUDGET_MS = 30000;
-    const deadline = Date.now() + BUDGET_MS;
-
-    if (serverState.adapter?.isWorkspaceIndexingServer?.()) {
-      // An announced complete index is the cheapest possible confirmation.
-      const graceDeadline = Date.now() + 5000;
-      while (Date.now() < deadline) {
-        if (serverState.indexingComplete) {
-          logger.debug('[workspaceSymbol] Workspace index complete\n');
-          return true;
-        }
-        // Silence is not readiness. tsserver loads its program lazily and may
-        // announce nothing at all, so "nothing was signalled" used to be read as
-        // "nothing to index" and every absent symbol came back as a CONFIRMED
-        // zero. Measured on a 1,900-file project: 11 seeds opened, no progress
-        // within the grace, confirmed=true, and navto returned nothing for a class
-        // that exists — while opening one project file made the same query answer
-        // immediately. Fall through to the behavioural probe instead of assuming.
-        if (!serverState.indexingStarted && Date.now() > graceDeadline) {
-          logger.debug('[workspaceSymbol] No indexing signalled; probing navto directly\n');
-          break;
-        }
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-      if (serverState.indexingComplete) return true;
-      if (serverState.indexingStarted && Date.now() >= deadline) {
-        logger.debug('[workspaceSymbol] Indexing did not finish within budget; proceeding\n');
-        return false;
-      }
-      return await this.probeWorkspaceSymbolAnswering(serverState, seedFiles, deadline);
-    }
-
-    // Lazy-loading server (tsserver, gopls): opening a seed triggers the project/
-    // package load, but workspace/symbol (navto) only returns results once the whole
-    // project graph is built. The server publishes diagnostics for the seed at that
-    // point — a documentSymbol answer comes back earlier, from the syntactic parse,
-    // so it is NOT a reliable readiness signal. Wait for the seed's diagnostics to
-    // settle instead. A documentSymbol probe first nudges the parse along. All bounded
-    // by the remaining budget so priming can never hang.
-    if (seedFiles.length > 0) {
-      const remaining = () => Math.max(0, deadline - Date.now());
-      await Promise.all(
-        seedFiles.map((seedFile) =>
-          opsGetDocumentSymbols(serverState, seedFile).catch((error) => {
-            logger.debug(
-              `[workspaceSymbol] Seed documentSymbol failed for ${seedFile}: ${error}\n`
-            );
-            return [];
-          })
-        )
-      );
-      await Promise.all(
-        seedFiles.map((seedFile) =>
-          serverState.diagnosticsCache
-            .waitForIdle(pathToUri(seedFile), {
-              maxWaitTime: Math.min(15000, remaining()),
-              idleTime: 300,
-              checkInterval: 50,
-            })
-            .catch(() => undefined)
-        )
-      );
-      // Settled diagnostics witness the seeds' own projects, not the workspace, so
-      // they are a starting point rather than the answer. The probe below decides.
-      return await this.probeWorkspaceSymbolAnswering(serverState, seedFiles, deadline);
-    }
-    return true;
-  }
-
-  /**
-   * Readiness answered by BEHAVIOUR: ask the server for a symbol this workspace is
-   * known to declare and see whether it comes back.
-   *
-   * A canary name is taken from a seed file's own document symbols, which is a
-   * necessary condition rather than a sufficient one -- but that is exactly what
-   * was missing. Assuming readiness turns every absent symbol into a confirmed
-   * zero, which is the most convincing wrong answer this tier can give. When the
-   * canary never answers within the budget the result is `false`, so the caller
-   * reports `stale` and says the index is still loading instead of claiming the
-   * symbol does not exist.
-   *
-   * Cost is paid once per server: one document-symbol call plus a few polls, and
-   * the first poll usually succeeds because the seeds were opened just before.
-   */
-  private async probeWorkspaceSymbolAnswering(
-    serverState: ServerState,
-    seedFiles: string[],
-    deadline: number
-  ): Promise<boolean> {
-    // Wait for the FIRST canary only. Measured: polling every seed's canary in
-    // parallel floods the server with repeated navto while it is still building
-    // the program -- 34s and an empty answer, against 10s and the right answer
-    // when one canary is awaited. Proving every project up front also pays for
-    // loading programs the caller may never ask about.
-    //
-    // The residual is real and is handled where it costs nothing: one answering
-    // project does not prove a sibling package is loaded, so a NON-EMPTY answer
-    // is confirmed here, and an EMPTY one is strengthened by the caller before it
-    // is allowed to mean absence.
-    const canaries = await this.findWorkspaceSymbolCanaries(serverState, seedFiles, deadline);
-    if (canaries.length === 0) {
-      // No seed declared a name to ask for. Nothing is provable either way, and
-      // refusing every answer would be worse than admitting the uncertainty.
-      logger.debug('[workspaceSymbol] No canary symbol available; proceeding unconfirmed\n');
-      return false;
-    }
-    for (const canary of canaries) {
-      if (await this.waitForCanaryAnswer(serverState, canary, deadline)) {
-        logger.debug(`[workspaceSymbol] Index answering (canary "${canary}")\n`);
-        this.workspaceSymbolCanaries.set(serverState, canaries);
-        return true;
-      }
-    }
-    logger.debug('[workspaceSymbol] No canary answered within budget\n');
-    return false;
-  }
-
-  /**
-   * A zero is only an absence if every seeded project could have answered. Run
-   * once, and only when the answer was empty: a match already proves the index is
-   * live, and paying for cold sibling programs on every call would spend the time
-   * this tier exists to save.
-   */
-  private async allSeededProjectsAnswer(serverState: ServerState): Promise<boolean> {
-    const canaries = this.workspaceSymbolCanaries.get(serverState);
-    if (!canaries || canaries.length === 0) return false;
-    const deadline = Date.now() + 10000;
-    for (const canary of canaries) {
-      // Sequential on purpose: the parallel version is what starved the server.
-      if (!(await this.waitForCanaryAnswer(serverState, canary, deadline))) {
-        logger.debug(`[workspaceSymbol] Seeded project still cold (canary "${canary}")\n`);
-        return false;
-      }
-    }
-    return true;
-  }
-
-  /** Polls one known-present name until the server answers for it or the budget ends. */
-  private async waitForCanaryAnswer(
-    serverState: ServerState,
-    canary: string,
-    deadline: number
-  ): Promise<boolean> {
-    while (Date.now() < deadline) {
-      try {
-        const rows = await opsWorkspaceSymbol(serverState, canary);
-        if (rows.length > 0) return true;
-      } catch (error) {
-        logger.debug(`[workspaceSymbol] Canary probe failed for "${canary}": ${error}\n`);
-        return false;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-    logger.debug(`[workspaceSymbol] Canary "${canary}" never answered within budget\n`);
-    return false;
-  }
-
-  /** One known-present name per seeded project, deduplicated across seeds. */
-  private async findWorkspaceSymbolCanaries(
-    serverState: ServerState,
-    seedFiles: string[],
-    deadline: number
-  ): Promise<string[]> {
-    const canaries: string[] = [];
-    const found = await Promise.all(
-      seedFiles.map(async (seedFile) => {
-        if (Date.now() >= deadline) return null;
-        try {
-          return firstDocumentSymbolName(await opsGetDocumentSymbols(serverState, seedFile));
-        } catch (error) {
-          logger.debug(`[workspaceSymbol] Canary lookup failed for ${seedFile}: ${error}\n`);
-          return null;
-        }
-      })
-    );
-    for (const name of found) {
-      // A name shared by two seeds proves one thing once; asking twice costs a
-      // round trip and confirms nothing new.
-      if (name && !canaries.includes(name)) canaries.push(name);
-    }
-    return canaries;
+  /** Seeds are discovered once per server; a repository scan per query would dwarf the query. */
+  private async workspaceSymbolSeedsFor(serverState: ServerState): Promise<string[]> {
+    const known = this.workspaceSymbolSeeds.get(serverState);
+    if (known) return known;
+    const seeds = await this.findWorkspaceSymbolSeedFiles(serverState.config);
+    this.workspaceSymbolSeeds.set(serverState, seeds);
+    logger.debug(`[workspaceSymbol] ${seeds.length} seed file(s) select the query scopes\n`);
+    return seeds;
   }
 
   private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {
@@ -1175,36 +1066,31 @@ export class LSPClient {
     const extensions = new Set(serverConfig.extensions.map((ext) => ext.toLowerCase()));
     const ignoreFilter = await loadGitignore(rootDir);
     const projectRoots = await this.findWorkspaceSymbolProjectRoots(rootDir, ignoreFilter);
-    // One seed per project root is enough to trigger project loading. Cap the
-    // number of roots so a huge monorepo can't blow up priming.
-    const MAX_SEED_ROOTS = 25;
+    // Cap the opens so a huge monorepo can't blow up priming.
+    const MAX_SEED_FILES = 25;
     const roots = projectRoots.length > 0 ? projectRoots : [rootDir];
     const seedFiles: string[] = [];
 
     for (const projectRoot of roots) {
-      if (seedFiles.length >= MAX_SEED_ROOTS) break;
+      if (seedFiles.length >= MAX_SEED_FILES) break;
       const projectFiles = await this.findWorkspaceSymbolProjectFiles(
         rootDir,
         projectRoot,
         extensions,
         ignoreFilter
       );
-      // One seed per top-level source directory, not one per project. A single
-      // alphabetically-first file is a coin flip: if it happens to sit outside the
-      // tsconfig program -- a script, a fixture, an excluded folder -- tsserver
-      // loads an INFERRED project containing only that file, its diagnostics settle
-      // normally so priming reports success, and navto then searches a program that
-      // holds nothing. Measured: every name returned zero against a root whose
-      // symbols exist, and opening one real project file fixed it instantly.
-      // Seeding each source directory makes that miss require every directory to be
-      // excluded at once, and costs a handful of opens bounded by MAX_SEED_ROOTS.
+      // One seed per top-level source directory, not one per marker file: a
+      // directory with its own nested tsconfig is its own project, and on a server
+      // that scopes workspace/symbol to one project per request every project
+      // needs a seed to be asked at all. Seeds that resolve to the same scope
+      // collapse to one request, so the cost is bounded by MAX_SEED_FILES opens.
       const perDirectory = new Map<string, string>();
       for (const file of projectFiles) {
         const directory = dirname(relative(projectRoot, file)).split(sep)[0] ?? '.';
         if (!perDirectory.has(directory)) perDirectory.set(directory, file);
       }
       for (const seed of perDirectory.values()) {
-        if (seedFiles.length >= MAX_SEED_ROOTS) break;
+        if (seedFiles.length >= MAX_SEED_FILES) break;
         if (!seedFiles.includes(seed)) seedFiles.push(seed);
       }
     }

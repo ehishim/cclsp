@@ -183,12 +183,13 @@ export interface ServerAdapter {
   getTimeout?(method: string): number | undefined;
 
   /**
-   * True for servers that build a workspace-wide index asynchronously after
-   * initialization (e.g. intelephense) and signal completion via custom
-   * notifications. workspace/symbol priming waits for `state.indexingComplete`
-   * on these instead of opening seed files to force lazy project loading.
+   * For a server that answers `workspace/symbol` only from the project of its
+   * most recently touched document (typescript-language-server sends navto with
+   * `file: documents.files[0]`): the scope key one file selects. cclsp touches one
+   * file per distinct key before each query and merges the answers, so the
+   * result covers the workspace it names. Absent for a workspace-wide index.
    */
-  isWorkspaceIndexingServer?(): boolean;
+  workspaceSymbolScope?(state: ServerState, filePath: string): string;
 }
 
 /**

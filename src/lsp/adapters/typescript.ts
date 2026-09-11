@@ -53,8 +53,14 @@ export class TypeScriptAdapter implements ServerAdapter {
     return config.command.some((c: string) => c.includes('typescript-language-server'));
   }
 
-  isWorkspaceIndexingServer(): boolean {
-    return true;
+  /**
+   * Measured on typescript-language-server 4.x/5.x: `workspaceSymbol` sends
+   * `navto` with `file: documents.files[0]`, and `files[0]` is the document the
+   * last request touched. tsserver then searches only that file's project, so
+   * one query answers for one project and reads as absence for every other.
+   */
+  workspaceSymbolScope(state: ServerState, filePath: string): string {
+    return this.projectKey(state, filePath);
   }
 
   handleNotification(method: string, params: unknown, state: ServerState): boolean {

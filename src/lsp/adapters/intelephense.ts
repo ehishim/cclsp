@@ -11,8 +11,8 @@ import type { ServerAdapter, ServerState } from '../types.js';
  * returns partial results.
  *
  * This adapter:
- * - Tracks indexing state on the ServerState so workspace/symbol priming can
- *   wait for a complete index (see LSPClient.primeWorkspaceSymbolProject).
+ * - Tracks indexing state on the ServerState so `waitForProjectReady` can
+ *   confirm a complete index before workspace/symbol is trusted.
  * - Extends timeouts for operations that may run while the index is still warm.
  */
 export class IntelephenseAdapter implements ServerAdapter {
@@ -21,10 +21,6 @@ export class IntelephenseAdapter implements ServerAdapter {
 
   matches(config: LSPServerConfig): boolean {
     return config.command.some((c: string) => c.includes('intelephense'));
-  }
-
-  isWorkspaceIndexingServer(): boolean {
-    return true;
   }
 
   handleNotification(method: string, _params: unknown, state: ServerState): boolean {
