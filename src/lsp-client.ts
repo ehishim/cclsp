@@ -849,10 +849,21 @@ export class LSPClient {
     const perServer = await Promise.all(
       servers.map(async (serverState) => {
         if (!serverState) return { symbols: [] as SymbolInformation[], confirmed: true };
+        // Skipped before priming, which opens seed documents to warm a project this
+        // server is going to refuse anyway. A YAML or JSON server sharing the root
+        // would otherwise make every name search fail with ITS refusal.
+        if (!supportsMethod(serverState, 'workspace/symbol')) {
+          return { symbols: [] as SymbolInformation[], confirmed: true };
+        }
         try {
           const confirmed = await this.primeWorkspaceSymbolProject(serverState);
           return { symbols: await opsWorkspaceSymbol(serverState, query), confirmed };
         } catch (error) {
+          // Same rule for a server that advertises the capability and refuses only
+          // when asked: unsupported is a fact about that server, never about the symbol.
+          if (error instanceof LspToolOutcomeError && error.outcome.outcome === 'unsupported') {
+            return { symbols: [] as SymbolInformation[], confirmed: true };
+          }
           errors.push(error);
           logger.debug(`[workspaceSymbol] Server failed for query "${query}": ${error}\n`);
           return { symbols: [] as SymbolInformation[], confirmed: false };

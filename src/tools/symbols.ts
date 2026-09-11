@@ -16,6 +16,14 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
+import {
+  PREVIEW_SCHEMA,
+  type PreviewOption,
+  type SourcePreview,
+  createSourcePreview,
+  previewWindow,
+  renderLocationRow,
+} from './source-preview.js';
 
 interface DocumentSymbolOutput {
   name: string;
@@ -204,46 +212,166 @@ export const getDocumentSymbolsTool: ToolDefinition = {
 const NO_MATCH_RECOVERY =
   'Not absence: only loaded files were searched. Repository-wide: ast_search. Or open the file with get_document_symbols, then repeat.';
 
+interface WorkspaceQueryAnswer {
+  query: string;
+  symbols: SymbolInformation[];
+  readinessConfirmed: boolean;
+}
+
+/**
+ * The protocol takes one string and defines no alternation, so `"a|b"` is matched
+ * literally and finds nothing. Several names are therefore several requests whose
+ * answers stay SEPARATE: a merged list would hide which name found nothing, which
+ * is the false absence the caller asked several names to avoid.
+ */
+function normalizeWorkspaceQueries(value: unknown): string[] {
+  const entries = Array.isArray(value) ? value : [value];
+  if (entries.length === 0) throw new Error('query must name at least one symbol');
+  const queries: string[] = [];
+  for (const entry of entries) {
+    if (typeof entry !== 'string' || entry.trim().length === 0) {
+      throw new Error('every query entry must be a non-empty string');
+    }
+    // Entries are kept exactly as asked, duplicates included. Collapsing them
+    // would save one request and silently change the answer: the breakdown would
+    // carry fewer rows than the caller listed, and the shared row bound would be
+    // spent differently, so a caller comparing its array with the result would
+    // find them misaligned with nothing saying why.
+    queries.push(entry);
+  }
+  return queries;
+}
+
+function renderWorkspaceRow(
+  symbol: SymbolInformation,
+  client: Parameters<ToolDefinition['handler']>[1],
+  preview: SourcePreview | null
+): string {
+  const start = symbol.location.range.start;
+  return renderLocationRow(preview, {
+    file: uriToPath(symbol.location.uri),
+    zeroBasedLine: start.line,
+    zeroBasedCharacter: start.character,
+    suffix: ` · ${client.symbolKindToString(symbol.kind)} · ${symbol.name}`,
+  });
+}
+
 export const findWorkspaceSymbolsTool: ToolDefinition = {
   name: 'find_workspace_symbols',
   description:
-    'Search symbols among the files the language server has LOADED, with bounded rows and totals. Not a repository-wide search: use ast_search for that.',
+    'Search symbols BY NAME among the files the language server has LOADED, with bounded rows and totals. Pass an array to ask several names in one call; each name reports its own count. Not a repository-wide search: use ast_search for that.',
   inputSchema: {
     type: 'object',
     properties: {
-      query: { type: 'string', description: 'The symbol name or pattern' },
+      query: {
+        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        description:
+          'The symbol name or pattern. Pass an array to ask several names in one call; each reports its own count, so a zero among them is attributable. The answer is bounded by max_results, not by a name count. Alternation is never interpreted: express several names as separate entries, not as "a|b".',
+      },
       max_results: {
         type: 'number',
-        description: `Rows to return (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})`,
+        description: `Rows to return across every name (default ${DOCUMENT_SYMBOLS_DEFAULT_LIMIT}, max ${DOCUMENT_SYMBOLS_MAX_LIMIT})`,
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['query'],
   },
   handler: async (args, client) => {
-    const { query, max_results } = args as { query: string; max_results?: number };
+    const { query, max_results, preview } = args as {
+      query: unknown;
+      max_results?: number;
+      preview?: boolean | number;
+    };
     try {
-      const { symbols, readinessConfirmed } = await client.workspaceSymbol(query);
-      const selected = symbols.slice(0, boundedResultLimit(max_results));
-      const omitted = symbols.length - selected.length;
+      // Both admissions run before any workspace/symbol request: an invalid width
+      // or name list must cost nothing, not be refused after the scan is paid for.
+      const previewCache = createSourcePreview(preview);
+      const queries = normalizeWorkspaceQueries(query);
+      const limit = boundedResultLimit(max_results);
+      const answers: WorkspaceQueryAnswer[] = await Promise.all(
+        queries.map(async (name) => ({ query: name, ...(await client.workspaceSymbol(name)) }))
+      );
+
+      // The bound applies to the answer as a whole, and it is spent in the order the
+      // caller asked, so a later name is reported as omitted rather than as zero.
+      let remaining = limit;
+      const perQuery = answers.map((answer) => {
+        const selected = answer.symbols.slice(0, Math.max(remaining, 0));
+        remaining -= selected.length;
+        return {
+          query: answer.query,
+          symbols: selected,
+          shown: selected.length,
+          total: answer.symbols.length,
+          omitted: answer.symbols.length - selected.length,
+          readinessConfirmed: answer.readinessConfirmed,
+          // Per name, because the provider answers each request on its own state.
+          // The order matters: a name whose rows exist but were cut by the shared
+          // row bound is `partial`, NEVER `empty` -- calling that zero would be the
+          // false absence this breakdown exists to prevent. Only a name that truly
+          // matched nothing is a scoped negative, and only once its provider is
+          // confirmed answering; before that it is `stale`.
+          outcome:
+            selected.length > 0
+              ? ('ok' as const)
+              : answer.symbols.length > 0
+                ? ('partial' as const)
+                : answer.readinessConfirmed
+                  ? ('empty' as const)
+                  : ('stale' as const),
+        };
+      });
+
+      const selected = perQuery.flatMap((row) => row.symbols);
+      const total = answers.reduce((sum, answer) => sum + answer.symbols.length, 0);
+      const omitted = total - selected.length;
+      const readinessConfirmed = answers.every((answer) => answer.readinessConfirmed);
+      // One name keeps the payload it always spooled; several names spool the same
+      // breakdown the answer reports, so the complete result stays attributable too.
+      const spoolPayload =
+        queries.length === 1 && answers[0]
+          ? { query: answers[0].query, total, symbols: answers[0].symbols }
+          : {
+              queries,
+              total,
+              perQuery: answers.map((answer) => ({
+                query: answer.query,
+                total: answer.symbols.length,
+                symbols: answer.symbols,
+              })),
+            };
       const resultFile =
+        omitted > 0 ? spoolFullResult('find_workspace_symbols', spoolPayload) : null;
+      const omittedLine =
         omitted > 0
-          ? spoolFullResult('find_workspace_symbols', { query, total: symbols.length, symbols })
-          : null;
-      const text =
-        selected.length === 0
-          ? `Workspace symbols (0/0) matching "${query}" · searched LOADED files only`
+          ? [`... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`]
+          : [];
+
+      const single = queries.length === 1 ? perQuery[0] : null;
+      const text = single
+        ? single.shown === 0
+          ? `Workspace symbols (0/0) matching "${single.query}" · searched LOADED files only`
           : [
-              `Workspace symbols (${selected.length}/${symbols.length}) matching "${query}" · provider lsp`,
-              ...selected.map((symbol) => {
-                const start = symbol.location.range.start;
-                return `${uriToPath(symbol.location.uri)}:${start.line + 1}:${start.character + 1} · ${client.symbolKindToString(symbol.kind)} · ${symbol.name}`;
-              }),
-              ...(omitted > 0
-                ? [
-                    `... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`,
-                  ]
-                : []),
-            ].join('\n');
+              `Workspace symbols (${single.shown}/${single.total}) matching "${single.query}" · provider lsp`,
+              ...single.symbols.map((symbol) => renderWorkspaceRow(symbol, client, previewCache)),
+              ...omittedLine,
+            ].join('\n')
+        : [
+            `Workspace symbols (${selected.length}/${total}) matching ${queries.length} names · provider lsp · searched LOADED files only`,
+            ...perQuery.map(
+              (row) =>
+                `  "${row.query}": ${row.total} match(es)${row.total === 0 ? ' — no match among LOADED files' : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
+            ),
+            ...perQuery
+              .filter((row) => row.shown > 0)
+              .flatMap((row) => [
+                '',
+                `"${row.query}"`,
+                ...row.symbols.map((symbol) => renderWorkspaceRow(symbol, client, previewCache)),
+              ]),
+            ...omittedLine,
+          ].join('\n');
+
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
@@ -258,16 +386,24 @@ export const findWorkspaceSymbolsTool: ToolDefinition = {
           provider: 'lsp',
           symbols: selected,
           shown: selected.length,
-          total: symbols.length,
+          total,
           omitted,
+          // One name keeps the shape it always had; several names always carry the
+          // breakdown, because the aggregate alone cannot say which name was zero.
+          ...(single ? {} : { queries, perQuery }),
           recovery:
             omitted > 0
               ? `Read the complete result at ${resultFile ?? '(spool unavailable)'}, or narrow the workspace-symbol query.`
               : selected.length === 0
                 ? NO_MATCH_RECOVERY
-                : readinessConfirmed
-                  ? null
-                  : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
+                : perQuery.some((row) => row.total === 0)
+                  ? `Some names matched nothing among LOADED files: ${perQuery
+                      .filter((row) => row.total === 0)
+                      .map((row) => `"${row.query}"`)
+                      .join(', ')}. ${NO_MATCH_RECOVERY}`
+                  : readinessConfirmed
+                    ? null
+                    : 'The project graph is still loading, so this answer may be incomplete. Retry the same call once it finishes.',
           ...(resultFile ? { resultFile } : {}),
         },
       };
@@ -289,6 +425,7 @@ const positionSchema = {
       type: 'number',
       description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
     },
+    preview: PREVIEW_SCHEMA,
   },
   required: ['file_path'],
 };
@@ -299,6 +436,7 @@ type PositionArgs = {
   line?: number;
   character?: number;
   max_results?: number;
+  preview?: PreviewOption;
 };
 
 export const prepareCallHierarchyTool: ToolDefinition = {
@@ -306,8 +444,17 @@ export const prepareCallHierarchyTool: ToolDefinition = {
   description: 'Get call hierarchy items by symbol query or 1-indexed position.',
   inputSchema: positionSchema,
   handler: async (args, client) => {
-    const { file_path, query, line, character, max_results } = args as PositionArgs;
+    const {
+      file_path,
+      query,
+      line,
+      character,
+      max_results,
+      preview: previewOption,
+    } = args as PositionArgs;
     const absolutePath = resolvePath(file_path);
+    // Before the position lookup and the provider call: an invalid width costs nothing.
+    const preview = createSourcePreview(previewOption);
     try {
       const resolution = await resolveToolPosition(
         absolutePath,
@@ -355,7 +502,11 @@ export const prepareCallHierarchyTool: ToolDefinition = {
             text: `${resolved ? `${resolved}\n\n` : ''}Call hierarchy item(s):\n\n${items
               .map((item) => {
                 const start = item.selectionRange.start;
-                return `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${uriToPath(item.uri)}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`;
+                const file = uriToPath(item.uri);
+                return [
+                  `• ${item.name} (${client.symbolKindToString(item.kind)}) at ${file}:${start.line + 1}:${start.character + 1}${item.detail ? ` - ${item.detail}` : ''}`,
+                  ...previewWindow(preview, file, start.line),
+                ].join('\n');
               })
               .join(
                 '\n'
@@ -390,6 +541,10 @@ async function callHierarchyResult(
   client: Parameters<ToolDefinition['handler']>[1]
 ) {
   const absolutePath = resolvePath(args.file_path);
+  // Admitted before the position lookup and both provider requests: an invalid
+  // width must cost nothing in either direction, and one owner per call keeps
+  // every row after the first in a file free.
+  const preview = createSourcePreview(args.preview);
   const resolution = await resolveToolPosition(
     absolutePath,
     { query: args.query, line: args.line, character: args.character },
@@ -435,15 +590,16 @@ async function callHierarchyResult(
       allCalls.push(call);
       if (selectedCalls.length >= limit) continue;
       selectedCalls.push(call);
-      if (direction === 'incoming' && 'from' in call) {
-        const start = call.from.selectionRange.start;
+      const end = direction === 'incoming' && 'from' in call ? call.from : 'to' in call ? call.to : null;
+      if (end) {
+        const start = end.selectionRange.start;
+        const file = uriToPath(end.uri);
+        const window = previewWindow(preview, file, start.line);
         selectedLines.push(
-          `• ${call.from.name} (${client.symbolKindToString(call.from.kind)}) at ${uriToPath(call.from.uri)}:${start.line + 1}:${start.character + 1}`
-        );
-      } else if (direction === 'outgoing' && 'to' in call) {
-        const start = call.to.selectionRange.start;
-        selectedLines.push(
-          `• ${call.to.name} (${client.symbolKindToString(call.to.kind)}) at ${uriToPath(call.to.uri)}:${start.line + 1}:${start.character + 1}`
+          [
+            `• ${end.name} (${client.symbolKindToString(end.kind)}) at ${file}:${start.line + 1}:${start.character + 1}`,
+            ...window,
+          ].join('\n')
         );
       }
     }

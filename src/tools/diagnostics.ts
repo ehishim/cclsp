@@ -9,6 +9,13 @@ import {
   textResult,
 } from './helpers.js';
 import type { ToolDefinition } from './registry.js';
+import {
+  PREVIEW_SCHEMA,
+  type PreviewOption,
+  type SourcePreview,
+  createSourcePreview,
+  previewWindow,
+} from './source-preview.js';
 
 export const getDiagnosticsTool: ToolDefinition = {
   name: 'get_diagnostics',
@@ -25,12 +32,19 @@ export const getDiagnosticsTool: ToolDefinition = {
         type: 'number',
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, max_results } = args as { file_path: string; max_results?: number };
+    const { file_path, max_results, preview } = args as {
+      file_path: string;
+      max_results?: number;
+      preview?: PreviewOption;
+    };
     const absolutePath = resolvePath(file_path);
+    // Created once per call: every diagnostic in this file reuses the same lines.
+    const source = createSourcePreview(preview);
 
     try {
       const report = await client.getDiagnosticsReport(absolutePath);
@@ -42,7 +56,7 @@ export const getDiagnosticsTool: ToolDefinition = {
           content: [
             {
               type: 'text' as const,
-              text: `${report.reason ?? 'Diagnostics are not current'}${diagnostics.length ? `\n${formatDiagnosticsForFile(file_path, diagnostics)}` : ''}`,
+              text: `${report.reason ?? 'Diagnostics are not current'}${diagnostics.length ? `\n${formatDiagnosticsForFile(file_path, diagnostics, absolutePath, source)}` : ''}`,
             },
           ],
           structuredContent: {
@@ -62,7 +76,7 @@ export const getDiagnosticsTool: ToolDefinition = {
       const text =
         diagnostics.length === 0
           ? `No diagnostics found for ${file_path}. The file has no errors, warnings, or hints.`
-          : `${formatDiagnosticsForFile(file_path, diagnostics)}${omitted > 0 ? `\n\n... ${omitted} omitted. Narrow the file or severity.` : ''}`;
+          : `${formatDiagnosticsForFile(file_path, diagnostics, absolutePath, source)}${omitted > 0 ? `\n\n... ${omitted} omitted. Narrow the file or severity.` : ''}`;
       return {
         content: [{ type: 'text', text }],
         structuredContent: {
@@ -89,7 +103,11 @@ export const getDiagnosticsTool: ToolDefinition = {
         content: [
           {
             type: 'text',
-            text: `Error getting diagnostics: ${reason}${details.diagnostics?.length ? `\nUnverified provider rows:\n${formatDiagnosticsForFile(file_path, details.diagnostics)}` : ''}`,
+            // Unverified rows are still rows about real code, so they carry the
+            // same window: a caller told "these may be stale" still has to look at
+            // what they point to, and dropping the source here would force exactly
+            // the read this answer exists to avoid.
+            text: `Error getting diagnostics: ${reason}${details.diagnostics?.length ? `\nUnverified provider rows:\n${formatDiagnosticsForFile(file_path, details.diagnostics, absolutePath, source)}` : ''}`,
           },
         ],
         structuredContent: {
@@ -137,6 +155,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
         description:
           'Maximum number of files to scan. Default: 50 (CCLSP_MAX_FILES_DEFAULT). Max: 200 (CCLSP_MAX_FILES_LIMIT).',
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['path'],
   },
@@ -146,12 +165,17 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
       pattern,
       severity_filter,
       max_files,
+      preview,
     } = args as {
       path: string;
       pattern?: string;
       severity_filter?: string;
       max_files?: number;
+      preview?: PreviewOption;
     };
+    // One window owner for the whole call: every file is read at most once, and a
+    // hundred diagnostics inside one file cost one read, not a hundred.
+    const source = createSourcePreview(preview);
 
     const absolutePath = resolve(inputPath);
     // The per-call default (when max_files is omitted) and the upper bound are both
@@ -219,7 +243,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
           content: [
             {
               type: 'text' as const,
-              text: `Diagnostics incomplete: ${uncertain.length}/${filePaths.length} files are unverified or unknown.\n${results.map((result) => `${result.filePath}: ${result.status ?? 'current'}${result.reason ? ` — ${result.reason}` : ''}${result.diagnostics.length ? `\n${formatDiagnosticsForFile(result.filePath, result.diagnostics)}` : ''}`).join('\n')}`,
+              text: `Diagnostics incomplete: ${uncertain.length}/${filePaths.length} files are unverified or unknown.\n${results.map((result) => `${result.filePath}: ${result.status ?? 'current'}${result.reason ? ` — ${result.reason}` : ''}${result.diagnostics.length ? `\n${formatDiagnosticsForFile(result.filePath, result.diagnostics, result.filePath, source)}` : ''}`).join('\n')}`,
             },
           ],
           structuredContent: {
@@ -275,7 +299,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
           ? result.filePath.slice(absolutePath.length + 1)
           : result.filePath;
 
-        fileOutputs.push(formatDiagnosticsForFile(displayPath, filtered));
+        fileOutputs.push(formatDiagnosticsForFile(displayPath, filtered, result.filePath, source));
       }
 
       if (totalDiags === 0) {
@@ -357,6 +381,12 @@ const SEVERITY_MAP: Record<number, string> = {
   4: 'Hint',
 };
 
+/**
+ * A diagnostic without its source line is a message about code the reader cannot
+ * see, so acting on it costs a file read every time. The offending line is the
+ * cheapest possible answer to "what is actually written there", and it comes from
+ * the same window owner every other location answer uses.
+ */
 function formatDiagnosticsForFile(
   displayPath: string,
   diagnostics: Array<{
@@ -365,17 +395,25 @@ function formatDiagnosticsForFile(
     source?: string;
     message: string;
     range: { start: { line: number; character: number }; end: { line: number; character: number } };
-  }>
+  }>,
+  sourceFile?: string,
+  source?: SourcePreview | null
 ): string {
   const header = `Found ${diagnostics.length} diagnostic${diagnostics.length === 1 ? '' : 's'} in ${displayPath}:`;
 
   const messages = diagnostics.map((diag) => {
     const severity = diag.severity ? SEVERITY_MAP[diag.severity] || 'Unknown' : 'Unknown';
     const code = diag.code ? ` [${diag.code}]` : '';
-    const source = diag.source ? ` (${diag.source})` : '';
+    const source_ = diag.source ? ` (${diag.source})` : '';
     const { start, end } = diag.range;
+    const window =
+      source && sourceFile ? previewWindow(source, sourceFile, start.line) : ([] as string[]);
 
-    return `• ${severity}${code}${source}: ${diag.message}\n  Location: Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}`;
+    return [
+      `• ${severity}${code}${source_}: ${diag.message}`,
+      `  Location: Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}`,
+      ...window,
+    ].join('\n');
   });
 
   return `${header}\n\n${messages.join('\n\n')}`;

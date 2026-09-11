@@ -4,6 +4,7 @@ import type { Location } from '../lsp/types.js';
 import { resultSpoolDir, spoolFullResult } from '../result-spool.js';
 import { uriToPath } from '../utils.js';
 import type { ToolResult } from './registry.js';
+import { type SourcePreview, renderLocationRow } from './source-preview.js';
 
 /**
  * Row limits are generous on purpose: a caller mapping architecture needs the
@@ -31,13 +32,21 @@ export function resolvePath(filePath: string): string {
   return resolve(filePath);
 }
 
-export function formatLocations(locations: Location[]): string {
+/**
+ * A bare position list is the shape that costs a follow-up read per candidate,
+ * so every location answer carries the same source window by default. The
+ * preview owner is shared with workspace symbols: one window, one cache, one
+ * rendering, whichever tool produced the location.
+ */
+export function formatLocations(locations: Location[], source?: SourcePreview | null): string {
   return locations
-    .map((loc) => {
-      const filePath = uriToPath(loc.uri);
-      const { start } = loc.range;
-      return `${filePath}:${start.line + 1}:${start.character + 1}`;
-    })
+    .map((loc) =>
+      renderLocationRow(source ?? null, {
+        file: uriToPath(loc.uri),
+        zeroBasedLine: loc.range.start.line,
+        zeroBasedCharacter: loc.range.start.character,
+      })
+    )
     .join('\n');
 }
 

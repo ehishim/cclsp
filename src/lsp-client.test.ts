@@ -4,6 +4,7 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LSPClient } from './lsp-client.js';
+import { LspToolOutcomeError } from './lsp/capabilities.js';
 import * as operations from './lsp/operations.js';
 import { pathToUri, uriToPath } from './utils.js';
 
@@ -1492,6 +1493,137 @@ describe('LSPClient', () => {
         { query: 'test' },
         30000
       );
+    });
+
+    it('answers from a capable server while a sibling that cannot do workspace/symbol is skipped', async () => {
+      // Measured through the real Hub: a YAML server sharing the root made EVERY
+      // name search fail with its own refusal while the TypeScript answer was
+      // available. Unsupported is a fact about that server, never about the symbol.
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const seedPath = join(TEST_DIR, 'seed.ts');
+      await writeFile(seedPath, 'export const seed = true;');
+      const symbols = [
+        {
+          name: 'testFunction',
+          kind: 12,
+          location: {
+            uri: pathToUri(MOCK_TEST_TS),
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 20 } },
+          },
+        },
+      ];
+      const capable = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport({ sendRequest: jest.fn().mockResolvedValue(symbols) }),
+        initialized: true,
+        adapter: undefined,
+        documentManager: createMockDocumentManager(),
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: {
+          extensions: ['ts'],
+          command: ['typescript-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
+      };
+      // Refuses exactly as a real yaml-language-server does: the capability is
+      // absent, so the request comes back typed as unsupported.
+      const incapableTransport = createMockTransport({
+        sendRequest: jest.fn().mockRejectedValue(
+          new LspToolOutcomeError({
+            outcome: 'unsupported',
+            code: 'LSP_METHOD_UNSUPPORTED',
+            method: 'workspace/symbol',
+            server: 'yaml-language-server --stdio',
+          })
+        ),
+      });
+      const incapable = {
+        ...capable,
+        // Advertises the capability and still refuses when asked, which is the
+        // shape that actually reached the Hub.
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        transport: incapableTransport,
+        documentManager: createMockDocumentManager(),
+        config: {
+          // Same extensions as the capable server ON PURPOSE: seed files exist for
+          // it, so if priming ran it would really open documents. A server whose
+          // extensions match nothing in the root would hide that cost.
+          extensions: ['ts'],
+          command: ['yaml-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
+      };
+      (client as any).serverManager.getRunningServers().set('yaml', incapable);
+      (client as any).serverManager.getRunningServers().set('ts', capable);
+
+      const result = await client.workspaceSymbol('test');
+
+      expect(result.symbols).toEqual(symbols);
+      // Its refusal must neither surface as the answer nor make it look incomplete.
+      expect(result.readinessConfirmed).toBe(true);
+    });
+
+    it('never primes a server that cannot answer workspace/symbol', async () => {
+      // Priming opens seed documents and waits for the project to warm. Doing that
+      // for a server that is going to refuse the query spends the expensive half of
+      // the call for nothing, and the refusal arrives afterwards either way.
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const seedPath = join(TEST_DIR, 'seed.ts');
+      await writeFile(seedPath, 'export const seed = true;');
+      const symbols = [
+        {
+          name: 'testFunction',
+          kind: 12,
+          location: {
+            uri: pathToUri(MOCK_TEST_TS),
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 20 } },
+          },
+        },
+      ];
+      const base = {
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        initialized: true,
+        adapter: undefined,
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: {
+          extensions: ['ts'],
+          command: ['typescript-language-server', '--stdio'],
+          rootDir: TEST_DIR,
+        },
+      };
+      const capable = {
+        ...base,
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        transport: createMockTransport({ sendRequest: jest.fn().mockResolvedValue(symbols) }),
+        documentManager: createMockDocumentManager(),
+      };
+      const unsupportedTransport = createMockTransport({
+        sendRequest: jest.fn().mockResolvedValue([]),
+      });
+      const unsupportedDocuments = createMockDocumentManager();
+      const unsupported = {
+        ...base,
+        // The capability is simply absent, as it is on a YAML or JSON server.
+        serverCapabilities: { documentSymbolProvider: true },
+        transport: unsupportedTransport,
+        documentManager: unsupportedDocuments,
+      };
+      (client as any).serverManager.getRunningServers().set('unsupported', unsupported);
+      (client as any).serverManager.getRunningServers().set('ts', capable);
+
+      const result = await client.workspaceSymbol('test');
+
+      expect(result.symbols).toEqual(symbols);
+      // Untouched: no seed document opened, no request sent, and its silence does
+      // not make the answer look incomplete.
+      expect(unsupportedDocuments.acquire).not.toHaveBeenCalled();
+      expect(unsupportedTransport.sendRequest).not.toHaveBeenCalled();
+      expect(result.readinessConfirmed).toBe(true);
+      // The capable sibling was primed and asked, so the skip is selective.
+      expect(capable.documentManager.acquire).toHaveBeenCalledWith(seedPath);
     });
 
     it('should return empty array when no servers running', async () => {

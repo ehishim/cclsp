@@ -2,6 +2,13 @@ import { AST_LANGUAGES, type AstPatternReport, type AstSearchOutcome } from '../
 import { codeRewriteTool } from './code-rewrite.js';
 import { INLINE_RESULT_BYTES, spoolFullResult } from './helpers.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
+import {
+  PREVIEW_SCHEMA,
+  type PreviewOption,
+  type SourcePreview,
+  createSourcePreview,
+  previewSpan,
+} from './source-preview.js';
 
 /**
  * The two incomplete-file codes mean opposite things to a reader, so the text
@@ -39,7 +46,18 @@ function renderPatternBreakdown(perPattern: AstPatternReport[] | undefined): str
   return only?.note ? renderPatternRow(only) : '';
 }
 
-function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'partial' }>): string {
+/**
+ * A bare-name pattern matches the identifier NODE, so `match.text` is the name the
+ * caller already typed -- a row that costs a file read to interpret. Every match
+ * therefore renders through the one window owner: a name gains the line it sits
+ * on, a shape gains numbered lines plus its surroundings, and both are citable by
+ * line without recounting. `match.text` remains the fallback when the window
+ * cannot be built, so a match is never lost to an unreadable file.
+ */
+function renderMatches(
+  result: Extract<AstSearchOutcome, { outcome: 'ok' | 'partial' }>,
+  preview: SourcePreview | null
+): string {
   return result.matches
     .map((match) => {
       const start = match.range.start;
@@ -50,12 +68,15 @@ function renderMatches(result: Extract<AstSearchOutcome, { outcome: 'ok' | 'part
         })
         .join('\n');
       const origin = match.recovered ? ' (recovered file)' : '';
-      return `${match.file}:${start.line + 1}:${start.character + 1}${origin}\n${match.text}${captures ? `\n${captures}` : ''}`;
+      const head = `${match.file}:${start.line + 1}:${start.character + 1}${origin}`;
+      const window = previewSpan(preview, match.file, start.line, match.range.end.line);
+      const body = window.length ? window.join('\n') : match.text;
+      return `${head}\n${body}${captures ? `\n${captures}` : ''}`;
     })
     .join('\n\n');
 }
 
-function renderText(result: AstSearchOutcome): string {
+function renderText(result: AstSearchOutcome, preview: SourcePreview | null): string {
   if (result.outcome === 'rejected') return `${result.code}: ${result.reason}`;
   if (result.outcome === 'partial') {
     const header = `${result.code}: AST search (${result.provider}, ${result.language}) searched ${result.filesScanned} file(s) but cannot prove absence: ${result.parseFailureCount} file(s) did not parse completely; ${result.filesSkippedOversized} oversized file(s) skipped; indexCapped=${result.indexCapped}.`;
@@ -74,7 +95,7 @@ function renderText(result: AstSearchOutcome): string {
     ]
       .filter(Boolean)
       .join('\n');
-    return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result)}`;
+    return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result, preview)}`;
   }
   const header = [
     `AST search (${result.provider}, ${result.language})`,
@@ -83,10 +104,10 @@ function renderText(result: AstSearchOutcome): string {
   ].join(' — ');
   const breakdown = renderPatternBreakdown(result.perPattern);
   const summary = breakdown ? `${header}\n${breakdown}` : header;
-  return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result)}`;
+  return result.matches.length === 0 ? summary : `${summary}\n\n${renderMatches(result, preview)}`;
 }
 
-function toolResult(result: AstSearchOutcome): ToolResult {
+function toolResult(result: AstSearchOutcome, preview: SourcePreview | null): ToolResult {
   // Presentation bounds redirect to complete bytes, never trim match/capture text.
   if (Buffer.byteLength(JSON.stringify(result), 'utf8') > INLINE_RESULT_BYTES) {
     const resultFile = spoolFullResult('ast_search', result);
@@ -118,7 +139,7 @@ function toolResult(result: AstSearchOutcome): ToolResult {
     };
   }
   return {
-    content: [{ type: 'text', text: renderText(result) }],
+    content: [{ type: 'text', text: renderText(result, preview) }],
     structuredContent: { ...result },
     ...(result.outcome !== 'ok' ? { isError: true } : {}),
   };
@@ -152,17 +173,25 @@ export const astSearchTool: ToolDefinition = {
         description:
           'Optional positive result limit. Omit for all matches; large complete results are spooled.',
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['pattern', 'language'],
   },
   handler: async (args, client) => {
-    const { pattern, language, path, max_results } = args as {
+    const { pattern, language, path, max_results, preview } = args as {
       pattern: string | string[];
       language: string;
       path?: string;
       max_results?: number;
+      preview?: PreviewOption;
     };
-    return toolResult(await client.astSearch({ pattern, language, path, maxResults: max_results }));
+    // Built first on purpose: an invalid preview width must be refused before the
+    // scan runs, not after the expensive part of the answer is already paid for.
+    const window = createSourcePreview(preview);
+    return toolResult(
+      await client.astSearch({ pattern, language, path, maxResults: max_results }),
+      window
+    );
   },
 };
 

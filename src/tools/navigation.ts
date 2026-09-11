@@ -16,6 +16,11 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
+import {
+  PREVIEW_SCHEMA,
+  type PreviewOption,
+  createSourcePreview,
+} from './source-preview.js';
 
 type NavigationSelector =
   | { outcome: 'name'; symbolName: string; symbolKind?: string }
@@ -110,19 +115,24 @@ export const findDefinitionTool: ToolDefinition = {
         type: 'number',
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, symbol_name, symbol_kind, line, character } = args as {
+    const { file_path, symbol_name, symbol_kind, line, character, preview } = args as {
       file_path: string;
       symbol_name?: string;
       symbol_kind?: string;
       line?: number;
       character?: number;
       max_results?: number;
+      preview?: PreviewOption;
     };
     const maxResults = boundedResultLimit((args as { max_results?: number }).max_results);
+    // Built before any provider request: an invalid preview width must cost
+    // nothing, and one owner per call keeps every row after the first free.
+    const window = createSourcePreview(preview);
     const absolutePath = resolvePath(file_path);
     const selector = selectNavigationArgs({ symbol_name, symbol_kind, line, character });
     if (selector.outcome === 'invalid') return invalidNavigationSelector(selector, file_path);
@@ -151,7 +161,7 @@ export const findDefinitionTool: ToolDefinition = {
             : null;
         const text =
           selected.length > 0
-            ? `Found ${selected.length}/${locations.length} definition(s) at ${selector.line}:${selector.character} (lsp):\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            ? `Found ${selected.length}/${locations.length} definition(s) at ${selector.line}:${selector.character} (lsp):\n${formatLocations(selected, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
             : `No definitions found at ${file_path}:${selector.line}:${selector.character} (lsp).`;
         return {
           content: [{ type: 'text', text }],
@@ -199,7 +209,7 @@ export const findDefinitionTool: ToolDefinition = {
           : null;
       const text =
         selected.length > 0
-          ? `Found ${selected.length}/${result.value.length} definition(s) for "${symbolName}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+          ? `Found ${selected.length}/${result.value.length} definition(s) for "${symbolName}" (${result.provider}):\n${result.provider === 'lsp' && result.matchedDescriptions?.length ? `${result.matchedDescriptions.join(', ')}\n` : ''}${formatLocations(selected, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
           : result.provider === 'lsp' && result.matchedSymbols === 0
             ? `No symbols found with name "${symbolName}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${file_path}.`
             : `Found ${result.provider === 'lsp' ? (result.matchedSymbols ?? 0) : 0} symbol(s) but no definitions could be retrieved (${result.provider}).`;
@@ -281,6 +291,7 @@ export const findReferencesTool: ToolDefinition = {
         type: 'number',
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['file_path'],
   },
@@ -293,6 +304,7 @@ export const findReferencesTool: ToolDefinition = {
       character,
       include_declaration = true,
       max_results,
+      preview,
     } = args as {
       file_path: string;
       symbol_name?: string;
@@ -301,8 +313,12 @@ export const findReferencesTool: ToolDefinition = {
       character?: number;
       include_declaration?: boolean;
       max_results?: number;
+      preview?: PreviewOption;
     };
     const maxResults = boundedResultLimit(max_results);
+    // Built before any provider request: an invalid preview width must cost
+    // nothing, and one owner per call keeps every row after the first free.
+    const window = createSourcePreview(preview);
     const absolutePath = resolvePath(file_path);
     const selector = selectNavigationArgs({ symbol_name, symbol_kind, line, character });
     if (selector.outcome === 'invalid') return invalidNavigationSelector(selector, file_path);
@@ -335,7 +351,7 @@ export const findReferencesTool: ToolDefinition = {
             : null;
         const text =
           selected.length > 0
-            ? `References (${selected.length}/${locations.length}) at ${selector.line}:${selector.character}:\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            ? `References (${selected.length}/${locations.length}) at ${selector.line}:${selector.character}:\n${formatLocations(selected, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
             : `No references found at ${file_path}:${selector.line}:${selector.character} (lsp).`;
         return {
           content: [{ type: 'text', text }],
@@ -422,7 +438,7 @@ export const findReferencesTool: ToolDefinition = {
       selected.length > 0
         ? withWarning(
             warning,
-            `References (${selected.length}/${total}) for "${symbolName}":\n${formatLocations(selected)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            `References (${selected.length}/${total}) for "${symbolName}":\n${formatLocations(selected, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
           )
         : withWarning(
             warning,
@@ -464,17 +480,21 @@ export const findImplementationTool: ToolDefinition = {
         type: 'number',
         description: `Rows to return (default ${SEMANTIC_DEFAULT_LIMIT}, max ${SEMANTIC_MAX_LIMIT})`,
       },
+      preview: PREVIEW_SCHEMA,
     },
     required: ['file_path'],
   },
   handler: async (args, client) => {
-    const { file_path, query, line, character, max_results } = args as {
+    const { file_path, query, line, character, max_results, preview } = args as {
       file_path: string;
       query?: string;
       line?: number;
       character?: number;
       max_results?: number;
+      preview?: PreviewOption;
     };
+    // Same rule here: refuse an invalid width before the implementation lookup.
+    const window = createSourcePreview(preview);
     const absolutePath = resolvePath(file_path);
     try {
       const resolution = await resolveToolPosition(
@@ -521,7 +541,7 @@ export const findImplementationTool: ToolDefinition = {
         content: [
           {
             type: 'text',
-            text: `${resolved ? `${resolved}\n\n` : ''}Implementations (${locations.length}/${allLocations.length}):\n\n${formatLocations(locations)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`,
+            text: `${resolved ? `${resolved}\n\n` : ''}Implementations (${locations.length}/${allLocations.length}):\n\n${formatLocations(locations, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`,
           },
         ],
         structuredContent: {

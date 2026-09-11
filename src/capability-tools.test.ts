@@ -1,16 +1,24 @@
 import { describe, expect, it, jest } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
 import { LspToolOutcomeError } from './lsp/capabilities.js';
+import { astSearchTool } from './tools/ast-search.js';
 import { getDiagnosticsTool } from './tools/diagnostics.js';
 import { getHoverTool } from './tools/hover.js';
 import { getCodeActionsTool, getCompletionsTool } from './tools/language-features.js';
 import { findReferencesTool } from './tools/navigation.js';
 import { renameFileTool } from './tools/refactoring.js';
 import { type ToolDefinition, boundToolResult, registerTools } from './tools/registry.js';
-import { findWorkspaceSymbolsTool, getDocumentSymbolsTool } from './tools/symbols.js';
+import {
+  findWorkspaceSymbolsTool,
+  getDocumentSymbolsTool,
+  getIncomingCallsTool,
+  getOutgoingCallsTool,
+  prepareCallHierarchyTool,
+} from './tools/symbols.js';
 import { pathToUri } from './utils.js';
 
 function asClient(value: Record<string, unknown>): LSPClient {
@@ -298,6 +306,43 @@ describe('capability tool contracts', () => {
     expect(result.content[0]?.text).toContain('/workspace/src/b.ts:9:3');
   });
 
+  it('follows every reference row with its source window, so no follow-up read is needed', async () => {
+    // The measured shape this replaces: 100 reference rows, each a bare position,
+    // and the very next action was a Read of the file they pointed at.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-refs-'));
+    const file = join(dir, 'caller.ts');
+    writeFileSync(file, 'import { answer } from "./a.js";\n\nexport const used = answer();\nconst tail = 1;\n');
+    try {
+      const locations = [
+        {
+          uri: pathToUri(file),
+          range: { start: { line: 2, character: 21 }, end: { line: 2, character: 27 } },
+        },
+      ];
+      const client = asClient({
+        findSymbolsByName: jest.fn().mockResolvedValue({
+          matches: [{ name: 'answer', kind: 12, position: { line: 0, character: 0 } }],
+        }),
+        findReferences: jest.fn().mockResolvedValue(locations),
+        symbolKindToString: () => 'function',
+      });
+      const result = await findReferencesTool.handler(
+        { file_path: file, symbol_name: 'answer' },
+        client
+      );
+      expect(result.content[0]?.text).toContain('export const used = answer();');
+
+      const bare = await findReferencesTool.handler(
+        { file_path: file, symbol_name: 'answer', preview: false },
+        client
+      );
+      expect(bare.content[0]?.text).not.toContain('export const used = answer();');
+      expect(bare.content[0]?.text).toContain(':3:22');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('bounds workspace symbols with canonical totals and recovery', async () => {
     const symbols = ['alpha', 'beta', 'gamma'].map((name, index) => ({
       name,
@@ -327,6 +372,264 @@ describe('capability tool contracts', () => {
     const spooled = (result.structuredContent as any).resultFile as string;
     expect(result.content[0]?.text).toContain(spooled);
     expect(JSON.parse(readFileSync(spooled, 'utf8')).symbols).toHaveLength(3);
+  });
+
+  it('answers several names in one call and keeps every count attributable', async () => {
+    // The turn cost, not the server cost, is what several names used to spend: one
+    // call per name. A merged answer would trade that for a worse defect -- a zero
+    // nobody can attribute -- so every name reports its own count.
+    const symbolFor = (name: string) => ({
+      name,
+      kind: 13,
+      location: {
+        uri: `file:///workspace/src/${name}.ts`,
+        range: { start: { line: 0, character: 0 }, end: { line: 0, character: name.length } },
+      },
+    });
+    const workspaceSymbol = jest.fn(async (query: string) => ({
+      symbols: query === 'present' ? [symbolFor('present')] : [],
+      readinessConfirmed: true,
+    }));
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: ['present', 'absent'] },
+      asClient({ workspaceSymbol, symbolKindToString: () => 'variable' })
+    );
+
+    // One request per name: the protocol takes one string and defines no alternation.
+    expect(workspaceSymbol.mock.calls.map((call) => call[0])).toEqual(['present', 'absent']);
+    expect(result.structuredContent).toMatchObject({ outcome: 'ok', shown: 1, total: 1 });
+    expect((result.structuredContent as any).perQuery).toMatchObject([
+      { query: 'present', shown: 1, total: 1, outcome: 'ok' },
+      { query: 'absent', shown: 0, total: 0, outcome: 'empty' },
+    ]);
+    // The absent name must stay visible in the text a reader actually meets, and
+    // its zero must still route to the tier that can prove repository absence.
+    expect(result.content[0]?.text).toContain('"absent": 0 match(es)');
+    expect((result.structuredContent as any).recovery).toContain('"absent"');
+    expect((result.structuredContent as any).recovery).toContain('ast_search');
+  });
+
+  it('carries each row\'s declaration line by default, and drops it only on request', async () => {
+    // Without the line, a row says only WHERE a name the caller already knew is,
+    // so choosing between candidates costs a file read each. One line answers it.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-preview-'));
+    const file = join(dir, 'health.ts');
+    writeFileSync(file, 'const other = 1;\nexport function HealthView(props: Props) {\n  return null;\n}\n');
+    try {
+      const symbols = [
+        {
+          name: 'HealthView',
+          kind: 12,
+          location: {
+            uri: pathToUri(file),
+            range: { start: { line: 1, character: 16 }, end: { line: 1, character: 26 } },
+          },
+        },
+      ];
+      const client = asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols, readinessConfirmed: true }),
+        symbolKindToString: () => 'function',
+      });
+
+      const withPreview = await findWorkspaceSymbolsTool.handler({ query: 'HealthView' }, client);
+      expect(withPreview.content[0]?.text).toContain('export function HealthView(props: Props) {');
+
+      const withoutPreview = await findWorkspaceSymbolsTool.handler(
+        { query: 'HealthView', preview: false },
+        client
+      );
+      expect(withoutPreview.content[0]?.text).not.toContain('export function HealthView(props');
+      expect(withoutPreview.content[0]?.text).toContain('HealthView');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('renders the window in the grep convention, contiguously, marking the matched span', async () => {
+    // One rendering owner, one convention: `:` is a matched line and `-` is context,
+    // the same shape `path:line:col` already uses above it. A per-tool marker is
+    // exactly the drift this owner exists to prevent, so the format is pinned here.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-window-'));
+    const file = join(dir, 'shape.ts');
+    writeFileSync(file, 'const before = 1;\n\nexport function target() {\n  return 2;\n}\n\nconst after = 3;\n');
+    try {
+      const symbols = [
+        {
+          name: 'target',
+          kind: 12,
+          location: {
+            uri: pathToUri(file),
+            range: { start: { line: 2, character: 16 }, end: { line: 4, character: 1 } },
+          },
+        },
+      ];
+      const result = await findWorkspaceSymbolsTool.handler(
+        { query: 'target' },
+        asClient({
+          workspaceSymbol: jest.fn().mockResolvedValue({ symbols, readinessConfirmed: true }),
+          symbolKindToString: () => 'function',
+        })
+      );
+      const lines = (result.content[0]?.text ?? '').split('\n');
+      expect(lines).toContain('  1- const before = 1;');
+      // The blank line is rendered, not skipped: a gap in the numbering reads as a
+      // defect and saves nothing measurable.
+      expect(lines).toContain('  2- ');
+      expect(lines).toContain('  3: export function target() {');
+      // A symbol row marks its declaration line, not its whole body: marking the
+      // span would print every line of a two-hundred-line function to say where it
+      // starts, which is the opposite of the read this window replaces.
+      expect(lines).toContain('  4-   return 2;');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a row whose file cannot be read, and only loses its preview', async () => {
+    // The preview is an enrichment. Losing the answer because a path moved would
+    // turn a real match into a silent absence, which is the worse failure.
+    const symbols = [
+      {
+        name: 'Gone',
+        kind: 12,
+        location: {
+          uri: 'file:///workspace/does-not-exist.ts',
+          range: { start: { line: 4, character: 0 }, end: { line: 4, character: 4 } },
+        },
+      },
+    ];
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'Gone' },
+      asClient({
+        workspaceSymbol: jest.fn().mockResolvedValue({ symbols, readinessConfirmed: true }),
+        symbolKindToString: () => 'function',
+      })
+    );
+    expect(result.structuredContent).toMatchObject({ outcome: 'ok', shown: 1 });
+    expect(result.content[0]?.text).toContain('/workspace/does-not-exist.ts:5:1');
+  });
+
+  it('keeps duplicate names as asked, so the breakdown lines up with the caller\'s array', async () => {
+    // Collapsing ['same','same'] would save one request and silently return fewer
+    // rows than the caller listed, spending the shared bound differently. A caller
+    // comparing its array with the answer would find them misaligned and nothing
+    // in the answer would say why.
+    const asked: string[] = [];
+    const workspaceSymbol = jest.fn(async (query: string) => {
+      asked.push(query);
+      return { symbols: [], readinessConfirmed: true };
+    });
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: ['same', 'same', 'other'] },
+      asClient({ workspaceSymbol, symbolKindToString: () => 'variable' })
+    );
+    expect(asked).toEqual(['same', 'same', 'other']);
+    expect((result.structuredContent as any).perQuery.map((row: any) => row.query)).toEqual([
+      'same',
+      'same',
+      'other',
+    ]);
+  });
+
+  it('refuses a malformed name list before issuing any provider request', async () => {
+    const workspaceSymbol = jest.fn();
+    for (const query of [[], ['ok', '   '], ['ok', 42]]) {
+      await expect(
+        findWorkspaceSymbolsTool.handler(
+          { query },
+          asClient({ workspaceSymbol, symbolKindToString: () => 'variable' })
+        )
+      ).rejects.toThrow();
+    }
+    expect(workspaceSymbol).not.toHaveBeenCalled();
+  });
+
+  it('keeps one name answering exactly as it did before the batch form existed', async () => {
+    const workspaceSymbol = jest.fn().mockResolvedValue({
+      symbols: [
+        {
+          name: 'alpha',
+          kind: 13,
+          location: {
+            uri: 'file:///workspace/src/alpha.ts',
+            range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } },
+          },
+        },
+      ],
+      readinessConfirmed: true,
+    });
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: 'alpha' },
+      asClient({ workspaceSymbol, symbolKindToString: () => 'variable' })
+    );
+    expect(result.content[0]?.text).toContain('matching "alpha"');
+    // No breakdown for one name: the header already carries its count, and a
+    // second copy of it is noise in every single-name answer ever returned.
+    expect((result.structuredContent as any).perQuery).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({ outcome: 'ok', shown: 1, total: 1 });
+  });
+
+  it('bounds a long name list by rows, not by an invented name ceiling', async () => {
+    // No cap on how many names one call may ask: `max_results` already bounds the
+    // ANSWER, and a name count refused at 21 would be a number nothing measured.
+    const names = Array.from({ length: 50 }, (_, index) => `name${index}`);
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: names, max_results: 1 },
+      asClient({
+        workspaceSymbol: jest.fn(async (query: string) => ({
+          symbols: [
+            {
+              name: query,
+              kind: 13,
+              location: {
+                uri: `file:///workspace/src/${query}.ts`,
+                range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+              },
+            },
+          ],
+          readinessConfirmed: true,
+        })),
+        symbolKindToString: () => 'variable',
+      })
+    );
+    expect((result.structuredContent as any).perQuery).toHaveLength(50);
+    expect(result.structuredContent).toMatchObject({ shown: 1, total: 50, omitted: 49 });
+    const spooled = (result.structuredContent as any).resultFile as string;
+    rmSync(spooled, { force: true });
+  });
+
+  it('spends the row bound in asked order, so a later name is omitted rather than zero', async () => {
+    // The dangerous failure is silent: if the bound simply truncated the merged
+    // list, the last name would read as a clean zero instead of an unread answer.
+    const rowsFor = (name: string, count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        name: `${name}${index}`,
+        kind: 13,
+        location: {
+          uri: `file:///workspace/src/${name}${index}.ts`,
+          range: { start: { line: index, character: 0 }, end: { line: index, character: 3 } },
+        },
+      }));
+    const result = await findWorkspaceSymbolsTool.handler(
+      { query: ['first', 'second'], max_results: 2 },
+      asClient({
+        workspaceSymbol: jest.fn(async (query: string) => ({
+          symbols: rowsFor(query, query === 'first' ? 2 : 3),
+          readinessConfirmed: true,
+        })),
+        symbolKindToString: () => 'variable',
+      })
+    );
+    expect((result.structuredContent as any).perQuery).toMatchObject([
+      { query: 'first', shown: 2, omitted: 0, outcome: 'ok' },
+      // Rows exist and were cut by the SHARED bound, so this name is partial.
+      // Reporting it as `empty` would be the false zero the breakdown prevents.
+      { query: 'second', shown: 0, total: 3, omitted: 3, outcome: 'partial' },
+    ]);
+    expect(result.structuredContent).toMatchObject({ shown: 2, total: 5, omitted: 3 });
+    const spooled = (result.structuredContent as any).resultFile as string;
+    expect(JSON.parse(readFileSync(spooled, 'utf8')).perQuery).toHaveLength(2);
+    rmSync(spooled, { force: true });
   });
 
   it('reports zero rows as a SCOPED empty only when the provider is confirmed answering', async () => {
@@ -381,6 +684,304 @@ describe('capability tool contracts', () => {
     );
     expect(result.structuredContent).toMatchObject({ outcome: 'ok', shown: 1 });
     expect((result.structuredContent as any).readinessConfirmed).toBe(false);
+  });
+
+  it('carries the offending source line with a diagnostic, reading each file once', async () => {
+    // A diagnostic without its line is a message about code the reader cannot see,
+    // so acting on it costs a read every time. Many diagnostics in one file must
+    // still cost ONE read: the window owner is created per call, not per row.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-diag-'));
+    const file = join(dir, 'broken.ts');
+    writeFileSync(file, 'const a = 1;\nconst b: string = 2;\nconst c: number = "x";\nconst d = 4;\n');
+    try {
+      const diagnostics = [
+        { severity: 1, message: 'not assignable', range: { start: { line: 1, character: 6 }, end: { line: 1, character: 7 } } },
+        { severity: 1, message: 'not assignable', range: { start: { line: 2, character: 6 }, end: { line: 2, character: 7 } } },
+      ];
+      const result = await getDiagnosticsTool.handler(
+        { file_path: file },
+        asClient({
+          getDiagnosticsReport: jest
+            .fn()
+            .mockResolvedValue({ diagnostics, freshness: { status: 'current' } }),
+        })
+      );
+      const text = result.content[0]?.text ?? '';
+      expect(text).toContain('const b: string = 2;');
+      expect(text).toContain('const c: number = "x";');
+      // The matched line is marked, so a reader never counts lines to find it.
+      expect(text).toContain('2:');
+
+      const positionsOnly = await getDiagnosticsTool.handler(
+        { file_path: file, preview: false },
+        asClient({
+          getDiagnosticsReport: jest
+            .fn()
+            .mockResolvedValue({ diagnostics, freshness: { status: 'current' } }),
+        })
+      );
+      expect(positionsOnly.content[0]?.text).not.toContain('const b: string = 2;');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps the window on unverified and stale diagnostic rows, not just on current ones', async () => {
+    // A row marked "may be stale" still points at real code, and the caller still
+    // has to look at it. Dropping the window on the failure path would force the
+    // exact read this answer exists to replace, precisely when the caller is least
+    // sure what is going on.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-stale-'));
+    const file = join(dir, 'unverified.ts');
+    writeFileSync(file, 'const head = 0;\nconst suspect: number = "text";\nconst tail = 2;\n');
+    try {
+      const rows = [
+        {
+          severity: 1,
+          message: 'not assignable',
+          range: { start: { line: 1, character: 6 }, end: { line: 1, character: 13 } },
+        },
+      ];
+      // The freshness-unknown path: the provider answered, but nothing certifies it.
+      const staleResult = await getDiagnosticsTool.handler(
+        { file_path: file },
+        asClient({
+          getDiagnosticsReport: jest
+            .fn()
+            .mockResolvedValue({ diagnostics: rows, freshness: { status: 'unknown' } }),
+        })
+      );
+      expect(staleResult.structuredContent).toMatchObject({ outcome: 'stale' });
+      expect(staleResult.content[0]?.text).toContain('const suspect: number = "text";');
+
+      // The throw path, where the provider hands back rows it cannot verify.
+      const thrown = Object.assign(new Error('LSP_DIAGNOSTICS_UNKNOWN: provider is indexing'), {
+        diagnostics: rows,
+        status: 'unknown',
+      });
+      const errorResult = await getDiagnosticsTool.handler(
+        { file_path: file },
+        asClient({
+          getDiagnosticsReport: jest.fn().mockRejectedValue(thrown),
+        })
+      );
+      expect(errorResult.structuredContent).toMatchObject({ outcome: 'stale' });
+      expect(errorResult.content[0]?.text).toContain('Unverified provider rows:');
+      expect(errorResult.content[0]?.text).toContain('const suspect: number = "text";');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('renders ast_search matches through the shared window and admits its width first', async () => {
+    // The structural tier is the one that answers when no language server can, so
+    // its rows carry the same window as every semantic row -- and its admission is
+    // owed at the same place, before the scan that is the expensive part.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-ast-'));
+    const file = join(dir, 'shape.ts');
+    writeFileSync(file, 'const before = 0;\nexport const target = 1;\nconst after = 2;\n');
+    try {
+      const scans: unknown[] = [];
+      const client = asClient({
+        astSearch: jest.fn(async (input: unknown) => {
+          scans.push(input);
+          return {
+            outcome: 'ok',
+            provider: 'tree-sitter',
+            language: 'typescript',
+            filesScanned: 1,
+            truncated: false,
+            indexCapped: false,
+            perPattern: [{ pattern: 'target', matches: 1, completeness: 'exact' }],
+            matches: [
+              {
+                file,
+                range: { start: { line: 1, character: 13 }, end: { line: 1, character: 19 } },
+                text: 'target',
+                captures: [],
+                recovered: false,
+              },
+            ],
+          };
+        }),
+      });
+
+      const ok = await astSearchTool.handler(
+        { pattern: 'target', language: 'typescript' },
+        client
+      );
+      // A bare name matches the identifier node, so its text is the name the caller
+      // already typed; the window is what makes the row worth reading.
+      expect(ok.content[0]?.text).toContain('  2: export const target = 1;');
+      expect(ok.content[0]?.text).toContain('  1- const before = 0;');
+
+      const bare = await astSearchTool.handler(
+        { pattern: 'target', language: 'typescript', preview: false },
+        client
+      );
+      expect(bare.content[0]?.text).not.toContain('const before = 0;');
+      expect(bare.content[0]?.text).toContain('target');
+
+      const scansBefore = scans.length;
+      await expect(
+        astSearchTool.handler({ pattern: 'target', language: 'typescript', preview: -4 }, client)
+      ).rejects.toThrow();
+      // The refusal must cost no scan: that is the expensive half of this answer.
+      expect(scans.length).toBe(scansBefore);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks every line of a multi-line ast_search match, and only those lines', async () => {
+    // A shape pattern spans several lines, so the end line must reach the window.
+    // A single-line fixture cannot see that: passing start.line twice would render
+    // identically and the regression would ship. The blank line inside the span is
+    // deliberate -- it must be marked as part of the match, while the blank line
+    // outside it must be rendered as context, not skipped.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-span-'));
+    const file = join(dir, 'span.ts');
+    writeFileSync(
+      file,
+      [
+        'const before = 0;',
+        '',
+        'export function target() {',
+        '',
+        '  return 1;',
+        '}',
+        '',
+        'const after = 2;',
+        '',
+      ].join('\n')
+    );
+    try {
+      const client = asClient({
+        astSearch: jest.fn(async () => ({
+          outcome: 'ok',
+          provider: 'tree-sitter',
+          language: 'typescript',
+          filesScanned: 1,
+          truncated: false,
+          indexCapped: false,
+          perPattern: [{ pattern: 'function $NAME() { $$$BODY }', matches: 1, completeness: 'exact' }],
+          matches: [
+            {
+              file,
+              // Lines 3..6 one-indexed: the whole declaration, blank line included.
+              range: { start: { line: 2, character: 0 }, end: { line: 5, character: 1 } },
+              text: 'export function target() {\n\n  return 1;\n}',
+              captures: [],
+              recovered: false,
+            },
+          ],
+        })),
+      });
+
+      const result = await astSearchTool.handler(
+        { pattern: 'function $NAME() { $$$BODY }', language: 'typescript', preview: 1 },
+        client
+      );
+      const lines = (result.content[0]?.text ?? '').split('\n');
+      // Context above, then every line of the span marked, then context below.
+      expect(lines).toContain('  2- ');
+      expect(lines).toContain('  3: export function target() {');
+      expect(lines).toContain('  4: ');
+      expect(lines).toContain('  5:   return 1;');
+      expect(lines).toContain('  6: }');
+      expect(lines).toContain('  7- ');
+      // Nothing beyond the window, and no line outside the span wearing the mark.
+      expect(lines).not.toContain('  8- const after = 2;');
+      expect(lines.filter((line) => line.trimStart().startsWith('8:'))).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an invalid preview width BEFORE the provider is asked anything', async () => {
+    // A refusal issued after the scan has already run costs the whole expensive
+    // part of the answer. Every location tool admits the width at entry, so the
+    // provider call count for an invalid width is exactly zero.
+    const calls: string[] = [];
+    const client = asClient({
+      getDiagnosticsReport: jest.fn(async () => {
+        calls.push('diagnostics');
+        return { diagnostics: [], freshness: { status: 'current' } };
+      }),
+      workspaceSymbol: jest.fn(async () => {
+        calls.push('workspaceSymbol');
+        return { symbols: [], readinessConfirmed: true };
+      }),
+      findSymbolsByName: jest.fn(async () => {
+        calls.push('findSymbolsByName');
+        return { matches: [] };
+      }),
+      findReferences: jest.fn(async () => {
+        calls.push('findReferences');
+        return [];
+      }),
+      prepareCallHierarchy: jest.fn(async () => {
+        calls.push('prepareCallHierarchy');
+        return [];
+      }),
+      incomingCalls: jest.fn(async () => {
+        calls.push('incomingCalls');
+        return [];
+      }),
+      outgoingCalls: jest.fn(async () => {
+        calls.push('outgoingCalls');
+        return [];
+      }),
+      getDocumentSymbolsWithProvider: jest.fn(async () => {
+        // The position lookup a call-hierarchy query runs FIRST. It must not run
+        // either, or the refusal still arrives after real work -- and it is the
+        // call that made the mutation probe pass while the admission was late.
+        calls.push('getDocumentSymbolsWithProvider');
+        return {
+          provider: 'lsp' as const,
+          symbols: [
+            {
+              name: 'answer',
+              kind: 12,
+              range: { start: { line: 0, character: 0 }, end: { line: 3, character: 1 } },
+              selectionRange: { start: { line: 0, character: 9 }, end: { line: 0, character: 15 } },
+              children: [],
+            },
+          ],
+        };
+      }),
+      symbolKindToString: () => 'function',
+    });
+
+    for (const invocation of [
+      () => getDiagnosticsTool.handler({ file_path: '/workspace/src/a.ts', preview: -1 }, client),
+      () => findWorkspaceSymbolsTool.handler({ query: 'answer', preview: 99 }, client),
+      () =>
+        findReferencesTool.handler(
+          { file_path: '/workspace/src/a.ts', symbol_name: 'answer', preview: 1.5 },
+          client
+        ),
+      // Both call-hierarchy directions: each runs a POSITION lookup before its own
+      // provider request, so a late refusal here would waste two round trips.
+      () =>
+        getIncomingCallsTool.handler(
+          { file_path: '/workspace/src/a.ts', query: 'answer', preview: -2 },
+          client
+        ),
+      () =>
+        getOutgoingCallsTool.handler(
+          { file_path: '/workspace/src/a.ts', query: 'answer', preview: 21 },
+          client
+        ),
+      () =>
+        prepareCallHierarchyTool.handler(
+          { file_path: '/workspace/src/a.ts', query: 'answer', preview: 2.5 },
+          client
+        ),
+    ]) {
+      await expect(invocation()).rejects.toThrow();
+    }
+    expect(calls).toEqual([]);
   });
 
   it('returns typed diagnostics including the source file for range normalization', async () => {
