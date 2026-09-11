@@ -23,7 +23,7 @@ import {
 } from './source-preview.js';
 
 type NavigationSelector =
-  | { outcome: 'name'; symbolName: string; symbolKind?: string }
+  | { outcome: 'name'; symbolName: string; symbolNames: string[]; symbolKind?: string }
   | { outcome: 'position'; line: number; character: number }
   | { outcome: 'invalid'; reason: string };
 
@@ -47,15 +47,27 @@ function selectNavigationArgs(args: {
     };
   }
   if (namePresent) {
-    if (typeof args.symbol_name !== 'string' || args.symbol_name.trim().length === 0) {
-      return { outcome: 'invalid', reason: 'symbol_name must not be empty' };
+    // One name or several, asked in one request. Entries are kept as given,
+    // duplicates included, so the answer's breakdown lines up with the array the
+    // caller sent; collapsing them would return fewer rows than it listed.
+    const entries = Array.isArray(args.symbol_name) ? args.symbol_name : [args.symbol_name];
+    if (entries.length === 0) {
+      return { outcome: 'invalid', reason: 'symbol_name must name at least one symbol' };
+    }
+    const symbolNames: string[] = [];
+    for (const entry of entries) {
+      if (typeof entry !== 'string' || entry.trim().length === 0) {
+        return { outcome: 'invalid', reason: 'symbol_name must not be empty' };
+      }
+      symbolNames.push(entry.trim());
     }
     if (args.symbol_kind !== undefined && typeof args.symbol_kind !== 'string') {
       return { outcome: 'invalid', reason: 'symbol_kind must be a string' };
     }
     return {
       outcome: 'name',
-      symbolName: args.symbol_name.trim(),
+      symbolName: symbolNames[0] as string,
+      symbolNames,
       ...(typeof args.symbol_kind === 'string' ? { symbolKind: args.symbol_kind } : {}),
     };
   }
@@ -267,8 +279,9 @@ export const findReferencesTool: ToolDefinition = {
         description: 'The path to the file where the symbol is defined',
       },
       symbol_name: {
-        type: 'string',
-        description: 'The name of the symbol',
+        anyOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
+        description:
+          'The name of the symbol. Pass an array to ask several names in one request; each reports its own reference count, so a zero among them is attributable and the row bound is spent in asked order.',
       },
       symbol_kind: {
         type: 'string',
@@ -375,75 +388,128 @@ export const findReferencesTool: ToolDefinition = {
       }
     }
 
-    const symbolName = selector.symbolName;
     const symbolKind = selector.symbolKind;
-    const result = await client.findSymbolsByName(absolutePath, symbolName, symbolKind);
-    const { matches: symbolMatches, warning, incomplete } = result;
-    if (symbolMatches.length === 0) {
-      const text = withWarning(
-        warning,
-        `No symbols found with name "${symbolName}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${file_path}.`
-      );
-      return {
-        content: [{ type: 'text', text }],
-        structuredContent: {
-          outcome: incomplete ? 'partial' : 'empty',
-          ...(incomplete ? { code: 'LSP_SYMBOL_QUERY_INCOMPLETE', partial: true } : {}),
-          provider: 'lsp',
-          locations: [],
-          shown: 0,
-          total: 0,
-          omitted: 0,
-          recovery: incomplete
-            ? 'Use an exact line/character with a position-based semantic tool; the by-name occurrence bound was exceeded.'
-            : null,
-        },
-        ...(incomplete ? { isError: true } : {}),
-      };
+    // One request, several names. A caller mapping an unfamiliar area asks about
+    // three or four symbols at once, and one call per name costs a whole turn each.
+    // Names stay separate in the answer for the same reason the symbol search keeps
+    // them separate: a merged list cannot say which name found nothing.
+    const answers: Array<{
+      name: string;
+      locations: Awaited<ReturnType<LSPClient['findReferences']>>;
+      warning?: string;
+      incomplete: boolean;
+      symbolMatches: number;
+    }> = [];
+    for (const name of selector.symbolNames) {
+      const result = await client.findSymbolsByName(absolutePath, name, symbolKind);
+      const { matches: symbolMatches, warning, incomplete } = result;
+      const unique: Awaited<ReturnType<LSPClient['findReferences']>> = [];
+      const seenLocations = new Set<string>();
+      for (const match of symbolMatches) {
+        try {
+          const locations = await client.findReferences(
+            absolutePath,
+            match.position,
+            include_declaration
+          );
+          for (const location of locations) {
+            const range = location.range;
+            const key = `${location.uri}\u0000${range.start.line}\u0000${range.start.character}\u0000${range.end.line}\u0000${range.end.character}`;
+            if (seenLocations.has(key)) continue;
+            seenLocations.add(key);
+            unique.push(location);
+          }
+        } catch (error) {
+          rethrowToolOutcome(error);
+        }
+      }
+      answers.push({
+        name,
+        locations: unique,
+        ...(warning ? { warning } : {}),
+        incomplete: incomplete === true,
+        symbolMatches: symbolMatches.length,
+      });
     }
 
-    const unique: Awaited<ReturnType<LSPClient['findReferences']>> = [];
-    const seenLocations = new Set<string>();
-    for (const match of symbolMatches) {
-      try {
-        const locations = await client.findReferences(
-          absolutePath,
-          match.position,
-          include_declaration
-        );
-        for (const location of locations) {
-          const range = location.range;
-          const key = `${location.uri}\u0000${range.start.line}\u0000${range.start.character}\u0000${range.end.line}\u0000${range.end.character}`;
-          if (seenLocations.has(key)) continue;
-          seenLocations.add(key);
-          unique.push(location);
-        }
-      } catch (error) {
-        rethrowToolOutcome(error);
-      }
-    }
-    const selected = unique.slice(0, maxResults);
-    const total = unique.length;
+    // The bound is spent in asked order, so a later name reports omitted rather
+    // than a zero it never earned.
+    let remaining = maxResults;
+    const perQuery = answers.map((answer) => {
+      const selected = answer.locations.slice(0, Math.max(remaining, 0));
+      remaining -= selected.length;
+      return {
+        query: answer.name,
+        locations: selected,
+        shown: selected.length,
+        total: answer.locations.length,
+        omitted: answer.locations.length - selected.length,
+        symbolMatches: answer.symbolMatches,
+        incomplete: answer.incomplete,
+        outcome: selected.length > 0
+          ? ('ok' as const)
+          : answer.locations.length > 0
+            ? ('partial' as const)
+            : answer.incomplete
+              ? ('partial' as const)
+              : ('empty' as const),
+      };
+    });
+
+    const selected = perQuery.flatMap((row) => row.locations);
+    const total = answers.reduce((sum, answer) => sum + answer.locations.length, 0);
     const omitted = total - selected.length;
+    const incomplete = answers.some((answer) => answer.incomplete);
+    const warning = answers.find((answer) => answer.warning)?.warning;
+    const single = selector.symbolNames.length === 1 ? perQuery[0] : null;
     const resultFile =
       omitted > 0
         ? spoolFullResult('find_references', {
             file: absolutePath,
-            symbol: symbolName,
+            ...(single
+              ? { symbol: single.query, locations: answers[0]?.locations ?? [] }
+              : {
+                  symbols: selector.symbolNames,
+                  perQuery: answers.map((answer) => ({
+                    query: answer.name,
+                    total: answer.locations.length,
+                    locations: answer.locations,
+                  })),
+                }),
             total,
-            locations: unique,
           })
         : null;
-    const text =
-      selected.length > 0
+    const omittedLine =
+      omitted > 0
+        ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}`
+        : '';
+
+    const text = single
+      ? single.shown > 0
         ? withWarning(
             warning,
-            `References (${selected.length}/${total}) for "${symbolName}":\n${formatLocations(selected, window)}${omitted > 0 ? `\n... ${omitted} omitted; complete result: ${resultFile ?? '(spool unavailable)'}` : ''}`
+            `References (${single.shown}/${single.total}) for "${single.query}":\n${formatLocations(single.locations, window)}${omittedLine}`
           )
         : withWarning(
             warning,
-            `Found ${symbolMatches.length} symbol(s) but no references were returned.`
-          );
+            single.symbolMatches > 0
+              ? `Found ${single.symbolMatches} symbol(s) but no references were returned.`
+              : `No symbols found with name "${single.query}"${symbolKind ? ` and kind "${symbolKind}"` : ''} in ${file_path}.`
+          )
+      : withWarning(
+          warning,
+          [
+            `References (${selected.length}/${total}) for ${selector.symbolNames.length} names:`,
+            ...perQuery.map(
+              (row) =>
+                `  "${row.query}": ${row.total} reference(s)${row.symbolMatches === 0 ? ' — no such symbol in this file' : ''}${row.omitted > 0 ? ` — ${row.omitted} omitted, not shown here` : ''}`
+            ),
+            ...perQuery
+              .filter((row) => row.shown > 0)
+              .flatMap((row) => ['', `"${row.query}"`, formatLocations(row.locations, window)]),
+          ].join('\n') + omittedLine
+        );
+
     return {
       content: [{ type: 'text', text }],
       structuredContent: {
@@ -454,6 +520,7 @@ export const findReferencesTool: ToolDefinition = {
         shown: selected.length,
         total,
         omitted,
+        ...(single ? {} : { queries: selector.symbolNames, perQuery }),
         recovery: incomplete
           ? 'Use an exact line/character with a position-based semantic tool; the by-name occurrence bound was exceeded.'
           : omitted > 0

@@ -2,7 +2,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { Stats } from 'node:fs';
 import { readdir, stat } from 'node:fs/promises';
-import { extname, isAbsolute, join, normalize, relative } from 'node:path';
+import { dirname, extname, isAbsolute, join, normalize, relative, sep } from 'node:path';
 import { AstProvider } from './ast/provider.js';
 import type {
   AstRewriteInput,
@@ -77,6 +77,17 @@ import type {
 import { pathToUri, uriToPath } from './utils.js';
 
 const MAX_QUERY_OCCURRENCES = 32;
+
+/** First named declaration of a document-symbol answer, hierarchical or flat. */
+function firstDocumentSymbolName(
+  symbols: DocumentSymbol[] | SymbolInformation[]
+): string | null {
+  for (const symbol of symbols) {
+    const name = symbol?.name;
+    if (typeof name === 'string' && name.trim().length > 0) return name;
+  }
+  return null;
+}
 
 export interface SymbolQueryMatchResult {
   matches: SymbolMatch[];
@@ -963,25 +974,32 @@ export class LSPClient {
     const deadline = Date.now() + BUDGET_MS;
 
     if (serverState.adapter?.isWorkspaceIndexingServer?.()) {
-      // Grace window for the server to announce indexing has begun. Servers are
-      // usually warmed (at ensure-root) well before the first query, so indexing
-      // has typically started — often finished — by now. If nothing is signalled
-      // within the grace, assume there's nothing to index and treat it as ready.
+      // An announced complete index is the cheapest possible confirmation.
       const graceDeadline = Date.now() + 5000;
       while (Date.now() < deadline) {
         if (serverState.indexingComplete) {
           logger.debug('[workspaceSymbol] Workspace index complete\n');
           return true;
         }
+        // Silence is not readiness. tsserver loads its program lazily and may
+        // announce nothing at all, so "nothing was signalled" used to be read as
+        // "nothing to index" and every absent symbol came back as a CONFIRMED
+        // zero. Measured on a 1,900-file project: 11 seeds opened, no progress
+        // within the grace, confirmed=true, and navto returned nothing for a class
+        // that exists — while opening one project file made the same query answer
+        // immediately. Fall through to the behavioural probe instead of assuming.
         if (!serverState.indexingStarted && Date.now() > graceDeadline) {
-          logger.debug('[workspaceSymbol] No indexing signalled within grace; proceeding\n');
-          return true;
+          logger.debug('[workspaceSymbol] No indexing signalled; probing navto directly\n');
+          break;
         }
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      // Indexing started but didn't finish in the budget: not confirmed.
-      logger.debug('[workspaceSymbol] Indexing did not finish within budget; proceeding\n');
-      return false;
+      if (serverState.indexingComplete) return true;
+      if (serverState.indexingStarted && Date.now() >= deadline) {
+        logger.debug('[workspaceSymbol] Indexing did not finish within budget; proceeding\n');
+        return false;
+      }
+      return await this.probeWorkspaceSymbolAnswering(serverState, seedFiles, deadline);
     }
 
     // Lazy-loading server (tsserver, gopls): opening a seed triggers the project/
@@ -1014,17 +1032,74 @@ export class LSPClient {
             .catch(() => undefined)
         )
       );
-      // Settled seed diagnostics remain the best available evidence for a server
-      // that announces nothing about its own project load. It is weaker than it
-      // looks — it witnesses the seeds' own projects, not the whole workspace — so
-      // a server whose load IS observable (see TypeScriptAdapter) takes the
-      // indexing branch above instead, and is waited for rather than assumed.
-      // Do not "strengthen" this by probing a seed's own symbol: we just opened
-      // that file, so finding it proves only that, while a false negative here
-      // would report every absent symbol as merely unconfirmed.
-      return true;
+      // Settled diagnostics witness the seeds' own projects, not the workspace, so
+      // they are a starting point rather than the answer. The probe below decides.
+      return await this.probeWorkspaceSymbolAnswering(serverState, seedFiles, deadline);
     }
     return true;
+  }
+
+  /**
+   * Readiness answered by BEHAVIOUR: ask the server for a symbol this workspace is
+   * known to declare and see whether it comes back.
+   *
+   * A canary name is taken from a seed file's own document symbols, which is a
+   * necessary condition rather than a sufficient one -- but that is exactly what
+   * was missing. Assuming readiness turns every absent symbol into a confirmed
+   * zero, which is the most convincing wrong answer this tier can give. When the
+   * canary never answers within the budget the result is `false`, so the caller
+   * reports `stale` and says the index is still loading instead of claiming the
+   * symbol does not exist.
+   *
+   * Cost is paid once per server: one document-symbol call plus a few polls, and
+   * the first poll usually succeeds because the seeds were opened just before.
+   */
+  private async probeWorkspaceSymbolAnswering(
+    serverState: ServerState,
+    seedFiles: string[],
+    deadline: number
+  ): Promise<boolean> {
+    const canary = await this.findWorkspaceSymbolCanary(serverState, seedFiles, deadline);
+    if (!canary) {
+      // No seed declared a name to ask for. Nothing is provable either way, and
+      // refusing every answer would be worse than admitting the uncertainty.
+      logger.debug('[workspaceSymbol] No canary symbol available; proceeding unconfirmed\n');
+      return false;
+    }
+    while (Date.now() < deadline) {
+      try {
+        const rows = await opsWorkspaceSymbol(serverState, canary);
+        if (rows.length > 0) {
+          logger.debug(`[workspaceSymbol] Index answering (canary "${canary}")\n`);
+          return true;
+        }
+      } catch (error) {
+        logger.debug(`[workspaceSymbol] Canary probe failed: ${error}\n`);
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    logger.debug(`[workspaceSymbol] Canary "${canary}" never answered within budget\n`);
+    return false;
+  }
+
+  /** First named declaration of any opened seed; the name we know the workspace has. */
+  private async findWorkspaceSymbolCanary(
+    serverState: ServerState,
+    seedFiles: string[],
+    deadline: number
+  ): Promise<string | null> {
+    for (const seedFile of seedFiles) {
+      if (Date.now() >= deadline) return null;
+      try {
+        const symbols = await opsGetDocumentSymbols(serverState, seedFile);
+        const name = firstDocumentSymbolName(symbols);
+        if (name) return name;
+      } catch (error) {
+        logger.debug(`[workspaceSymbol] Canary lookup failed for ${seedFile}: ${error}\n`);
+      }
+    }
+    return null;
   }
 
   private async findWorkspaceSymbolSeedFiles(serverConfig: LSPServerConfig): Promise<string[]> {
@@ -1046,9 +1121,23 @@ export class LSPClient {
         extensions,
         ignoreFilter
       );
-      const seed = projectFiles[0];
-      if (seed && !seedFiles.includes(seed)) {
-        seedFiles.push(seed);
+      // One seed per top-level source directory, not one per project. A single
+      // alphabetically-first file is a coin flip: if it happens to sit outside the
+      // tsconfig program -- a script, a fixture, an excluded folder -- tsserver
+      // loads an INFERRED project containing only that file, its diagnostics settle
+      // normally so priming reports success, and navto then searches a program that
+      // holds nothing. Measured: every name returned zero against a root whose
+      // symbols exist, and opening one real project file fixed it instantly.
+      // Seeding each source directory makes that miss require every directory to be
+      // excluded at once, and costs a handful of opens bounded by MAX_SEED_ROOTS.
+      const perDirectory = new Map<string, string>();
+      for (const file of projectFiles) {
+        const directory = dirname(relative(projectRoot, file)).split(sep)[0] ?? '.';
+        if (!perDirectory.has(directory)) perDirectory.set(directory, file);
+      }
+      for (const seed of perDirectory.values()) {
+        if (seedFiles.length >= MAX_SEED_ROOTS) break;
+        if (!seedFiles.includes(seed)) seedFiles.push(seed);
       }
     }
 

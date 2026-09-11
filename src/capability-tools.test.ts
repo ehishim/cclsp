@@ -306,6 +306,57 @@ describe('capability tool contracts', () => {
     expect(result.content[0]?.text).toContain('/workspace/src/b.ts:9:3');
   });
 
+  it('answers several reference names in one request, each count attributable', async () => {
+    // Mapping an unfamiliar area means asking about three or four symbols at once.
+    // One call per name costs a whole turn each, and a merged answer could not say
+    // which name found nothing.
+    const dir = mkdtempSync(join(tmpdir(), 'cclsp-multiref-'));
+    const file = join(dir, 'multi.ts');
+    writeFileSync(file, 'export const alpha = 1;\nexport const beta = alpha;\n');
+    try {
+      const asked: string[] = [];
+      const client = asClient({
+        findSymbolsByName: jest.fn(async (_file: string, name: string) => {
+          asked.push(name);
+          return name === 'missing'
+            ? { matches: [] }
+            : { matches: [{ name, kind: 13, position: { line: 0, character: 13 } }] };
+        }),
+        findReferences: jest.fn(async () => [
+          {
+            uri: pathToUri(file),
+            range: { start: { line: 1, character: 17 }, end: { line: 1, character: 22 } },
+          },
+        ]),
+        symbolKindToString: () => 'variable',
+      });
+
+      const result = await findReferencesTool.handler(
+        { file_path: file, symbol_name: ['alpha', 'missing'] },
+        client
+      );
+
+      expect(asked).toEqual(['alpha', 'missing']);
+      const rows = (result.structuredContent as any).perQuery;
+      expect(rows).toMatchObject([
+        { query: 'alpha', shown: 1, total: 1, outcome: 'ok' },
+        { query: 'missing', shown: 0, total: 0, symbolMatches: 0, outcome: 'empty' },
+      ]);
+      // The name that found nothing stays visible in the text a reader meets.
+      expect(result.content[0]?.text).toContain('"missing": 0 reference(s)');
+      expect(result.content[0]?.text).toContain('no such symbol in this file');
+      // One name keeps the shape it always had: no breakdown, no extra noise.
+      const singleName = await findReferencesTool.handler(
+        { file_path: file, symbol_name: 'alpha' },
+        client
+      );
+      expect((singleName.structuredContent as any).perQuery).toBeUndefined();
+      expect(singleName.content[0]?.text).toContain('References (1/1) for "alpha"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('follows every reference row with its source window, so no follow-up read is needed', async () => {
     // The measured shape this replaces: 100 reference rows, each a bare position,
     // and the very next action was a Read of the file they pointed at.
