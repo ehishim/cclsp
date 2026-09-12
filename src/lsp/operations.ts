@@ -752,47 +752,53 @@ export async function willRenameFilesBatch(
   moves: FileRenamePair[]
 ): Promise<WorkspaceEditResult> {
   await serverState.initializationPromise;
-  for (const move of moves) {
-    requireFileRenameSupport(serverState, 'workspace/willRenameFiles', move.oldPath);
-    await ensureProjectReady(serverState, move.oldPath);
-  }
-  const method = 'workspace/willRenameFiles';
-  const result = await serverState.transport.sendRequest(
-    method,
-    {
-      files: moves.map((move) => ({
-        oldUri: pathToUri(move.oldPath),
-        newUri: pathToUri(move.newPath),
-      })),
-    },
-    serverState.adapter?.getTimeout?.(method) ?? 30000
-  );
-  if (!result || typeof result !== 'object') return {};
-  if ('changes' in result) return result as WorkspaceEditResult;
-  if ('documentChanges' in result) {
-    const changes: NonNullable<WorkspaceEditResult['changes']> = {};
-    const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
-    for (const change of documentChanges ?? []) {
-      if (
-        !change ||
-        typeof change !== 'object' ||
-        !('textDocument' in change) ||
-        !('edits' in change)
-      ) {
-        continue;
-      }
-      const textChange = change as {
-        textDocument: { uri: string };
-        edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
-      };
-      changes[textChange.textDocument.uri] = [
-        ...(changes[textChange.textDocument.uri] ?? []),
-        ...textChange.edits,
-      ];
+  const leases = [];
+  try {
+    for (const move of moves) {
+      requireFileRenameSupport(serverState, 'workspace/willRenameFiles', move.oldPath);
+      leases.push(await serverState.documentManager.acquire(move.oldPath));
     }
-    return { changes };
+    for (const move of moves) await ensureProjectReady(serverState, move.oldPath);
+    const method = 'workspace/willRenameFiles';
+    const result = await serverState.transport.sendRequest(
+      method,
+      {
+        files: moves.map((move) => ({
+          oldUri: pathToUri(move.oldPath),
+          newUri: pathToUri(move.newPath),
+        })),
+      },
+      serverState.adapter?.getTimeout?.(method) ?? 30000
+    );
+    if (!result || typeof result !== 'object') return {};
+    if ('changes' in result) return result as WorkspaceEditResult;
+    if ('documentChanges' in result) {
+      const changes: NonNullable<WorkspaceEditResult['changes']> = {};
+      const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
+      for (const change of documentChanges ?? []) {
+        if (
+          !change ||
+          typeof change !== 'object' ||
+          !('textDocument' in change) ||
+          !('edits' in change)
+        ) {
+          continue;
+        }
+        const textChange = change as {
+          textDocument: { uri: string };
+          edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
+        };
+        changes[textChange.textDocument.uri] = [
+          ...(changes[textChange.textDocument.uri] ?? []),
+          ...textChange.edits,
+        ];
+      }
+      return { changes };
+    }
+    return {};
+  } finally {
+    for (const lease of leases) lease.release();
   }
-  return {};
 }
 
 export async function willRenameFiles(

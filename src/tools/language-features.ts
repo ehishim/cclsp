@@ -6,6 +6,7 @@ import type {
   TextDocumentEditResult,
   WorkspaceEditResult,
 } from '../lsp/operations.js';
+import { uriToPath } from '../utils.js';
 import {
   SEMANTIC_DEFAULT_LIMIT,
   SEMANTIC_MAX_LIMIT,
@@ -29,6 +30,12 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition, ToolResult } from './registry.js';
+import {
+  type SourceReader,
+  createSourcePreview,
+  previewSpan,
+  renderMutationCandidate,
+} from './source-preview.js';
 
 const MAX_COMPLETION_LIMIT = 100;
 const MAX_RESOLVE_LIMIT = 20;
@@ -506,7 +513,10 @@ function rankCodeActions(actions: CodeActionResult[]): CodeActionResult[] {
     .map(({ action }) => action);
 }
 
-function previewWorkspaceEdit(edit?: WorkspaceEditResult): Array<Record<string, unknown>> {
+function previewWorkspaceEdit(
+  edit?: WorkspaceEditResult,
+  source = createSourcePreview(true)
+): Array<Record<string, unknown>> {
   if (!edit) return [];
   const normalized = normalizeTextWorkspaceEdit(edit);
   if (!normalized.edit?.changes) {
@@ -519,11 +529,18 @@ function previewWorkspaceEdit(edit?: WorkspaceEditResult): Array<Record<string, 
     for (const textEdit of edits) {
       if (preview.length >= MAX_PREVIEW_EDITS) break;
       const text = textEdit.newText.replace(/\n/g, '\\n');
+      const sourceLines = previewSpan(
+        source,
+        uriToPath(uri),
+        textEdit.range.start.line,
+        textEdit.range.end.line
+      );
       preview.push({
         uri,
         range: textEdit.range,
         newText:
           text.length > MAX_PREVIEW_TEXT ? `${text.slice(0, MAX_PREVIEW_TEXT - 3)}...` : text,
+        ...(sourceLines.length > 0 ? { source: sourceLines } : {}),
       });
     }
     if (preview.length >= MAX_PREVIEW_EDITS) break;
@@ -532,226 +549,240 @@ function previewWorkspaceEdit(edit?: WorkspaceEditResult): Array<Record<string, 
   return preview;
 }
 
-export const getCodeActionsTool: ToolDefinition = {
-  name: 'get_code_actions',
-  description:
-    'Rank and preview language-server code actions for a query or range; exact-title apply remains text-edit only.',
-  inputSchema: {
-    type: 'object',
-    properties: {
-      file_path: { type: 'string', description: 'The path to the file' },
-      query: { type: 'string', description: 'Symbol query (alternative to start position)' },
-      start_line: { type: 'number', description: 'Range start line (1-indexed)' },
-      start_character: { type: 'number', description: 'Range start character (1-indexed)' },
-      end_line: { type: 'number', description: 'Range end line (1-indexed)' },
-      end_character: { type: 'number', description: 'Range end character (1-indexed)' },
-      limit: { type: 'number', description: 'Maximum actions to list (default 20, max 50)' },
-      title: { type: 'string', description: 'Exact action title to select' },
-      apply: { type: 'boolean', description: 'Apply the selected WorkspaceEdit (default false)' },
-      candidate_id: {
-        type: 'string',
-        description: 'Opaque identity from the exact-title preview; required when apply=true',
+export function summarizeCodeActions(
+  actions: CodeActionResult[],
+  limit: number,
+  read?: SourceReader
+): Array<Record<string, unknown>> {
+  const source = createSourcePreview(true, read);
+  return actions.slice(0, limit).map((action, index) => ({
+    index,
+    title: action.title,
+    ...(action.kind ? { kind: action.kind } : {}),
+    ...(action.isPreferred !== undefined ? { isPreferred: action.isPreferred } : {}),
+    ...(action.disabled ? { disabled: action.disabled.reason } : {}),
+    hasEdit: !!action.edit,
+    commandOnly: !!action.command && !action.edit,
+    preview: previewWorkspaceEdit(action.edit, source),
+  }));
+}
+
+export function createGetCodeActionsTool(read?: SourceReader): ToolDefinition {
+  return {
+    name: 'get_code_actions',
+    description:
+      'Rank and preview language-server code actions for a query or range; exact-title apply remains text-edit only.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        file_path: { type: 'string', description: 'The path to the file' },
+        query: { type: 'string', description: 'Symbol query (alternative to start position)' },
+        start_line: { type: 'number', description: 'Range start line (1-indexed)' },
+        start_character: { type: 'number', description: 'Range start character (1-indexed)' },
+        end_line: { type: 'number', description: 'Range end line (1-indexed)' },
+        end_character: { type: 'number', description: 'Range end character (1-indexed)' },
+        limit: { type: 'number', description: 'Maximum actions to list (default 20, max 50)' },
+        title: { type: 'string', description: 'Exact action title to select' },
+        apply: { type: 'boolean', description: 'Apply the selected WorkspaceEdit (default false)' },
+        candidate_id: {
+          type: 'string',
+          description: 'Opaque identity from the exact-title preview; required when apply=true',
+        },
       },
+      required: ['file_path'],
     },
-    required: ['file_path'],
-  },
-  handler: async (args, client) => {
-    const {
-      file_path,
-      query,
-      start_line,
-      start_character,
-      end_line,
-      end_character,
-      limit,
-      title,
-      apply = false,
-      candidate_id,
-    } = args as {
-      file_path: string;
-      query?: string;
-      start_line?: number;
-      start_character?: number;
-      end_line?: number;
-      end_character?: number;
-      limit?: number;
-      title?: string;
-      apply?: boolean;
-      candidate_id?: string;
-    };
-    const absolutePath = resolvePath(file_path);
-    try {
-      const hasEndLine = end_line !== undefined;
-      const hasEndCharacter = end_character !== undefined;
-      if (!query && (!hasEndLine || !hasEndCharacter)) {
-        return positionResolutionResult(
-          {
-            outcome: 'invalid',
-            reason: 'coordinate calls require start_line/start_character/end_line/end_character',
-          },
-          file_path
-        );
-      }
-      if (hasEndLine !== hasEndCharacter) {
-        return positionResolutionResult(
-          { outcome: 'invalid', reason: 'end_line and end_character must be provided together' },
-          file_path
-        );
-      }
-      if (
-        hasEndLine &&
-        hasEndCharacter &&
-        (!Number.isInteger(end_line) ||
-          !Number.isInteger(end_character) ||
-          (end_line as number) < 1 ||
-          (end_character as number) < 1)
-      ) {
-        return positionResolutionResult(
-          { outcome: 'invalid', reason: 'end_line and end_character must be positive integers' },
-          file_path
-        );
-      }
-      const resolution = await resolveToolPosition(
-        absolutePath,
-        { query, line: start_line, character: start_character },
-        client
-      );
-      if (resolution.outcome !== 'resolved') {
-        return positionResolutionResult(resolution, file_path);
-      }
-      const end =
-        hasEndLine && hasEndCharacter
-          ? { line: (end_line as number) - 1, character: (end_character as number) - 1 }
-          : resolution.position;
-      const actions = rankCodeActions(
-        await client.getCodeActions(absolutePath, { start: resolution.position, end })
-      );
-      const boundedLimit = boundedInt(limit, 20, 1, MAX_CODE_ACTION_LIMIT);
-      const summaries = actions.slice(0, boundedLimit).map((action, index) => ({
-        index,
-        title: action.title,
-        ...(action.kind ? { kind: action.kind } : {}),
-        ...(action.isPreferred !== undefined ? { isPreferred: action.isPreferred } : {}),
-        ...(action.disabled ? { disabled: action.disabled.reason } : {}),
-        hasEdit: !!action.edit,
-        commandOnly: !!action.command && !action.edit,
-        preview: previewWorkspaceEdit(action.edit),
-      }));
-      const resolved = resolvedFromText(resolution);
-      const resolvedFrom = resolvedFromMetadata(resolution);
-      if (!title) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text:
-                summaries.length === 0
-                  ? `${resolved ? `${resolved}\n\n` : ''}No code actions found for ${file_path}`
-                  : `${resolved ? `${resolved}\n\n` : ''}${summaries.length} of ${actions.length} code actions for ${file_path}:\n${JSON.stringify(summaries, null, 2)}`,
-            },
-          ],
-          structuredContent: {
-            outcome: summaries.length > 0 ? 'ok' : 'empty',
-            ...(resolvedFrom ? { resolvedFrom } : {}),
-            actions: summaries,
-            truncated: actions.length > summaries.length,
-          },
-        };
-      }
-      const matches = actions.filter((action) => action.title === title);
-      if (matches.length !== 1) {
-        return rejectedResult(
-          'textDocument/codeAction',
-          matches.length === 0
-            ? `no action has the exact title "${title}"`
-            : `${matches.length} actions have the title "${title}"`
-        );
-      }
-      const matchedAction = matches[0];
-      if (!matchedAction)
-        return rejectedResult('textDocument/codeAction', 'selected action missing');
-      const selected = await client.resolveCodeAction(absolutePath, matchedAction);
-      if (selected.disabled)
-        return rejectedResult('textDocument/codeAction', selected.disabled.reason);
-      if (!selected.edit) {
-        return rejectedResult(
-          'textDocument/codeAction',
-          selected.command
-            ? 'the action requires workspace/executeCommand, which cclsp does not execute'
-            : 'the action did not provide a WorkspaceEdit'
-        );
-      }
-      const normalized = normalizeTextWorkspaceEdit(selected.edit);
-      if (normalized.reason) return rejectedResult('textDocument/codeAction', normalized.reason);
-      const normalizedEdit = normalized.edit;
-      if (!normalizedEdit?.changes || Object.keys(normalizedEdit.changes).length === 0) {
-        return rejectedResult('textDocument/codeAction', 'the action did not provide text edits');
-      }
-      const intent = JSON.stringify({
-        operation: 'code_action',
-        file: absolutePath,
-        position: resolution.position,
-        end,
+    handler: async (args, client) => {
+      const {
+        file_path,
+        query,
+        start_line,
+        start_character,
+        end_line,
+        end_character,
+        limit,
         title,
-      });
-      const preparedEdit = await prepareWorkspaceEdit(normalizedEdit, intent, [absolutePath]);
-      if (!apply) {
+        apply = false,
+        candidate_id,
+      } = args as {
+        file_path: string;
+        query?: string;
+        start_line?: number;
+        start_character?: number;
+        end_line?: number;
+        end_character?: number;
+        limit?: number;
+        title?: string;
+        apply?: boolean;
+        candidate_id?: string;
+      };
+      const absolutePath = resolvePath(file_path);
+      try {
+        const hasEndLine = end_line !== undefined;
+        const hasEndCharacter = end_character !== undefined;
+        if (!query && (!hasEndLine || !hasEndCharacter)) {
+          return positionResolutionResult(
+            {
+              outcome: 'invalid',
+              reason: 'coordinate calls require start_line/start_character/end_line/end_character',
+            },
+            file_path
+          );
+        }
+        if (hasEndLine !== hasEndCharacter) {
+          return positionResolutionResult(
+            { outcome: 'invalid', reason: 'end_line and end_character must be provided together' },
+            file_path
+          );
+        }
+        if (
+          hasEndLine &&
+          hasEndCharacter &&
+          (!Number.isInteger(end_line) ||
+            !Number.isInteger(end_character) ||
+            (end_line as number) < 1 ||
+            (end_character as number) < 1)
+        ) {
+          return positionResolutionResult(
+            { outcome: 'invalid', reason: 'end_line and end_character must be positive integers' },
+            file_path
+          );
+        }
+        const resolution = await resolveToolPosition(
+          absolutePath,
+          { query, line: start_line, character: start_character },
+          client
+        );
+        if (resolution.outcome !== 'resolved') {
+          return positionResolutionResult(resolution, file_path);
+        }
+        const end =
+          hasEndLine && hasEndCharacter
+            ? { line: (end_line as number) - 1, character: (end_character as number) - 1 }
+            : resolution.position;
+        const actions = rankCodeActions(
+          await client.getCodeActions(absolutePath, { start: resolution.position, end })
+        );
+        const boundedLimit = boundedInt(limit, 20, 1, MAX_CODE_ACTION_LIMIT);
+        const resolved = resolvedFromText(resolution);
+        const resolvedFrom = resolvedFromMetadata(resolution);
+        if (!title) {
+          const summaries = summarizeCodeActions(actions, boundedLimit, read);
+          return {
+            content: [
+              {
+                type: 'text',
+                text:
+                  summaries.length === 0
+                    ? `${resolved ? `${resolved}\n\n` : ''}No code actions found for ${file_path}`
+                    : `${resolved ? `${resolved}\n\n` : ''}${summaries.length} of ${actions.length} code actions for ${file_path}:\n${JSON.stringify(summaries, null, 2)}`,
+              },
+            ],
+            structuredContent: {
+              outcome: summaries.length > 0 ? 'ok' : 'empty',
+              ...(resolvedFrom ? { resolvedFrom } : {}),
+              actions: summaries,
+              truncated: actions.length > summaries.length,
+            },
+          };
+        }
+        const matches = actions.filter((action) => action.title === title);
+        if (matches.length !== 1) {
+          return rejectedResult(
+            'textDocument/codeAction',
+            matches.length === 0
+              ? `no action has the exact title "${title}"`
+              : `${matches.length} actions have the title "${title}"`
+          );
+        }
+        const matchedAction = matches[0];
+        if (!matchedAction)
+          return rejectedResult('textDocument/codeAction', 'selected action missing');
+        const selected = await client.resolveCodeAction(absolutePath, matchedAction);
+        if (selected.disabled)
+          return rejectedResult('textDocument/codeAction', selected.disabled.reason);
+        if (!selected.edit) {
+          return rejectedResult(
+            'textDocument/codeAction',
+            selected.command
+              ? 'the action requires workspace/executeCommand, which cclsp does not execute'
+              : 'the action did not provide a WorkspaceEdit'
+          );
+        }
+        const normalized = normalizeTextWorkspaceEdit(selected.edit);
+        if (normalized.reason) return rejectedResult('textDocument/codeAction', normalized.reason);
+        const normalizedEdit = normalized.edit;
+        if (!normalizedEdit?.changes || Object.keys(normalizedEdit.changes).length === 0) {
+          return rejectedResult('textDocument/codeAction', 'the action did not provide text edits');
+        }
+        const intent = JSON.stringify({
+          operation: 'code_action',
+          file: absolutePath,
+          position: resolution.position,
+          end,
+          title,
+        });
+        const preparedEdit = await prepareWorkspaceEdit(normalizedEdit, intent, [absolutePath]);
+        if (!apply) {
+          const preview = previewWorkspaceEdit(selected.edit, createSourcePreview(true, read));
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `[DRY RUN]\n${renderMutationCandidate(preparedEdit.candidateId, 'Apply with the same file, selector, exact title, and this candidate ID.')}\n\nCode action "${title}" would apply:\n${JSON.stringify(preview, null, 2)}`,
+              },
+            ],
+            structuredContent: {
+              outcome: 'ok',
+              ...(resolvedFrom ? { resolvedFrom } : {}),
+              applied: false,
+              title,
+              candidateId: preparedEdit.candidateId,
+              edit: normalizedEdit,
+              preview,
+            },
+          };
+        }
+        if (!candidate_id) {
+          return rejectedResult(
+            'textDocument/codeAction',
+            'apply requires candidate_id from an inspected exact-title preview'
+          );
+        }
+        if (candidate_id !== preparedEdit.candidateId) {
+          return rejectedResult(
+            'textDocument/codeAction',
+            'code action edits or source bytes changed since preview'
+          );
+        }
+        const applied = await applyPreparedWorkspaceEdit(preparedEdit, client);
+        if (!applied.success) {
+          return rejectedResult('textDocument/codeAction', applied.error ?? 'failed to apply edit');
+        }
         return {
           content: [
             {
               type: 'text',
-              text: `[DRY RUN] Code action "${title}" would apply:\n${JSON.stringify(normalizedEdit.changes, null, 2)}`,
+              text: `Applied code action "${title}" to ${applied.filesModified.length} file(s):\n${applied.filesModified.join('\n')}`,
             },
           ],
           structuredContent: {
             outcome: 'ok',
             ...(resolvedFrom ? { resolvedFrom } : {}),
-            applied: false,
+            applied: true,
             title,
             candidateId: preparedEdit.candidateId,
-            edit: normalizedEdit,
-            preview: previewWorkspaceEdit(selected.edit),
+            filesModified: applied.filesModified,
           },
         };
+      } catch (error) {
+        rethrowToolOutcome(error);
+        throw error;
       }
-      if (!candidate_id) {
-        return rejectedResult(
-          'textDocument/codeAction',
-          'apply requires candidate_id from an inspected exact-title preview'
-        );
-      }
-      if (candidate_id !== preparedEdit.candidateId) {
-        return rejectedResult(
-          'textDocument/codeAction',
-          'code action edits or source bytes changed since preview'
-        );
-      }
-      const applied = await applyPreparedWorkspaceEdit(preparedEdit, client);
-      if (!applied.success) {
-        return rejectedResult('textDocument/codeAction', applied.error ?? 'failed to apply edit');
-      }
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `Applied code action "${title}" to ${applied.filesModified.length} file(s):\n${applied.filesModified.join('\n')}`,
-          },
-        ],
-        structuredContent: {
-          outcome: 'ok',
-          ...(resolvedFrom ? { resolvedFrom } : {}),
-          applied: true,
-          title,
-          candidateId: preparedEdit.candidateId,
-          filesModified: applied.filesModified,
-        },
-      };
-    } catch (error) {
-      rethrowToolOutcome(error);
-      throw error;
-    }
-  },
-};
+    },
+  };
+}
+
+export const getCodeActionsTool = createGetCodeActionsTool();
 
 export const languageFeatureTools: ToolDefinition[] = [
   getCompletionsTool,

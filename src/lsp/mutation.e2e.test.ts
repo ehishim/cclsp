@@ -161,6 +161,12 @@ suite('real TypeScript and PHP mutations', () => {
         });
         const candidate = preview.structuredContent?.candidateId as string;
         expect(candidate).toMatch(/^sha256:[0-9a-f]{64}$/);
+        expect(preview.content[0]?.text).toContain(`Candidate ID: ${candidate}`);
+        expect(preview.content[0]?.text).toContain(
+          row.language === 'TypeScript'
+            ? 'export function doubleValue'
+            : 'function doubleValue(int $value)'
+        );
         expect(await readFile(owner, 'utf8')).toBe(beforeOwner);
         expect(await readFile(consumer, 'utf8')).toBe(beforeConsumer);
         const missingCandidate = await renameSymbolStrictTool.handler(
@@ -176,6 +182,22 @@ suite('real TypeScript and PHP mutations', () => {
           isError: true,
           structuredContent: { code: 'LSP_RENAME_PREVIEW_REQUIRED' },
         });
+        const staleCandidate = await renameSymbolStrictTool.handler(
+          {
+            file_path: owner,
+            query: 'doubleValue',
+            new_name: 'twiceValue',
+            dry_run: false,
+            candidate_id: `sha256:${'0'.repeat(64)}`,
+          },
+          client
+        );
+        expect(staleCandidate).toMatchObject({
+          isError: true,
+          structuredContent: { code: 'LSP_RENAME_STALE', applied: false },
+        });
+        expect(await readFile(owner, 'utf8')).toBe(beforeOwner);
+        expect(await readFile(consumer, 'utf8')).toBe(beforeConsumer);
         const applied = await renameSymbolStrictTool.handler(
           {
             file_path: owner,
@@ -280,6 +302,23 @@ suite('real TypeScript and PHP mutations', () => {
       const preview = await renameFileTool.handler({ moves: typescriptMoves }, client);
       const candidate = preview.structuredContent?.candidateId as string;
       expect(candidate).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(preview.content[0]?.text).toContain(`Candidate ID: ${candidate}`);
+      expect(preview.content[0]?.text).toContain("import { doubleValue } from './math.js'");
+      const staleCandidate = await renameFileTool.handler(
+        {
+          moves: typescriptMoves,
+          dry_run: false,
+          candidate_id: `sha256:${'0'.repeat(64)}`,
+        },
+        client
+      );
+      expect(staleCandidate).toMatchObject({
+        isError: true,
+        structuredContent: { code: 'LSP_FILE_RENAME_STALE', applied: false },
+      });
+      expect(await Bun.file(join(root, 'src/math.ts')).exists()).toBe(true);
+      expect(await Bun.file(join(root, 'src/math-core.ts')).exists()).toBe(false);
+      expect(await readFile(join(root, 'src/app.ts'), 'utf8')).toContain('./math.js');
       const applied = await renameFileTool.handler(
         { moves: typescriptMoves, dry_run: false, candidate_id: candidate },
         client

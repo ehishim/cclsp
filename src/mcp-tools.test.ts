@@ -566,6 +566,7 @@ describe('MCP Tool Handlers', () => {
       expect(result.content[0]?.text).toContain('[DRY RUN]');
       expect(result.content[0]?.text).toContain('oldName (function)');
       expect(result.content[0]?.text).toContain('"newName"');
+      expect(result.content[0]?.text).toContain('6: export function oldName() {}');
       rmSync(SRC_TEST, { force: true });
     });
 
@@ -776,6 +777,40 @@ describe('MCP Tool Handlers', () => {
         { allowUnpreparedPreview: true }
       );
       expect(mockClient.syncFileContent).not.toHaveBeenCalled();
+    });
+
+    it('returns the candidate id and apply instruction in visible prepared-preview text', async () => {
+      mockClient.renameSymbol.mockResolvedValue({
+        prepared: true,
+        changes: {
+          [pathToUri(SRC_TEST)]: [
+            {
+              range: { start: { line: 0, character: 0 }, end: { line: 0, character: 4 } },
+              newText: 'renamed',
+            },
+          ],
+        },
+      });
+      writeFileSync(SRC_TEST, 'test');
+      try {
+        const result = await renameSymbolStrictTool.handler(
+          {
+            file_path: SRC_TEST,
+            line: 1,
+            character: 1,
+            new_name: 'renamed',
+            dry_run: true,
+          },
+          asClient(mockClient)
+        );
+        expect(result.content[0]?.text).toContain(
+          `Candidate ID: ${result.structuredContent?.candidateId}`
+        );
+        expect(result.content[0]?.text).toContain('Apply with the same file, selector, new name');
+        expect(result.content[0]?.text).toContain('1: test');
+      } finally {
+        rmSync(SRC_TEST, { force: true });
+      }
     });
 
     it('does not opt strict apply into unprepared preview', async () => {

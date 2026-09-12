@@ -114,6 +114,28 @@ export function previewWindow(
   return previewSpan(preview, file, zeroBasedLine);
 }
 
+export function renderMutationCandidate(candidateId: string, instruction: string): string {
+  return `Candidate ID: ${candidateId}\n${instruction}`;
+}
+
+export function renderTextEditPreview(
+  preview: SourcePreview | null,
+  file: string,
+  edit: {
+    range: {
+      start: { line: number; character: number };
+      end: { line: number; character: number };
+    };
+    newText: string;
+  }
+): string {
+  const { start, end } = edit.range;
+  return [
+    `File: ${file} · Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: ${JSON.stringify(edit.newText)}`,
+    ...previewSpan(preview, file, start.line, end.line),
+  ].join('\n');
+}
+
 /** One location row, optionally followed by its window. Coordinates are 1-indexed. */
 export function renderLocationRow(
   preview: SourcePreview | null,

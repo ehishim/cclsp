@@ -14,6 +14,7 @@ import {
 import { getDiagnosticsTool } from './tools/diagnostics.js';
 import { getHoverTool } from './tools/hover.js';
 import {
+  createGetCodeActionsTool,
   getCodeActionsTool,
   getCompletionsTool,
   getSignatureHelpTool,
@@ -1557,6 +1558,50 @@ describe('capability tool contracts', () => {
     expect(getCodeActions).not.toHaveBeenCalled();
   });
 
+  it('reads one shared source file once across a multiple-action handler result', async () => {
+    const file = '/workspace/shared.ts';
+    const reads: string[] = [];
+    const edit = (newText: string) => ({
+      changes: {
+        [pathToUri(file)]: [
+          {
+            range: { start: { line: 0, character: 6 }, end: { line: 0, character: 11 } },
+            newText,
+          },
+        ],
+      },
+    });
+    const tool = createGetCodeActionsTool((path) => {
+      reads.push(path);
+      return 'const value = 1;\n';
+    });
+    const result = await tool.handler(
+      {
+        file_path: file,
+        start_line: 1,
+        start_character: 1,
+        end_line: 1,
+        end_character: 16,
+      },
+      asClient({
+        getCodeActions: jest.fn().mockResolvedValue([
+          { title: 'First', edit: edit('first') },
+          { title: 'Second', edit: edit('second') },
+        ]),
+      })
+    );
+
+    expect(result.structuredContent?.actions).toEqual([
+      expect.objectContaining({
+        preview: [expect.objectContaining({ source: ['  1: const value = 1;', '  2- '] })],
+      }),
+      expect.objectContaining({
+        preview: [expect.objectContaining({ source: ['  1: const value = 1;', '  2- '] })],
+      }),
+    ]);
+    expect(reads).toEqual([file]);
+  });
+
   it('previews and applies only a selected code action WorkspaceEdit', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cclsp-code-action-'));
     const file = join(root, 'example.ts');
@@ -1591,7 +1636,15 @@ describe('capability tool contracts', () => {
         },
         client
       );
-      expect(preview.structuredContent).toMatchObject({ applied: false, title: 'Rename local' });
+      expect(preview.structuredContent).toMatchObject({
+        applied: false,
+        title: 'Rename local',
+        preview: [expect.objectContaining({ source: ['  1: const value = 1;', '  2- '] })],
+      });
+      expect(preview.content[0]?.text).toContain(
+        `Candidate ID: ${preview.structuredContent?.candidateId}`
+      );
+      expect(preview.content[0]?.text).toContain('const value = 1;');
       expect(readFileSync(file, 'utf8')).toBe('const value = 1;\n');
 
       const applied = await getCodeActionsTool.handler(
@@ -1732,6 +1785,10 @@ describe('capability tool contracts', () => {
         client
       );
       expect(preview.structuredContent).toMatchObject({ outcome: 'ok', applied: false });
+      expect(preview.content[0]?.text).toContain(
+        `Candidate ID: ${preview.structuredContent?.candidateId}`
+      );
+      expect(preview.content[0]?.text).toContain("import { value } from './old';");
       expect(readFileSync(oldPath, 'utf8')).toContain('value');
       expect(() => readFileSync(newPath, 'utf8')).toThrow();
       expect(didRenameFiles).not.toHaveBeenCalled();

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import { createSourcePreview, previewSpan, renderLocationRow } from './tools/source-preview.js';
+import {
+  createSourcePreview,
+  previewSpan,
+  renderLocationRow,
+  renderMutationCandidate,
+  renderTextEditPreview,
+} from './tools/source-preview.js';
 
 function countingReader(body: string) {
   const reads: string[] = [];
@@ -37,9 +43,9 @@ describe('source window owner', () => {
     // The row itself must survive: only its window is missing.
     expect(previewSpan(preview, FILE, 2)).toEqual([]);
     expect(previewSpan(preview, FILE, 3)).toEqual([]);
-    expect(renderLocationRow(preview, { file: FILE, zeroBasedLine: 2, zeroBasedCharacter: 0 })).toBe(
-      `${FILE}:3:1`
-    );
+    expect(
+      renderLocationRow(preview, { file: FILE, zeroBasedLine: 2, zeroBasedCharacter: 0 })
+    ).toBe(`${FILE}:3:1`);
     expect(reads).toEqual([FILE]);
   });
 
@@ -66,6 +72,29 @@ describe('source window owner', () => {
     const byTrue = createSourcePreview(true);
     expect(byDefault?.context).toBeGreaterThan(0);
     expect(byDefault?.context).toBe(byTrue?.context as number);
+  });
+
+  it('renders a reusable candidate handoff for the matching apply call', () => {
+    expect(renderMutationCandidate('sha256:abc', 'Apply with unchanged inputs.')).toBe(
+      'Candidate ID: sha256:abc\nApply with unchanged inputs.'
+    );
+  });
+
+  it('renders text-edit coordinates, replacement and original source through one window owner', () => {
+    const preview = createSourcePreview(1, countingReader(BODY).read);
+    expect(
+      renderTextEditPreview(preview, FILE, {
+        range: { start: { line: 2, character: 16 }, end: { line: 2, character: 22 } },
+        newText: 'renamed',
+      })
+    ).toBe(
+      [
+        `File: ${FILE} · Line 3, Column 17 to Line 3, Column 23: "renamed"`,
+        '  2- ',
+        '  3: export function target() {',
+        '  4-   return 2;',
+      ].join('\n')
+    );
   });
 
   it('clips a long line instead of letting one row carry the whole answer', () => {

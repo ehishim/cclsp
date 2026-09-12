@@ -155,6 +155,45 @@ describe('capability-gated operations', () => {
     expect(order).toEqual(['ready', 'references']);
   });
 
+  it('opens cold rename sources before checking project readiness', async () => {
+    const sendRequest = jest.fn().mockResolvedValue({ changes: {} });
+    const state = server(
+      {
+        workspace: {
+          fileOperations: {
+            willRename: { filters: [{ scheme: 'file', pattern: { glob: '**/*.ts' } }] },
+          },
+        },
+      },
+      sendRequest
+    );
+    const acquire = jest.fn().mockResolvedValue({ justOpened: true, release: jest.fn() });
+    state.documentManager.acquire = acquire;
+    const readiness = jest.fn(async () => acquire.mock.calls.length === 1);
+    state.adapter = {
+      name: 'fixture',
+      matches: () => true,
+      waitForProjectReady: readiness,
+    };
+
+    await willRenameFiles(state, TEST_FILE, `${TEST_FILE}.renamed.ts`);
+
+    expect(acquire).toHaveBeenCalledWith(TEST_FILE);
+    expect(readiness).toHaveBeenCalledWith(state, TEST_FILE, 30000);
+    expect(sendRequest).toHaveBeenCalledWith(
+      'workspace/willRenameFiles',
+      {
+        files: [
+          {
+            oldUri: expect.stringContaining('cclsp-capability-'),
+            newUri: expect.stringContaining('.renamed.ts'),
+          },
+        ],
+      },
+      30000
+    );
+  });
+
   it('gates file rename edits before requesting workspace changes', async () => {
     const sendRequest = jest.fn();
     const state = server(

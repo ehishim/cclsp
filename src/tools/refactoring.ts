@@ -10,6 +10,11 @@ import {
   resolvedFromText,
 } from './position-resolver.js';
 import type { ToolDefinition } from './registry.js';
+import {
+  createSourcePreview,
+  renderMutationCandidate,
+  renderTextEditPreview,
+} from './source-preview.js';
 
 function matchKindText(
   match: { kind: number; resolutionSource?: string },
@@ -196,6 +201,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
       candidate_id?: string;
     };
     const absolutePath = resolvePath(file_path);
+    const source = createSourcePreview(true);
     try {
       const resolution = await resolveToolPosition(
         absolutePath,
@@ -224,12 +230,8 @@ export const renameSymbolStrictTool: ToolDefinition = {
       const resolvedFrom = resolvedFromMetadata(resolution);
       const preview: string[] = [];
       for (const [uri, edits] of Object.entries(changes)) {
-        preview.push(`File: ${uriToPath(uri)}`);
         for (const edit of edits) {
-          const { start, end } = edit.range;
-          preview.push(
-            `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
-          );
+          preview.push(renderTextEditPreview(source, uriToPath(uri), edit));
         }
       }
       if (dry_run && !workspaceEdit.prepared) {
@@ -296,7 +298,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
           content: [
             {
               type: 'text',
-              text: `${resolved ? `${resolved}\n\n` : ''}[DRY RUN] Would rename symbol at line ${resolution.position.line + 1}, character ${resolution.position.character + 1} to "${new_name}":\n${preview.join('\n')}`,
+              text: `${resolved ? `${resolved}\n\n` : ''}[DRY RUN]\n${renderMutationCandidate(preparedEdit.candidateId, 'Apply with the same file, selector, new name, and this candidate ID.')}\n\nWould rename symbol at line ${resolution.position.line + 1}, character ${resolution.position.character + 1} to "${new_name}":\n${preview.join('\n')}`,
             },
           ],
           structuredContent: {
@@ -477,6 +479,7 @@ export const renameFileTool: ToolDefinition = {
     }
     const firstMove = moves[0];
     if (!firstMove) return textResult('Invalid file rename batch: no moves');
+    const source = createSourcePreview(true);
     try {
       const edit =
         typeof client.willRenameFilesBatch === 'function'
@@ -492,11 +495,14 @@ export const renameFileTool: ToolDefinition = {
         moves
       );
       if (dry_run) {
+        const editPreview = Object.entries(normalizedEdit.changes).flatMap(([uri, edits]) =>
+          edits.map((edit) => renderTextEditPreview(source, uriToPath(uri), edit))
+        );
         return {
           content: [
             {
               type: 'text' as const,
-              text: `[DRY RUN] Would rename ${moves.length} file(s) and apply:\n${moves.map((move) => `${move.oldPath} -> ${move.newPath}`).join('\n')}\n${JSON.stringify(normalizedEdit.changes, null, 2)}`,
+              text: `[DRY RUN]\n${renderMutationCandidate(preparedEdit.candidateId, 'Apply with the same moves and this candidate ID.')}\n\nWould rename ${moves.length} file(s) and apply:\n${moves.map((move) => `${move.oldPath} -> ${move.newPath}`).join('\n')}${editPreview.length > 0 ? `\n${editPreview.join('\n')}` : ''}`,
             },
           ],
           structuredContent: {
