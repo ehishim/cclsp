@@ -40,15 +40,32 @@ function coerceParams(raw: Record<string, unknown>, schema: ToolSchema | undefin
 
 const FILESYSTEM_PARAMS = new Set(['file_path', 'path', 'old_path', 'new_path']);
 
-function resolveFilesystemParams(
+function resolvePathValue(value: unknown, cwd: string): unknown {
+  return typeof value === 'string' && value.length > 0
+    ? isAbsolute(value) ? value : resolve(cwd, value)
+    : value;
+}
+
+export function resolveFilesystemParams(
   raw: Record<string, unknown>,
   cwd: string,
 ): Record<string, unknown> {
   return Object.fromEntries(Object.entries(raw).map(([key, value]) => {
-    if (!FILESYSTEM_PARAMS.has(key) || typeof value !== 'string' || value.length === 0) {
-      return [key, value];
+    if (key === 'path' && Array.isArray(value)) {
+      return [key, value.map((path) => resolvePathValue(path, cwd))];
     }
-    return [key, isAbsolute(value) ? value : resolve(cwd, value)];
+    if (key === 'moves' && Array.isArray(value)) {
+      return [key, value.map((move) => {
+        if (!move || typeof move !== 'object' || Array.isArray(move)) return move;
+        const row = move as Record<string, unknown>;
+        return {
+          ...row,
+          old_path: resolvePathValue(row.old_path, cwd),
+          new_path: resolvePathValue(row.new_path, cwd),
+        };
+      })];
+    }
+    return [key, FILESYSTEM_PARAMS.has(key) ? resolvePathValue(value, cwd) : value];
   }));
 }
 
@@ -72,19 +89,25 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   const name = String(args.name);
   const signal = args.signal instanceof AbortSignal ? args.signal : undefined;
   const cwd = typeof args.cwd === 'string' ? resolve(args.cwd) : process.cwd();
-  const rawParams = resolveFilesystemParams((args.params ?? {}) as Record<string, unknown>, cwd);
   const explicitRoot = args.root
     ? (isAbsolute(String(args.root)) ? String(args.root) : resolve(cwd, String(args.root)))
     : undefined;
+  const rawParams = resolveFilesystemParams(
+    (args.params ?? {}) as Record<string, unknown>,
+    explicitRoot ?? cwd,
+  );
 
   // A file/path is the strongest routing intent; target-less workspace calls use
   // the caller cwd. Explicit --root remains the only exact-root override.
+  const firstBatchPath = Array.isArray(rawParams.path)
+    ? rawParams.path.find((path): path is string => typeof path === 'string')
+    : undefined;
   const pathArg =
     typeof rawParams.file_path === 'string'
       ? (rawParams.file_path as string)
       : typeof rawParams.path === 'string'
         ? (rawParams.path as string)
-        : cwd;
+        : firstBatchPath ?? cwd;
 
   if (name === 'restart_server') {
     const entries = pool.servingRoots(explicitRoot ?? cwd);
@@ -389,7 +412,8 @@ export async function runDaemon(): Promise<void> {
           break;
         }
         case 'tool':
-          reply(true, await dispatchTool(pool, { ...args, signal: controller!.signal }));
+          if (!controller) throw new Error('HUB_REQUEST_CONTROLLER_MISSING');
+          reply(true, await dispatchTool(pool, { ...args, signal: controller.signal }));
           break;
         case 'shutdown':
           reply(true, { stopped: true });

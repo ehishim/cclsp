@@ -5,6 +5,7 @@ export class DiagnosticsCache {
   private readonly diagnostics = new Map<string, Diagnostic[]>();
   private readonly lastUpdate = new Map<string, number>();
   private readonly versions = new Map<string, number>();
+  private readonly revisions = new Map<string, number>();
   private readonly listeners = new Map<string, Set<() => void>>();
 
   update(uri: string, items: Diagnostic[], version?: number): void {
@@ -12,6 +13,7 @@ export class DiagnosticsCache {
     if (version !== undefined && previous !== undefined && version < previous) return;
     this.diagnostics.set(uri, items);
     this.lastUpdate.set(uri, Date.now());
+    this.revisions.set(uri, (this.revisions.get(uri) ?? 0) + 1);
     if (version !== undefined) this.versions.set(uri, version);
     for (const listener of this.listeners.get(uri) ?? []) listener();
   }
@@ -20,10 +22,42 @@ export class DiagnosticsCache {
     return this.diagnostics.get(uri);
   }
 
+  revision(uri: string): number {
+    return this.revisions.get(uri) ?? 0;
+  }
+
+  waitForUpdate(uri: string, afterRevision: number, maxWaitTime: number): Promise<boolean> {
+    if (this.revision(uri) > afterRevision) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let finished = false;
+      const finish = (updated: boolean) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        const listeners = this.listeners.get(uri);
+        listeners?.delete(changed);
+        if (listeners?.size === 0) this.listeners.delete(uri);
+        resolve(updated);
+      };
+      const changed = () => {
+        if (this.revision(uri) > afterRevision) finish(true);
+      };
+      const timer = setTimeout(() => finish(false), maxWaitTime);
+      let listeners = this.listeners.get(uri);
+      if (!listeners) {
+        listeners = new Set();
+        this.listeners.set(uri, listeners);
+      }
+      listeners.add(changed);
+      changed();
+    });
+  }
+
   delete(uri: string): void {
     this.diagnostics.delete(uri);
     this.lastUpdate.delete(uri);
     this.versions.delete(uri);
+    this.revisions.delete(uri);
     for (const listener of this.listeners.get(uri) ?? []) listener();
   }
 

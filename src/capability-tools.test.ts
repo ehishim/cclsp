@@ -31,6 +31,14 @@ import { pathToUri } from './utils.js';
 function asClient(value: Record<string, unknown>): LSPClient {
   return {
     withDocumentWriteScopes: (_paths: string[], action: () => Promise<unknown>) => action(),
+    synchronizeRewriteFilesStrict: async () => undefined,
+    invalidateSourceFiles: async () => undefined,
+    didRenameFilesBatch: async (moves: Array<{ oldPath: string; newPath: string }>) => {
+      const didRenameFiles = value.didRenameFiles as
+        | ((oldPath: string, newPath: string) => Promise<void>)
+        | undefined;
+      for (const move of moves) await didRenameFiles?.(move.oldPath, move.newPath);
+    },
     ...value,
   } as unknown as LSPClient;
 }
@@ -375,12 +383,26 @@ describe('capability tool contracts', () => {
       didRenameFiles: async () => undefined,
     });
     try {
+      const newPath = join(root, 'missing', 'next.ts');
+      const preview = await renameFileTool.handler(
+        { old_path: oldPath, new_path: newPath },
+        client
+      );
       const result = await renameFileTool.handler(
-        { old_path: oldPath, new_path: join(root, 'missing', 'next.ts'), dry_run: false },
+        {
+          old_path: oldPath,
+          new_path: newPath,
+          dry_run: false,
+          candidate_id: preview.structuredContent?.candidateId,
+        },
         client
       );
       expect(result.isError).toBe(true);
-      expect(result.structuredContent).toMatchObject({ rolledBack: true });
+      expect(result.structuredContent).toMatchObject({
+        outcome: 'rejected',
+        code: 'LSP_FILE_RENAME_APPLY_FAILED',
+        rollbackFailures: [],
+      });
       expect(readFileSync(importer, 'utf8')).toBe(original);
       expect(readFileSync(oldPath, 'utf8')).toBe('export const value = 1;');
     } finally {
@@ -1581,6 +1603,7 @@ describe('capability tool contracts', () => {
           end_character: 16,
           title: 'Rename local',
           apply: true,
+          candidate_id: preview.structuredContent?.candidateId,
         },
         client
       );
@@ -1647,18 +1670,26 @@ describe('capability tool contracts', () => {
       start_character: 1,
       end_line: 1,
       end_character: 16,
-      apply: true,
     };
     try {
-      const applied = await getCodeActionsTool.handler(
+      const preview = await getCodeActionsTool.handler(
         { ...baseArgs, title: 'Text document change' },
+        client
+      );
+      const applied = await getCodeActionsTool.handler(
+        {
+          ...baseArgs,
+          title: 'Text document change',
+          apply: true,
+          candidate_id: preview.structuredContent?.candidateId,
+        },
         client
       );
       expect(applied.structuredContent).toMatchObject({ outcome: 'ok', applied: true });
       expect(readFileSync(file, 'utf8')).toBe('const renamed = 1;\n');
 
       const rejected = await getCodeActionsTool.handler(
-        { ...baseArgs, title: 'Resource change' },
+        { ...baseArgs, title: 'Resource change', apply: false },
         client
       );
       expect(rejected).toMatchObject({
@@ -1706,7 +1737,12 @@ describe('capability tool contracts', () => {
       expect(didRenameFiles).not.toHaveBeenCalled();
 
       const applied = await renameFileTool.handler(
-        { old_path: oldPath, new_path: newPath, dry_run: false },
+        {
+          old_path: oldPath,
+          new_path: newPath,
+          dry_run: false,
+          candidate_id: preview.structuredContent?.candidateId,
+        },
         client
       );
       expect(applied.structuredContent).toMatchObject({ outcome: 'ok', applied: true });

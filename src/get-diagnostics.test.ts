@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, jest } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
@@ -33,7 +33,7 @@ function callHandler(args: { file_path: string }, mock: MockLSPClient) {
 }
 
 function callBatchHandler(
-  args: { path: string; pattern?: string; max_files?: number },
+  args: { path: string | string[]; pattern?: string; max_files?: number },
   mock: MockLSPClient
 ) {
   return getDiagnosticsBatchTool.handler(
@@ -195,6 +195,30 @@ describe('get_diagnostics MCP tool', () => {
     const result = await callHandler({ file_path: 'test.ts' }, mockClient);
 
     expect(result.content[0]?.text).toContain('Location: Line 1, Column 1 to Line 1, Column 1');
+  });
+
+  it('merges multiple scopes into one deduplicated provider-batched call', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-diagnostics-paths-'));
+    const first = join(root, 'first');
+    const second = join(root, 'second');
+    try {
+      await Promise.all([mkdir(first), mkdir(second)]);
+      await writeFile(join(first, 'a.ts'), 'const a = 1;\n');
+      await writeFile(join(second, 'b.php'), '<?php $b = 1;\n');
+      mockClient.getDiagnosticsBatch.mockImplementation(async (filePaths: string[]) =>
+        filePaths.map((filePath) => ({ filePath, diagnostics: [] }))
+      );
+
+      await callBatchHandler({ path: [first, second, join(first, 'a.ts')] }, mockClient);
+
+      expect(mockClient.getDiagnosticsBatch).toHaveBeenCalledTimes(1);
+      expect(mockClient.getDiagnosticsBatch.mock.calls[0]?.[0]).toEqual([
+        join(first, 'a.ts'),
+        join(second, 'b.php'),
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('should scan CSS and Markdown extensions while preserving pattern and file bounds', async () => {

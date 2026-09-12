@@ -386,7 +386,17 @@ export async function findReferences(
   return [];
 }
 
-export type RenameOperationResult = WorkspaceEditResult & { prepared: boolean };
+export interface WorkspaceResourceRename {
+  kind: 'rename';
+  oldUri: string;
+  newUri: string;
+  options?: { overwrite?: boolean; ignoreIfExists?: boolean };
+}
+
+export type RenameOperationResult = WorkspaceEditResult & {
+  prepared: boolean;
+  resourceRenames: WorkspaceResourceRename[];
+};
 
 export interface RenameOperationOptions {
   allowUnpreparedPreview?: boolean;
@@ -394,6 +404,7 @@ export interface RenameOperationOptions {
 
 function normalizeRenameWorkspaceEdit(result: unknown, prepared: boolean): RenameOperationResult {
   const changes: NonNullable<WorkspaceEditResult['changes']> = {};
+  const resourceRenames: WorkspaceResourceRename[] = [];
   if (result && typeof result === 'object' && 'changes' in result) {
     const raw = (result as WorkspaceEditResult).changes;
     for (const [uri, edits] of Object.entries(raw ?? {})) {
@@ -403,9 +414,24 @@ function normalizeRenameWorkspaceEdit(result: unknown, prepared: boolean): Renam
   if (result && typeof result === 'object' && 'documentChanges' in result) {
     const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
     for (const row of documentChanges ?? []) {
-      if (!row || typeof row !== 'object' || !('textDocument' in row) || !('edits' in row)) {
+      if (!row || typeof row !== 'object') continue;
+      if ('kind' in row) {
+        const operation = row as Partial<WorkspaceResourceRename>;
+        if (
+          operation.kind === 'rename' &&
+          typeof operation.oldUri === 'string' &&
+          typeof operation.newUri === 'string'
+        ) {
+          resourceRenames.push({
+            kind: 'rename',
+            oldUri: operation.oldUri,
+            newUri: operation.newUri,
+            ...(operation.options ? { options: operation.options } : {}),
+          });
+        }
         continue;
       }
+      if (!('textDocument' in row) || !('edits' in row)) continue;
       const change = row as {
         textDocument: { uri?: unknown };
         edits: Array<{ range: { start: Position; end: Position }; newText: string }>;
@@ -417,7 +443,7 @@ function normalizeRenameWorkspaceEdit(result: unknown, prepared: boolean): Renam
       changes[uri] = [...(changes[uri] ?? []), ...change.edits];
     }
   }
-  return { changes, prepared };
+  return { changes, prepared, resourceRenames };
 }
 
 export async function renameSymbol(
@@ -716,18 +742,29 @@ export async function resolveCodeAction(
   return result && typeof result === 'object' ? (result as CodeActionResult) : action;
 }
 
-export async function willRenameFiles(
+export interface FileRenamePair {
+  oldPath: string;
+  newPath: string;
+}
+
+export async function willRenameFilesBatch(
   serverState: ServerState,
-  oldPath: string,
-  newPath: string
+  moves: FileRenamePair[]
 ): Promise<WorkspaceEditResult> {
   await serverState.initializationPromise;
-  requireFileRenameSupport(serverState, 'workspace/willRenameFiles', oldPath);
-  await ensureProjectReady(serverState, oldPath);
+  for (const move of moves) {
+    requireFileRenameSupport(serverState, 'workspace/willRenameFiles', move.oldPath);
+    await ensureProjectReady(serverState, move.oldPath);
+  }
   const method = 'workspace/willRenameFiles';
   const result = await serverState.transport.sendRequest(
     method,
-    { files: [{ oldUri: pathToUri(oldPath), newUri: pathToUri(newPath) }] },
+    {
+      files: moves.map((move) => ({
+        oldUri: pathToUri(move.oldPath),
+        newUri: pathToUri(move.newPath),
+      })),
+    },
     serverState.adapter?.getTimeout?.(method) ?? 30000
   );
   if (!result || typeof result !== 'object') return {};
@@ -758,16 +795,36 @@ export async function willRenameFiles(
   return {};
 }
 
+export async function willRenameFiles(
+  serverState: ServerState,
+  oldPath: string,
+  newPath: string
+): Promise<WorkspaceEditResult> {
+  return willRenameFilesBatch(serverState, [{ oldPath, newPath }]);
+}
+
+export async function didRenameFilesBatch(
+  serverState: ServerState,
+  moves: FileRenamePair[]
+): Promise<void> {
+  if (!supportsMethod(serverState, 'workspace/didRenameFiles')) return;
+  for (const move of moves) {
+    requireFileRenameSupport(serverState, 'workspace/didRenameFiles', move.newPath);
+  }
+  serverState.transport.sendNotification('workspace/didRenameFiles', {
+    files: moves.map((move) => ({
+      oldUri: pathToUri(move.oldPath),
+      newUri: pathToUri(move.newPath),
+    })),
+  });
+}
+
 export async function didRenameFiles(
   serverState: ServerState,
   oldPath: string,
   newPath: string
 ): Promise<void> {
-  if (!supportsMethod(serverState, 'workspace/didRenameFiles')) return;
-  requireFileRenameSupport(serverState, 'workspace/didRenameFiles', newPath);
-  serverState.transport.sendNotification('workspace/didRenameFiles', {
-    files: [{ oldUri: pathToUri(oldPath), newUri: pathToUri(newPath) }],
-  });
+  return didRenameFilesBatch(serverState, [{ oldPath, newPath }]);
 }
 
 export async function getDocumentSymbols(

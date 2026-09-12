@@ -22,6 +22,7 @@ import {
   contentSignature,
   getValidSymbolKinds,
   didRenameFiles as opsDidRenameFiles,
+  didRenameFilesBatch as opsDidRenameFilesBatch,
   findDefinition as opsFindDefinition,
   findImplementation as opsFindImplementation,
   findReferences as opsFindReferences,
@@ -44,6 +45,7 @@ import {
   resolveCodeAction as opsResolveCodeAction,
   resolveCompletionItem as opsResolveCompletionItem,
   willRenameFiles as opsWillRenameFiles,
+  willRenameFilesBatch as opsWillRenameFilesBatch,
   workspaceSymbol as opsWorkspaceSymbol,
   stringToSymbolKind,
   symbolKindToString,
@@ -53,6 +55,7 @@ import type {
   CodeActionResult,
   CompletionItemResult,
   CompletionResult,
+  FileRenamePair,
   RenameOperationOptions,
   RenameOperationResult,
   SignatureHelpResult,
@@ -403,6 +406,10 @@ export class LSPClient {
       return state ? state.documentManager.withWriter(() => run(index + 1)) : action();
     };
     return run(0);
+  }
+
+  async invalidateSourceFiles(paths: string[]): Promise<void> {
+    await Promise.all(paths.map((path) => this.astProvider.invalidate(path)));
   }
 
   async synchronizeRewriteFilesStrict(
@@ -765,6 +772,36 @@ export class LSPClient {
     return opsWillRenameFiles(serverState, oldPath, newPath);
   }
 
+  private async fileRenameGroups(
+    moves: FileRenamePair[]
+  ): Promise<Map<string, { state: ServerState; moves: FileRenamePair[] }>> {
+    const groups = new Map<string, { state: ServerState; moves: FileRenamePair[] }>();
+    for (const move of moves) {
+      const state = await this.getServer(move.oldPath);
+      const key = JSON.stringify(state.config);
+      const group = groups.get(key);
+      if (group) group.moves.push(move);
+      else groups.set(key, { state, moves: [move] });
+    }
+    return groups;
+  }
+
+  async willRenameFilesBatch(moves: FileRenamePair[]): Promise<WorkspaceEditResult> {
+    const groups = await this.fileRenameGroups(moves);
+    const answers = await Promise.all(
+      [...groups.values()].map(({ state, moves: groupedMoves }) =>
+        opsWillRenameFilesBatch(state, groupedMoves)
+      )
+    );
+    const changes: NonNullable<WorkspaceEditResult['changes']> = {};
+    for (const answer of answers) {
+      for (const [uri, edits] of Object.entries(answer.changes ?? {})) {
+        changes[uri] = [...(changes[uri] ?? []), ...edits];
+      }
+    }
+    return { changes };
+  }
+
   async didRenameFiles(oldPath: string, newPath: string): Promise<void> {
     try {
       const serverState = await this.getServer(oldPath);
@@ -775,6 +812,26 @@ export class LSPClient {
     } finally {
       await this.astProvider.invalidate(oldPath);
       await this.astProvider.invalidate(newPath);
+    }
+  }
+
+  async didRenameFilesBatch(moves: FileRenamePair[]): Promise<void> {
+    const groups = await this.fileRenameGroups(moves);
+    try {
+      for (const { state, moves: groupedMoves } of groups.values()) {
+        await state.documentManager.withWriter(async (scope) => {
+          for (const move of groupedMoves) {
+            state.documentManager.renameOpenDocument(move.oldPath, move.newPath, scope);
+          }
+          await opsDidRenameFilesBatch(state, groupedMoves);
+        });
+      }
+    } finally {
+      await Promise.all(
+        moves
+          .flatMap((move) => [move.oldPath, move.newPath])
+          .map((path) => this.astProvider.invalidate(path))
+      );
     }
   }
 

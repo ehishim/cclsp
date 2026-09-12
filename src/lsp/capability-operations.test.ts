@@ -251,7 +251,7 @@ describe('capability-gated operations', () => {
       '.renamed',
       { allowUnpreparedPreview: true }
     );
-    expect(result).toEqual({ ...edit, prepared: false });
+    expect(result).toEqual({ ...edit, prepared: false, resourceRenames: [] });
     expect(previewRequest.mock.calls.map((call) => call[0])).toEqual(['textDocument/rename']);
   });
 
@@ -462,7 +462,7 @@ describe('capability-gated operations', () => {
       { line: 0, character: 13 },
       'renamed'
     );
-    expect(result).toEqual({ ...edit, prepared: true });
+    expect(result).toEqual({ ...edit, prepared: true, resourceRenames: [] });
     expect(sendRequest.mock.calls.map((call) => call[0])).toEqual([
       'textDocument/prepareRename',
       'textDocument/rename',

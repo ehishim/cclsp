@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, jest } from 'bun:test';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
@@ -20,6 +21,10 @@ type MockLSPClient = {
   renameSymbol: ReturnType<typeof jest.fn>;
   symbolKindToString: ReturnType<typeof jest.fn>;
   syncFileContent: ReturnType<typeof jest.fn>;
+  withDocumentWriteScopes: ReturnType<typeof jest.fn>;
+  synchronizeRewriteFilesStrict: ReturnType<typeof jest.fn>;
+  invalidateSourceFiles: ReturnType<typeof jest.fn>;
+  didRenameFilesBatch: ReturnType<typeof jest.fn>;
 };
 
 function createMockClient(): MockLSPClient {
@@ -39,6 +44,12 @@ function createMockClient(): MockLSPClient {
       return kindMap[kind] || 'unknown';
     }),
     syncFileContent: jest.fn().mockResolvedValue(undefined),
+    withDocumentWriteScopes: jest.fn(async (_paths: string[], action: () => Promise<unknown>) =>
+      action()
+    ),
+    synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+    invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+    didRenameFilesBatch: jest.fn().mockResolvedValue(undefined),
   };
   mock.findDefinitionsWithProvider.mockImplementation(
     async (filePath: string, symbolName: string, symbolKind?: string) => {
@@ -511,6 +522,8 @@ describe('MCP Tool Handlers', () => {
 
   describe('rename_symbol', () => {
     it('should rename single matching symbol in dry_run mode', async () => {
+      mkdirSync(join(tmpdir(), 'src'), { recursive: true });
+      writeFileSync(SRC_TEST, '\n\n\n\n\nexport function oldName() {}\n');
       mockClient.findSymbolsByName.mockResolvedValue({
         matches: [
           {
@@ -542,7 +555,7 @@ describe('MCP Tool Handlers', () => {
 
       const result = await renameSymbolTool.handler(
         {
-          file_path: 'test.ts',
+          file_path: SRC_TEST,
           symbol_name: 'oldName',
           new_name: 'newName',
           dry_run: true,
@@ -553,6 +566,7 @@ describe('MCP Tool Handlers', () => {
       expect(result.content[0]?.text).toContain('[DRY RUN]');
       expect(result.content[0]?.text).toContain('oldName (function)');
       expect(result.content[0]?.text).toContain('"newName"');
+      rmSync(SRC_TEST, { force: true });
     });
 
     it('should return candidate list when multiple symbols match', async () => {
@@ -725,16 +739,23 @@ describe('MCP Tool Handlers', () => {
         },
       });
 
-      const result = await renameSymbolStrictTool.handler(
-        {
-          file_path: 'test.ts',
-          line: 1,
-          character: 1,
-          new_name: 'renamed',
-          dry_run: true,
-        },
-        asClient(mockClient)
-      );
+      const file = resolve('test.ts');
+      writeFileSync(file, 'test');
+      let result: Awaited<ReturnType<typeof renameSymbolStrictTool.handler>>;
+      try {
+        result = await renameSymbolStrictTool.handler(
+          {
+            file_path: 'test.ts',
+            line: 1,
+            character: 1,
+            new_name: 'renamed',
+            dry_run: true,
+          },
+          asClient(mockClient)
+        );
+      } finally {
+        rmSync(file, { force: true });
+      }
 
       expect(result.isError).toBe(true);
       expect(result.structuredContent).toMatchObject({

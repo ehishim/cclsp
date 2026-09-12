@@ -12,7 +12,7 @@ import {
 } from 'node:fs';
 import { lstat, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import type { PreparedRewrite, RewriteRollback } from './ast/types.js';
+import type { RewriteRollback } from './ast/types.js';
 import { logger } from './logger.js';
 import type { LSPClient } from './lsp-client.js';
 import { uriToPath } from './utils.js';
@@ -35,6 +35,29 @@ export interface ApplyEditResult {
   backupFiles: string[];
   error?: string;
   rollbackFailures?: string[];
+}
+
+export interface AtomicMutationFile {
+  absolutePath: string;
+  relativePath: string;
+  mode: number;
+  original: Buffer;
+  output: Buffer;
+  originalSha256: string;
+}
+
+export interface WorkspaceResourceMove {
+  oldPath: string;
+  newPath: string;
+}
+
+export interface PreparedWorkspaceEdit {
+  candidateId: `sha256:${string}`;
+  intent: string;
+  editCount: number;
+  files: AtomicMutationFile[];
+  identities: Array<{ path: string; sha256: string | null }>;
+  resourceMoves: WorkspaceResourceMove[];
 }
 
 export type AtomicRewriteStage =
@@ -63,6 +86,13 @@ export interface AtomicRewriteResult {
 
 function bufferSha256(value: Buffer): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function addLengthDelimited(hash: ReturnType<typeof createHash>, value: string): void {
+  const bytes = Buffer.from(value);
+  hash.update(String(bytes.length));
+  hash.update(':');
+  hash.update(bytes);
 }
 
 async function writeOwnedTemp(path: string, content: Buffer, mode: number): Promise<void> {
@@ -98,7 +128,7 @@ async function assertCanonicalRewriteTarget(path: string): Promise<void> {
 }
 
 export async function applyAtomicRewrite(
-  prepared: PreparedRewrite,
+  prepared: { files: AtomicMutationFile[] },
   hooks: AtomicRewriteHooks
 ): Promise<AtomicRewriteResult> {
   const files = [...prepared.files].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
@@ -237,6 +267,232 @@ export async function applyAtomicRewrite(
   }
 }
 
+export async function prepareWorkspaceEdit(
+  workspaceEdit: WorkspaceEdit,
+  intent: string,
+  identityPaths: string[] = [],
+  absentPaths: string[] = [],
+  resourceMoves: WorkspaceResourceMove[] = []
+): Promise<PreparedWorkspaceEdit> {
+  const files: AtomicMutationFile[] = [];
+  let editCount = 0;
+  for (const [uri, edits] of Object.entries(workspaceEdit.changes ?? {}).sort(([left], [right]) =>
+    left.localeCompare(right)
+  )) {
+    const absolutePath = uriToPath(uri);
+    await assertCanonicalRewriteTarget(absolutePath);
+    const fileStat = await lstat(absolutePath);
+    if (!fileStat.isFile() || fileStat.isSymbolicLink()) {
+      throw new Error(`unsafe WorkspaceEdit target: ${absolutePath}`);
+    }
+    const original = await readFile(absolutePath);
+    const originalText = original.toString('utf8');
+    const sortedEdits = [...edits].sort(
+      (left, right) =>
+        left.range.start.line - right.range.start.line ||
+        left.range.start.character - right.range.start.character ||
+        left.range.end.line - right.range.end.line ||
+        left.range.end.character - right.range.end.character ||
+        left.newText.localeCompare(right.newText)
+    );
+    const output = Buffer.from(applyEditsToContent(originalText, sortedEdits, true), 'utf8');
+    editCount += sortedEdits.length;
+    files.push({
+      absolutePath,
+      relativePath: absolutePath,
+      mode: fileStat.mode,
+      original,
+      output,
+      originalSha256: bufferSha256(original),
+    });
+  }
+  const normalizedMoves = [...resourceMoves]
+    .map((move) => ({ oldPath: move.oldPath, newPath: move.newPath }))
+    .sort(
+      (left, right) =>
+        left.oldPath.localeCompare(right.oldPath) || left.newPath.localeCompare(right.newPath)
+    );
+  const moveSources = new Set<string>();
+  const moveDestinations = new Set<string>();
+  for (const move of normalizedMoves) {
+    if (move.oldPath === move.newPath) {
+      throw new Error(`WorkspaceEdit resource rename has identical paths: ${move.oldPath}`);
+    }
+    if (moveSources.has(move.oldPath)) {
+      throw new Error(`WorkspaceEdit resource rename has duplicate source: ${move.oldPath}`);
+    }
+    if (moveDestinations.has(move.newPath)) {
+      throw new Error(`WorkspaceEdit resource rename has duplicate destination: ${move.newPath}`);
+    }
+    moveSources.add(move.oldPath);
+    moveDestinations.add(move.newPath);
+  }
+  if ([...moveDestinations].some((path) => moveSources.has(path))) {
+    throw new Error('WorkspaceEdit resource rename chains and cycles are not supported');
+  }
+  const editedPaths = new Set(files.map((file) => file.absolutePath));
+  const identities = await Promise.all([
+    ...[...new Set([...identityPaths, ...moveSources])]
+      .filter((path) => !editedPaths.has(path))
+      .sort()
+      .map(async (path) => {
+        await assertCanonicalRewriteTarget(path);
+        return { path, sha256: bufferSha256(await readFile(path)) };
+      }),
+    ...[...new Set([...absentPaths, ...moveDestinations])]
+      .filter((path) => !editedPaths.has(path))
+      .sort()
+      .map(async (path) => {
+        try {
+          await lstat(path);
+          throw new Error(`WorkspaceEdit expected absent path: ${path}`);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        return { path, sha256: null };
+      }),
+  ]);
+  const hash = createHash('sha256');
+  addLengthDelimited(hash, 'cclsp-workspace-edit-v1');
+  addLengthDelimited(hash, intent);
+  for (const file of files) {
+    addLengthDelimited(hash, file.absolutePath);
+    addLengthDelimited(hash, file.originalSha256);
+    addLengthDelimited(hash, bufferSha256(file.output));
+  }
+  for (const identity of identities) {
+    addLengthDelimited(hash, identity.path);
+    addLengthDelimited(hash, identity.sha256 ?? 'absent');
+  }
+  for (const move of normalizedMoves) {
+    addLengthDelimited(hash, move.oldPath);
+    addLengthDelimited(hash, move.newPath);
+  }
+  return {
+    candidateId: `sha256:${hash.digest('hex')}`,
+    intent,
+    editCount,
+    files,
+    identities,
+    resourceMoves: normalizedMoves,
+  };
+}
+
+export async function applyPreparedWorkspaceEdit(
+  prepared: PreparedWorkspaceEdit,
+  lspClient: LSPClient
+): Promise<ApplyEditResult> {
+  return lspClient.withDocumentWriteScopes(
+    [
+      ...prepared.files.map((file) => file.absolutePath),
+      ...prepared.identities.map((identity) => identity.path),
+      ...prepared.resourceMoves.flatMap((move) => [move.oldPath, move.newPath]),
+    ],
+    async () => {
+      for (const identity of prepared.identities) {
+        let current: string | null;
+        try {
+          current = bufferSha256(await readFile(identity.path));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          current = null;
+        }
+        if (current !== identity.sha256) {
+          return {
+            success: false,
+            filesModified: [],
+            backupFiles: [],
+            error: `WorkspaceEdit identity changed: ${identity.path}`,
+          };
+        }
+      }
+
+      const transaction = await applyAtomicRewrite(
+        { files: prepared.files },
+        {
+          synchronize: (files) => lspClient.synchronizeRewriteFilesStrict(files),
+          invalidate: (paths) => lspClient.invalidateSourceFiles(paths),
+        }
+      );
+      if (!transaction.success) {
+        return {
+          success: false,
+          filesModified: [],
+          backupFiles: [],
+          error: transaction.error,
+          ...(transaction.rollback.failedFiles.length > 0
+            ? { rollbackFailures: transaction.rollback.failedFiles }
+            : {}),
+        };
+      }
+
+      const moved: WorkspaceResourceMove[] = [];
+      try {
+        for (const move of prepared.resourceMoves) {
+          await rename(move.oldPath, move.newPath);
+          moved.push(move);
+        }
+        if (moved.length > 0) await lspClient.didRenameFilesBatch(moved);
+        return {
+          success: true,
+          filesModified: [
+            ...transaction.filesModified.filter(
+              (path) => !prepared.resourceMoves.some((move) => move.oldPath === path)
+            ),
+            ...prepared.resourceMoves.map((move) => move.newPath),
+          ],
+          backupFiles: [],
+        };
+      } catch (error) {
+        const rollbackFailures: string[] = [];
+        for (const move of [...moved].reverse()) {
+          try {
+            await rename(move.newPath, move.oldPath);
+          } catch {
+            rollbackFailures.push(`rename:${move.oldPath}`);
+          }
+        }
+        for (const file of prepared.files) {
+          try {
+            const restorePath = rewriteTempPath(file.absolutePath);
+            try {
+              await writeOwnedTemp(restorePath, file.original, file.mode);
+              await rename(restorePath, file.absolutePath);
+            } finally {
+              await unlink(restorePath).catch(() => undefined);
+            }
+          } catch {
+            rollbackFailures.push(file.absolutePath);
+          }
+        }
+        try {
+          await lspClient.synchronizeRewriteFilesStrict(
+            prepared.files.map((file) => ({
+              path: file.absolutePath,
+              content: file.original.toString('utf8'),
+            }))
+          );
+          await lspClient.invalidateSourceFiles(prepared.files.map((file) => file.absolutePath));
+          if (moved.length > 0 && !rollbackFailures.some((row) => row.startsWith('rename:'))) {
+            await lspClient.didRenameFilesBatch(
+              [...moved].reverse().map((move) => ({ oldPath: move.newPath, newPath: move.oldPath }))
+            );
+          }
+        } catch {
+          rollbackFailures.push('providers');
+        }
+        return {
+          success: false,
+          filesModified: [],
+          backupFiles: [],
+          error: error instanceof Error ? error.message : String(error),
+          ...(rollbackFailures.length > 0 ? { rollbackFailures } : {}),
+        };
+      }
+    }
+  );
+}
+
 interface FileBackup {
   originalPath: string; // The path that was requested (could be symlink)
   targetPath: string; // The actual file path (resolved symlink target or same as originalPath)
@@ -296,7 +552,7 @@ async function applyWorkspaceEditUnderScope(
 
   try {
     // Pre-flight checks
-    for (const [uri, edits] of Object.entries(workspaceEdit.changes)) {
+    for (const uri of Object.keys(workspaceEdit.changes)) {
       const filePath = uriToPath(uri);
 
       // Check file exists

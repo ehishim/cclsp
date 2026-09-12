@@ -120,17 +120,34 @@ suite('real TypeScript freshness and refactoring', () => {
         const importers = Array.from({ length: 250 }, (_, i) => join(root, `f${i}.ts`));
         for (const path of importers.slice(0, openCount)) await client.getDocumentSymbols(path);
         const start = performance.now();
+        const firstMove = { old_path: join(root, 'owner.ts'), new_path: join(root, 'renamed.ts') };
+        const firstPreview = await renameFileTool.handler(firstMove, client);
         const result = await renameFileTool.handler(
-          { old_path: join(root, 'owner.ts'), new_path: join(root, 'renamed.ts'), dry_run: false },
+          {
+            ...firstMove,
+            dry_run: false,
+            candidate_id: firstPreview.structuredContent?.candidateId,
+          },
           client
         );
         expect(result.structuredContent).toMatchObject({ outcome: 'ok', applied: true });
         expect(performance.now() - start).toBeLessThan(5000);
         for (const path of importers)
           expect(await readFile(path, 'utf8')).toContain('./renamed.js');
-        expect(await client.getDiagnostics(importers[0]!)).toEqual([]);
+        const firstImporter = importers[0];
+        if (!firstImporter) throw new Error('missing importer fixture');
+        expect(await client.getDiagnostics(firstImporter)).toEqual([]);
+        const inverseMove = {
+          old_path: join(root, 'renamed.ts'),
+          new_path: join(root, 'owner.ts'),
+        };
+        const inversePreview = await renameFileTool.handler(inverseMove, client);
         const inverse = await renameFileTool.handler(
-          { old_path: join(root, 'renamed.ts'), new_path: join(root, 'owner.ts'), dry_run: false },
+          {
+            ...inverseMove,
+            dry_run: false,
+            candidate_id: inversePreview.structuredContent?.candidateId,
+          },
           client
         );
         expect(inverse.structuredContent).toMatchObject({ outcome: 'ok', applied: true });

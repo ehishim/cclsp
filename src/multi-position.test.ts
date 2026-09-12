@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, jest } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, it, jest } from 'bun:test';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { LSPClient } from './lsp-client.js';
@@ -18,6 +19,10 @@ type MockLSPClient = {
   findImplementation: ReturnType<typeof jest.fn>;
   renameSymbol: ReturnType<typeof jest.fn>;
   syncFileContent: ReturnType<typeof jest.fn>;
+  withDocumentWriteScopes: ReturnType<typeof jest.fn>;
+  synchronizeRewriteFilesStrict: ReturnType<typeof jest.fn>;
+  invalidateSourceFiles: ReturnType<typeof jest.fn>;
+  didRenameFilesBatch: ReturnType<typeof jest.fn>;
 };
 
 function createMockClient(): MockLSPClient {
@@ -25,6 +30,12 @@ function createMockClient(): MockLSPClient {
     findImplementation: jest.fn(),
     renameSymbol: jest.fn(),
     syncFileContent: jest.fn().mockResolvedValue(undefined),
+    withDocumentWriteScopes: jest.fn(async (_paths: string[], action: () => Promise<unknown>) =>
+      action()
+    ),
+    synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+    invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+    didRenameFilesBatch: jest.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -37,6 +48,10 @@ describe('Position-based Tool Handlers', () => {
 
   beforeEach(() => {
     mockClient = createMockClient();
+    mkdirSync(join(tmpdir(), 'src'), { recursive: true });
+    for (const file of [SRC_TEST, SRC_FILE1, SRC_FILE2]) {
+      writeFileSync(file, `${'const oldName = 1;\n'.repeat(24)}`);
+    }
   });
 
   describe('find_implementation', () => {
@@ -146,7 +161,7 @@ describe('Position-based Tool Handlers', () => {
 
       await renameSymbolStrictTool.handler(
         {
-          file_path: 'test.ts',
+          file_path: SRC_TEST,
           line: 5,
           character: 10,
           new_name: 'newName',
@@ -156,7 +171,7 @@ describe('Position-based Tool Handlers', () => {
       );
 
       expect(mockClient.renameSymbol).toHaveBeenCalledWith(
-        resolve('test.ts'),
+        SRC_TEST,
         { line: 4, character: 9 },
         'newName',
         { allowUnpreparedPreview: true }
@@ -181,7 +196,7 @@ describe('Position-based Tool Handlers', () => {
 
       const result = await renameSymbolStrictTool.handler(
         {
-          file_path: 'test.ts',
+          file_path: SRC_TEST,
           line: 6,
           character: 10,
           new_name: 'newName',
@@ -253,7 +268,7 @@ describe('Position-based Tool Handlers', () => {
 
       const result = await renameSymbolStrictTool.handler(
         {
-          file_path: 'test.ts',
+          file_path: SRC_TEST,
           line: 1,
           character: 1,
           new_name: 'newName',
@@ -267,4 +282,6 @@ describe('Position-based Tool Handlers', () => {
       expect(result.content[0]?.text).toContain(`File: ${uriToPath(pathToUri(SRC_FILE2))}`);
     });
   });
+
+  afterAll(() => rmSync(join(tmpdir(), 'src'), { recursive: true, force: true }));
 });

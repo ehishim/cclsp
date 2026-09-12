@@ -77,6 +77,20 @@ describe('cclsp-hub semantic ergonomics', () => {
     });
   });
 
+  it('accumulates diagnostic paths for one multi-scope call', () => {
+    const parsed = parse([
+      'diagnostics-batch',
+      '--path',
+      'src',
+      '--path',
+      'hub/src',
+      '--pattern',
+      '\\.ts$',
+    ]);
+    expect(parsed.flags.get('path')).toEqual(['src', 'hub/src']);
+    expect(parsed.flags.get('pattern')).toBe('\\.ts$');
+  });
+
   it('parses raw-mcp as a boolean without consuming the command', () => {
     const parsed = parse(['--raw-mcp', 'document-symbols', '--file', 'src/a.ts']);
     expect(parsed.command).toBe('document-symbols');
@@ -126,6 +140,8 @@ describe('cclsp-hub semantic ergonomics', () => {
     expect(output).toContain('--query Q | --line N --character C');
     expect(output).toContain('--resolve-limit N');
     expect(output).toContain('--synthetic-trigger');
+    expect(output).toContain('--path P [--path P2 ...]');
+    expect(output).toContain('reconciles each language provider once');
     expect(output).toContain('Ambiguous and unknown queries return bounded candidates');
     expect(output).toContain('unconfirmed timeout is');
     expect(output).toContain('typed stale instead of false absence');

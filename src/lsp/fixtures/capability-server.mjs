@@ -7,6 +7,8 @@ const returnsEmptyDocumentSymbols = process.argv.includes('--empty-document-symb
 const supportsLanguageFeatures = process.argv.includes('--language-features');
 const markerArg = process.argv.find((arg) => arg.startsWith('--did-rename-marker='));
 const didRenameMarker = markerArg?.slice('--did-rename-marker='.length);
+const initializeMarkerArg = process.argv.find((arg) => arg.startsWith('--initialize-marker='));
+const initializeMarker = initializeMarkerArg?.slice('--initialize-marker='.length);
 let buffer = Buffer.alloc(0);
 
 function send(message) {
@@ -17,6 +19,7 @@ function send(message) {
 
 function handle(message) {
   if (message.method === 'initialize' && message.id !== undefined) {
+    if (initializeMarker) writeFileSync(initializeMarker, JSON.stringify(message.params));
     send({
       jsonrpc: '2.0',
       id: message.id,

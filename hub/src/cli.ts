@@ -54,7 +54,7 @@ const FLAG_ALIASES: Record<string, string> = {
 // Repeating one of these accumulates instead of overwriting. Deliberately not a
 // comma split: a structural pattern legitimately contains commas (`f($A, $B)`),
 // so splitting on them would silently corrupt the pattern it claims to accept.
-const KNOWN_MULTI = new Set(['pattern']);
+const KNOWN_MULTI = new Set(['pattern', 'path']);
 
 const KNOWN_BOOLEAN = new Set([
   'json',
@@ -190,7 +190,7 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd
   get_code_actions        --file F (--query Q | --start-line N --start-character N
                           --end-line N --end-character N) [--limit N] [--title T] [--apply]
   get_diagnostics         --file F
-  get_diagnostics_batch   --path P [--pattern RE] [--max-files N]
+  get_diagnostics_batch   --path P [--path P2 ...] [--pattern RE] [--max-files N]
   rename_symbol           --file F --symbol-name NAME --new-name NEW [--dry-run]
   rename_symbol_strict    --file F (--query Q | --line N --character C) --new-name NEW [--dry-run]
   rename_file             --old-path F --new-path F [--dry-run=false]
@@ -200,6 +200,9 @@ CODE INTELLIGENCE  (cclsp tools 1:1; routed by target path, otherwise caller cwd
   get_outgoing_calls      --file F (--query Q | --line N --character C)
   restart_server          --root R [--extensions ts,tsx]
   call <tool>             Raw passthrough; combine with --params-json '{...}'
+
+For two or more diagnostic scopes, repeat --path in one call; cclsp collapses the values,
+deduplicates files and reconciles each language provider once.
 
 Structural rewrite is syntax-only and defaults to preview. Inspect its candidate ID before
 explicit apply; use rename_symbol_strict for semantic symbol renames.
@@ -274,11 +277,13 @@ function printManagementHelp(command: string): void {
       '  A covered subroot reuses its enclosing instance; pass --isolate only to force\n' +
       '  a dedicated instance.',
     'stop-root': 'cclsp-hub stop-root <path>\n  Tear down one root and its language servers.',
-    'restart-root': 'cclsp-hub restart-root <path>\n  Restart warm roots at/below this path and its serving covering root. No warm root is a typed refusal; none is created merely to restart.',
+    'restart-root':
+      'cclsp-hub restart-root <path>\n  Restart warm roots at/below this path and its serving covering root. No warm root is a typed refusal; none is created merely to restart.',
     'list-roots':
       'cclsp-hub list-roots [--json]\n  Show active roots with pid, age, and idle time.',
     roots: 'cclsp-hub roots [--json]\n  Alias for list-roots.',
-    status: 'cclsp-hub status [--json]\n  Show daemon status, roots, and in-flight tool requests (does not start the daemon).',
+    status:
+      'cclsp-hub status [--json]\n  Show daemon status, roots, and in-flight tool requests (does not start the daemon).',
     shutdown: 'cclsp-hub shutdown\n  Stop all roots and the daemon.',
     describe: 'cclsp-hub describe [--json]\n  List the available cclsp tools.',
   };
@@ -388,8 +393,18 @@ export async function runCli(argv: string[]): Promise<void> {
           process.exitCode = 1;
           return;
         }
-        const res = (await request('restart-root', { root })) as { root: string; pid?: number; roots?: Array<{ root: string; pid?: number }> };
-        out(json ? asJson(res) : (res.roots ?? [res]).map((entry) => `restarted: ${entry.root} (pid ${entry.pid ?? '?'})`).join('\n'));
+        const res = (await request('restart-root', { root })) as {
+          root: string;
+          pid?: number;
+          roots?: Array<{ root: string; pid?: number }>;
+        };
+        out(
+          json
+            ? asJson(res)
+            : (res.roots ?? [res])
+                .map((entry) => `restarted: ${entry.root} (pid ${entry.pid ?? '?'})`)
+                .join('\n')
+        );
         return;
       }
       case 'shutdown': {

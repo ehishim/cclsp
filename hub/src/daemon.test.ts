@@ -2,7 +2,7 @@
 // the caller is told about when the retry also fails.
 
 import { describe, expect, it } from 'bun:test';
-import { InFlightRequests, callThroughRoute } from './daemon.js';
+import { InFlightRequests, callThroughRoute, resolveFilesystemParams } from './daemon.js';
 import type { RootEntry, RoutedRoot } from './pool.js';
 
 function entry(root: string, startedAt = Date.now()): RootEntry {
@@ -53,6 +53,26 @@ function poolStub(options: {
     },
   };
 }
+
+describe('Hub filesystem argument resolution', () => {
+  it('resolves scalar paths, accumulated paths and move batches against the request root', () => {
+    expect(resolveFilesystemParams({
+      file_path: 'src/a.ts',
+      path: ['src', '/absolute/pkg'],
+      moves: [
+        { old_path: 'src/a.ts', new_path: 'src/core/a.ts' },
+        { old_path: '/absolute/b.php', new_path: '/absolute/core/b.php' },
+      ],
+    }, '/repo')).toEqual({
+      file_path: '/repo/src/a.ts',
+      path: ['/repo/src', '/absolute/pkg'],
+      moves: [
+        { old_path: '/repo/src/a.ts', new_path: '/repo/src/core/a.ts' },
+        { old_path: '/absolute/b.php', new_path: '/absolute/core/b.php' },
+      ],
+    });
+  });
+});
 
 describe('callThroughRoute cancellation', () => {
   it('cancels only the correlated request and retains accounting until settlement', () => {

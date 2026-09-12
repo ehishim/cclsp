@@ -4,7 +4,13 @@ import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PreparedRewrite, PreparedRewriteFile } from './ast/types.js';
-import { type AtomicRewriteStage, applyAtomicRewrite } from './file-editor.js';
+import {
+  type AtomicRewriteStage,
+  applyAtomicRewrite,
+  applyPreparedWorkspaceEdit,
+  prepareWorkspaceEdit,
+} from './file-editor.js';
+import { pathToUri } from './utils.js';
 
 function hash(buffer: Buffer): string {
   return createHash('sha256').update(buffer).digest('hex');
@@ -65,6 +71,127 @@ async function fixture(): Promise<{ root: string; prepared: PreparedRewrite }> {
 async function noDebris(root: string): Promise<void> {
   expect((await readdir(root)).filter((name) => name.includes('cclsp-rewrite'))).toEqual([]);
 }
+
+describe('prepared WorkspaceEdit transaction', () => {
+  it('binds intent, exact edits, edited bytes, and selector bytes into a stable candidate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-edit-'));
+    const selected = join(root, 'selected.ts');
+    const edited = join(root, 'edited.ts');
+    try {
+      await writeFile(selected, 'export const oldName = 1;\n');
+      await writeFile(edited, 'import { oldName } from "./selected";\n');
+      const edit = {
+        changes: {
+          [pathToUri(edited)]: [
+            {
+              range: { start: { line: 0, character: 9 }, end: { line: 0, character: 16 } },
+              newText: 'newName',
+            },
+          ],
+        },
+      };
+      const first = await prepareWorkspaceEdit(edit, 'rename oldName to newName', [selected]);
+      const second = await prepareWorkspaceEdit(edit, 'rename oldName to newName', [selected]);
+      expect(first.candidateId).toBe(second.candidateId);
+      expect(first.editCount).toBe(1);
+      await writeFile(selected, 'export const changed = 1;\n');
+      const changed = await prepareWorkspaceEdit(edit, 'rename oldName to newName', [selected]);
+      expect(changed.candidateId).not.toBe(first.candidateId);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('moves provider resource renames in the same prepared transaction', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-resource-rename-'));
+    const owner = join(root, 'Owner.php');
+    const destination = join(root, 'RenamedOwner.php');
+    const consumer = join(root, 'Consumer.php');
+    try {
+      await writeFile(owner, '<?php class Owner {}\n');
+      await writeFile(consumer, '<?php new Owner();\n');
+      const prepared = await prepareWorkspaceEdit(
+        {
+          changes: {
+            [pathToUri(owner)]: [
+              {
+                range: { start: { line: 0, character: 12 }, end: { line: 0, character: 17 } },
+                newText: 'RenamedOwner',
+              },
+            ],
+            [pathToUri(consumer)]: [
+              {
+                range: { start: { line: 0, character: 10 }, end: { line: 0, character: 15 } },
+                newText: 'RenamedOwner',
+              },
+            ],
+          },
+        },
+        'rename Owner to RenamedOwner',
+        [owner],
+        [],
+        [{ oldPath: owner, newPath: destination }]
+      );
+      const client = {
+        withDocumentWriteScopes: async (_paths: string[], action: () => Promise<unknown>) =>
+          action(),
+        synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+        invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+        didRenameFilesBatch: jest.fn().mockResolvedValue(undefined),
+      };
+      const result = await applyPreparedWorkspaceEdit(prepared, client as never);
+      expect(result).toMatchObject({ success: true });
+      expect(await Bun.file(owner).exists()).toBe(false);
+      expect(await readFile(destination, 'utf8')).toContain('class RenamedOwner');
+      expect(await readFile(consumer, 'utf8')).toContain('new RenamedOwner');
+      expect(client.didRenameFilesBatch).toHaveBeenCalledWith([
+        { oldPath: owner, newPath: destination },
+      ]);
+      expect(client.invalidateSourceFiles).toHaveBeenCalledWith([consumer, owner]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses changed selector bytes before mutating edited files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-edit-stale-'));
+    const selected = join(root, 'selected.ts');
+    const edited = join(root, 'edited.ts');
+    try {
+      await writeFile(selected, 'export const oldName = 1;\n');
+      await writeFile(edited, 'import { oldName } from "./selected";\n');
+      const prepared = await prepareWorkspaceEdit(
+        {
+          changes: {
+            [pathToUri(edited)]: [
+              {
+                range: { start: { line: 0, character: 9 }, end: { line: 0, character: 16 } },
+                newText: 'newName',
+              },
+            ],
+          },
+        },
+        'rename oldName to newName',
+        [selected]
+      );
+      await writeFile(selected, 'export const changed = 1;\n');
+      const client = {
+        withDocumentWriteScopes: async (_paths: string[], action: () => Promise<unknown>) =>
+          action(),
+        synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+        invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+        didRenameFilesBatch: jest.fn().mockResolvedValue(undefined),
+      };
+      const result = await applyPreparedWorkspaceEdit(prepared, client as never);
+      expect(result).toMatchObject({ success: false, filesModified: [] });
+      expect(result.error).toContain('identity changed');
+      expect(await readFile(edited, 'utf8')).toContain('oldName');
+      expect(client.synchronizeRewriteFilesStrict).not.toHaveBeenCalled();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('applyAtomicRewrite', () => {
   it('prepares every temp before the first rename and preserves exact bytes and modes', async () => {

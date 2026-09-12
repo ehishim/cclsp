@@ -1,7 +1,7 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
-import { applyWorkspaceEdit } from '../file-editor.js';
+import { existsSync } from 'node:fs';
+import { applyPreparedWorkspaceEdit, prepareWorkspaceEdit } from '../file-editor.js';
 import type { LSPClient } from '../lsp-client.js';
-import { pathToUri, uriToPath } from '../utils.js';
+import { uriToPath } from '../utils.js';
 import { resolvePath, rethrowToolOutcome, textResult, withWarning } from './helpers.js';
 import {
   positionResolutionResult,
@@ -23,7 +23,7 @@ function matchKindText(
 export const renameSymbolTool: ToolDefinition = {
   name: 'rename_symbol',
   description:
-    'Rename a symbol by name and kind in a file. If multiple symbols match, returns candidate positions and suggests using rename_symbol_strict. By default, this will apply the rename to the files. Use dry_run to preview changes without applying them.',
+    'Resolve one symbol by name and kind, then use the same candidate-bound preview/apply transaction as rename_symbol_strict.',
   inputSchema: {
     type: 'object',
     properties: {
@@ -45,7 +45,11 @@ export const renameSymbolTool: ToolDefinition = {
       },
       dry_run: {
         type: 'boolean',
-        description: 'If true, only preview the changes without applying them (default: false)',
+        description: 'Preview by default; set false with candidate_id to apply',
+      },
+      candidate_id: {
+        type: 'string',
+        description: 'Opaque candidate identity returned by preview; required to apply',
       },
     },
     required: ['file_path', 'symbol_name', 'new_name'],
@@ -56,13 +60,15 @@ export const renameSymbolTool: ToolDefinition = {
       symbol_name,
       symbol_kind,
       new_name,
-      dry_run = false,
+      dry_run = true,
+      candidate_id,
     } = args as {
       file_path: string;
       symbol_name: string;
       symbol_kind?: string;
       new_name: string;
       dry_run?: boolean;
+      candidate_id?: string;
     };
     const absolutePath = resolvePath(file_path);
 
@@ -121,50 +127,24 @@ export const renameSymbolTool: ToolDefinition = {
       throw new Error('Unexpected error: no match found');
     }
     try {
-      const workspaceEdit = await client.renameSymbol(absolutePath, match.position, new_name);
-
-      if (workspaceEdit?.changes && Object.keys(workspaceEdit.changes).length > 0) {
-        const changes = [];
-        for (const [uri, edits] of Object.entries(workspaceEdit.changes)) {
-          const filePath = uriToPath(uri);
-          changes.push(`File: ${filePath}`);
-          for (const edit of edits) {
-            const { start, end } = edit.range;
-            changes.push(
-              `  - Line ${start.line + 1}, Column ${start.character + 1} to Line ${end.line + 1}, Column ${end.character + 1}: "${edit.newText}"`
-            );
-          }
-        }
-
-        // Apply changes if not in dry run mode
-        if (!dry_run) {
-          const editResult = await applyWorkspaceEdit(workspaceEdit, { lspClient: client });
-
-          if (!editResult.success) {
-            return textResult(`Failed to apply rename: ${editResult.error}`);
-          }
-
-          return textResult(
-            withWarning(
-              warning,
-              `Successfully renamed ${match.name} (${matchKindText(match, client)}) to "${new_name}".\n\nModified files:\n${editResult.filesModified.map((f) => `- ${f}`).join('\n')}`
-            )
-          );
-        }
-        // Dry run mode - show preview
-        return textResult(
-          withWarning(
-            warning,
-            `[DRY RUN] Would rename ${match.name} (${matchKindText(match, client)}) to "${new_name}":\n${changes.join('\n')}`
-          )
+      const rename = await renameSymbolStrictTool.handler(
+        {
+          file_path,
+          line: match.position.line + 1,
+          character: match.position.character + 1,
+          new_name,
+          dry_run,
+          ...(candidate_id ? { candidate_id } : {}),
+        },
+        client
+      );
+      if (rename.content[0]?.type === 'text') {
+        rename.content[0].text = withWarning(
+          warning,
+          `${match.name} (${matchKindText(match, client)})\n\n${rename.content[0].text}`
         );
       }
-      return textResult(
-        withWarning(
-          warning,
-          `No rename edits available for ${match.name} (${matchKindText(match, client)}). The symbol may not be renameable or the language server doesn't support renaming this type of symbol.`
-        )
-      );
+      return rename;
     } catch (error) {
       rethrowToolOutcome(error);
       return textResult(
@@ -190,6 +170,10 @@ export const renameSymbolStrictTool: ToolDefinition = {
         type: 'boolean',
         description: 'If true, only preview the changes without applying them (default: false)',
       },
+      candidate_id: {
+        type: 'string',
+        description: 'Opaque candidate identity returned by dry_run; required to apply',
+      },
     },
     required: ['file_path', 'new_name'],
   },
@@ -201,6 +185,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
       character,
       new_name,
       dry_run = false,
+      candidate_id,
     } = args as {
       file_path: string;
       query?: string;
@@ -208,6 +193,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
       character?: number;
       new_name: string;
       dry_run?: boolean;
+      candidate_id?: string;
     };
     const absolutePath = resolvePath(file_path);
     try {
@@ -223,6 +209,16 @@ export const renameSymbolStrictTool: ToolDefinition = {
         allowUnpreparedPreview: dry_run,
       });
       const changes = workspaceEdit.changes ?? {};
+      const resourceMoves = (workspaceEdit.resourceRenames ?? []).map((move) => ({
+        oldPath: uriToPath(move.oldUri),
+        newPath: uriToPath(move.newUri),
+      }));
+      const intent = JSON.stringify({
+        operation: 'rename_symbol_strict',
+        file: absolutePath,
+        position: resolution.position,
+        newName: new_name,
+      });
       const editCount = Object.values(changes).reduce((total, edits) => total + edits.length, 0);
       const resolved = resolvedFromText(resolution);
       const resolvedFrom = resolvedFromMetadata(resolution);
@@ -267,7 +263,7 @@ export const renameSymbolStrictTool: ToolDefinition = {
           isError: true,
         };
       }
-      if (Object.keys(changes).length === 0) {
+      if (Object.keys(changes).length === 0 && resourceMoves.length === 0) {
         return {
           content: [
             {
@@ -288,6 +284,13 @@ export const renameSymbolStrictTool: ToolDefinition = {
           },
         };
       }
+      const preparedEdit = await prepareWorkspaceEdit(
+        { changes },
+        intent,
+        [absolutePath],
+        [],
+        resourceMoves
+      );
       if (dry_run) {
         return {
           content: [
@@ -303,14 +306,63 @@ export const renameSymbolStrictTool: ToolDefinition = {
             prepared: true,
             applied: false,
             edit: workspaceEdit,
-            shown: editCount,
-            total: editCount,
+            resourceMoves,
+            candidateId: preparedEdit.candidateId,
+            shown: editCount + resourceMoves.length,
+            total: editCount + resourceMoves.length,
             omitted: 0,
           },
         };
       }
-      const editResult = await applyWorkspaceEdit(workspaceEdit, { lspClient: client });
-      if (!editResult.success) return textResult(`Failed to apply rename: ${editResult.error}`);
+      if (!candidate_id) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'LSP_RENAME_PREVIEW_REQUIRED: apply requires candidate_id from an inspected dry-run preview',
+            },
+          ],
+          structuredContent: {
+            outcome: 'rejected',
+            code: 'LSP_RENAME_PREVIEW_REQUIRED',
+            applied: false,
+            candidateId: preparedEdit.candidateId,
+          },
+          isError: true,
+        };
+      }
+      if (candidate_id !== preparedEdit.candidateId) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: 'LSP_RENAME_STALE: rename edits or source bytes changed since preview',
+            },
+          ],
+          structuredContent: {
+            outcome: 'rejected',
+            code: 'LSP_RENAME_STALE',
+            applied: false,
+            candidateId: preparedEdit.candidateId,
+          },
+          isError: true,
+        };
+      }
+      const editResult = await applyPreparedWorkspaceEdit(preparedEdit, client);
+      if (!editResult.success) {
+        return {
+          content: [{ type: 'text', text: `Failed to apply rename: ${editResult.error}` }],
+          structuredContent: {
+            outcome: 'rejected',
+            code: editResult.error?.includes('changed')
+              ? 'LSP_RENAME_STALE'
+              : 'LSP_RENAME_APPLY_FAILED',
+            applied: false,
+            rollbackFailures: editResult.rollbackFailures ?? [],
+          },
+          isError: true,
+        };
+      }
       return {
         content: [
           {
@@ -323,9 +375,11 @@ export const renameSymbolStrictTool: ToolDefinition = {
           provider: 'lsp',
           ...(resolvedFrom ? { resolvedFrom } : {}),
           applied: true,
+          candidateId: preparedEdit.candidateId,
           filesModified: editResult.filesModified,
-          shown: editCount,
-          total: editCount,
+          resourceMoves,
+          shown: editCount + resourceMoves.length,
+          total: editCount + resourceMoves.length,
           omitted: 0,
         },
       };
@@ -336,150 +390,210 @@ export const renameSymbolStrictTool: ToolDefinition = {
   },
 };
 
+interface FileMoveInput {
+  old_path: string;
+  new_path: string;
+}
+
+function validateFileMoveBatch(moves: FileMoveInput[]): string | null {
+  if (moves.length < 1 || moves.length > 100) return 'moves must contain 1 to 100 file renames';
+  const sources = new Set<string>();
+  const destinations = new Set<string>();
+  for (const move of moves) {
+    if (!move.old_path || !move.new_path) return 'each move requires old_path and new_path';
+    if (move.old_path === move.new_path)
+      return `source and destination are identical: ${move.old_path}`;
+    if (sources.has(move.old_path)) return `duplicate source: ${move.old_path}`;
+    if (destinations.has(move.new_path)) return `duplicate destination: ${move.new_path}`;
+    sources.add(move.old_path);
+    destinations.add(move.new_path);
+  }
+  if ([...destinations].some((destination) => sources.has(destination))) {
+    return 'rename cycles and destination/source chains are not supported in one batch';
+  }
+  return null;
+}
+
 export const renameFileTool: ToolDefinition = {
   name: 'rename_file',
   description:
-    'Rename a file with language-server willRenameFiles import edits, then notify didRenameFiles. Defaults to dry-run.',
+    'Preview or atomically apply 1-100 file moves with one native willRenameFiles batch per language provider. Apply requires the candidate_id returned by preview.',
   inputSchema: {
     type: 'object',
     properties: {
-      old_path: { type: 'string', description: 'Existing file path' },
-      new_path: { type: 'string', description: 'Destination file path' },
+      old_path: { type: 'string', description: 'Existing file path (single-move compatibility)' },
+      new_path: {
+        type: 'string',
+        description: 'Destination file path (single-move compatibility)',
+      },
+      moves: {
+        type: 'array',
+        minItems: 1,
+        maxItems: 100,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            old_path: { type: 'string' },
+            new_path: { type: 'string' },
+          },
+          required: ['old_path', 'new_path'],
+        },
+        description: 'Primary batch form: 1-100 file moves applied as one candidate',
+      },
       dry_run: { type: 'boolean', description: 'Preview only (default true)' },
+      candidate_id: {
+        type: 'string',
+        description: 'Opaque identity from preview; required when dry_run=false',
+      },
     },
-    required: ['old_path', 'new_path'],
+    oneOf: [{ required: ['old_path', 'new_path'] }, { required: ['moves'] }],
   },
   handler: async (args, client) => {
     const {
       old_path,
       new_path,
       dry_run = true,
+      candidate_id,
+      moves: rawMoves,
     } = args as {
-      old_path: string;
-      new_path: string;
+      old_path?: string;
+      new_path?: string;
+      moves?: FileMoveInput[];
       dry_run?: boolean;
+      candidate_id?: string;
     };
-    const oldPath = resolvePath(old_path);
-    const newPath = resolvePath(new_path);
-    if (!existsSync(oldPath)) return textResult(`File does not exist: ${oldPath}`);
-    if (existsSync(newPath)) return textResult(`Destination already exists: ${newPath}`);
+    const suppliedMoves = rawMoves ?? (old_path && new_path ? [{ old_path, new_path }] : []);
+    const invalid = validateFileMoveBatch(suppliedMoves);
+    if (invalid) return textResult(`Invalid file rename batch: ${invalid}`);
+    const moves = suppliedMoves.map((move) => ({
+      oldPath: resolvePath(move.old_path),
+      newPath: resolvePath(move.new_path),
+    }));
+    for (const move of moves) {
+      if (!existsSync(move.oldPath)) return textResult(`File does not exist: ${move.oldPath}`);
+      if (existsSync(move.newPath))
+        return textResult(`Destination already exists: ${move.newPath}`);
+    }
+    const firstMove = moves[0];
+    if (!firstMove) return textResult('Invalid file rename batch: no moves');
     try {
-      const edit = await client.willRenameFiles(oldPath, newPath);
-      const oldUri = pathToUri(oldPath);
-      const newUri = pathToUri(newPath);
-      const normalizedChanges = { ...(edit.changes ?? {}) };
-      if (normalizedChanges[oldUri]) {
-        normalizedChanges[newUri] = [
-          ...(normalizedChanges[newUri] ?? []),
-          ...normalizedChanges[oldUri],
-        ];
-        delete normalizedChanges[oldUri];
-      }
-      const normalizedEdit = { changes: normalizedChanges };
+      const edit =
+        typeof client.willRenameFilesBatch === 'function'
+          ? await client.willRenameFilesBatch(moves)
+          : await client.willRenameFiles(firstMove.oldPath, firstMove.newPath);
+      const normalizedEdit = { changes: edit.changes ?? {} };
+      const intent = JSON.stringify({ operation: 'rename_file', moves });
+      const preparedEdit = await prepareWorkspaceEdit(
+        normalizedEdit,
+        intent,
+        moves.map((move) => move.oldPath),
+        moves.map((move) => move.newPath),
+        moves
+      );
       if (dry_run) {
         return {
           content: [
             {
               type: 'text' as const,
-              text: `[DRY RUN] Would rename ${oldPath} to ${newPath} and apply:\n${JSON.stringify(normalizedChanges, null, 2)}`,
+              text: `[DRY RUN] Would rename ${moves.length} file(s) and apply:\n${moves.map((move) => `${move.oldPath} -> ${move.newPath}`).join('\n')}\n${JSON.stringify(normalizedEdit.changes, null, 2)}`,
             },
           ],
           structuredContent: {
             outcome: 'ok',
             applied: false,
-            oldPath,
-            newPath,
+            moves,
+            candidateId: preparedEdit.candidateId,
             edit: normalizedEdit,
           },
         };
       }
-      return await client.withDocumentWriteScopes(
-        [oldPath, ...Object.keys(edit.changes ?? {}).map(uriToPath)],
-        async () => {
-          if (!existsSync(oldPath) || existsSync(newPath))
-            throw new Error('File rename target changed before apply');
-          const currentEdit = await client.willRenameFiles(oldPath, newPath);
-          if (JSON.stringify(currentEdit) !== JSON.stringify(edit))
-            throw new Error('File rename edits changed before apply; preview again');
-          const originals = new Map(
-            Object.keys(edit.changes ?? {}).map((uri) => {
-              const path = uriToPath(uri);
-              return [path, readFileSync(path)] as const;
-            })
-          );
-          let moved = false;
-          let applied: Awaited<ReturnType<typeof applyWorkspaceEdit>>;
-          try {
-            applied = await applyWorkspaceEdit(edit, { createBackups: false });
-            if (!applied.success) throw new Error(applied.error ?? 'failed to update imports');
-            renameSync(oldPath, newPath);
-            moved = true;
-            await client.didRenameFiles(oldPath, newPath);
-            for (const path of applied.filesModified)
-              await client.syncFileContent(path === oldPath ? newPath : path);
-          } catch (error) {
-            const failures: string[] = [];
-            if (moved) {
-              try {
-                renameSync(newPath, oldPath);
-              } catch {
-                failures.push('rename');
-              }
-            }
-            for (const [path, bytes] of originals) {
-              try {
-                writeFileSync(path, bytes);
-              } catch {
-                failures.push(path);
-              }
-            }
-            if (moved && !failures.includes('rename')) {
-              try {
-                await client.didRenameFiles(newPath, oldPath);
-              } catch {
-                failures.push('documents');
-              }
-            }
-            for (const path of originals.keys()) {
-              try {
-                await client.syncFileContent(path);
-              } catch {
-                failures.push(`sync:${path}`);
-              }
-            }
-            return {
-              content: [
-                {
-                  type: 'text' as const,
-                  text: `File rename failed: ${String(error)}; rollback ${failures.length ? 'incomplete' : 'complete'}`,
-                },
-              ],
-              structuredContent: {
-                outcome: 'rejected',
-                code: 'LSP_ACTION_NOT_APPLICABLE',
-                rolledBack: failures.length === 0,
-                rollbackFailures: failures,
-              },
-              isError: true,
-            };
-          }
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `Renamed ${oldPath} to ${newPath}${applied.filesModified.length > 0 ? ` and updated:\n${applied.filesModified.join('\n')}` : ''}`,
-              },
-            ],
-            structuredContent: {
-              outcome: 'ok',
-              applied: true,
-              oldPath,
-              newPath,
-              filesModified: applied.filesModified,
+      if (!candidate_id) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'LSP_FILE_RENAME_PREVIEW_REQUIRED: apply requires candidate_id from preview',
             },
-          };
-        }
+          ],
+          structuredContent: {
+            outcome: 'rejected',
+            code: 'LSP_FILE_RENAME_PREVIEW_REQUIRED',
+            applied: false,
+          },
+          isError: true,
+        };
+      }
+      if (candidate_id !== preparedEdit.candidateId) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'LSP_FILE_RENAME_STALE: file, import edits, or source bytes changed since preview',
+            },
+          ],
+          structuredContent: { outcome: 'rejected', code: 'LSP_FILE_RENAME_STALE', applied: false },
+          isError: true,
+        };
+      }
+      const currentEdit =
+        typeof client.willRenameFilesBatch === 'function'
+          ? await client.willRenameFilesBatch(moves)
+          : await client.willRenameFiles(firstMove.oldPath, firstMove.newPath);
+      const currentPrepared = await prepareWorkspaceEdit(
+        { changes: currentEdit.changes ?? {} },
+        intent,
+        moves.map((move) => move.oldPath),
+        moves.map((move) => move.newPath),
+        moves
       );
+      if (currentPrepared.candidateId !== candidate_id) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: 'LSP_FILE_RENAME_STALE: file, import edits, or source bytes changed since preview',
+            },
+          ],
+          structuredContent: { outcome: 'rejected', code: 'LSP_FILE_RENAME_STALE', applied: false },
+          isError: true,
+        };
+      }
+      const applied = await applyPreparedWorkspaceEdit(currentPrepared, client);
+      if (!applied.success) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `File rename failed: ${applied.error ?? 'transaction failed'}`,
+            },
+          ],
+          structuredContent: {
+            outcome: 'rejected',
+            code: applied.error?.includes('changed')
+              ? 'LSP_FILE_RENAME_STALE'
+              : 'LSP_FILE_RENAME_APPLY_FAILED',
+            applied: false,
+            rollbackFailures: applied.rollbackFailures ?? [],
+          },
+          isError: true,
+        };
+      }
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: `Renamed ${moves.length} file(s)${applied.filesModified.length > 0 ? ` and updated:\n${applied.filesModified.join('\n')}` : ''}`,
+          },
+        ],
+        structuredContent: {
+          outcome: 'ok',
+          applied: true,
+          moves,
+          candidateId: currentPrepared.candidateId,
+          filesModified: applied.filesModified,
+        },
+      };
     } catch (error) {
       rethrowToolOutcome(error);
       throw error;

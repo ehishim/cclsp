@@ -1,5 +1,5 @@
 import { readdir, stat } from 'node:fs/promises';
-import { extname, join, resolve } from 'node:path';
+import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { loadGitignore } from '../file-scanner.js';
 import {
   SEMANTIC_DEFAULT_LIMIT,
@@ -130,14 +130,14 @@ export const getDiagnosticsTool: ToolDefinition = {
 export const getDiagnosticsBatchTool: ToolDefinition = {
   name: 'get_diagnostics_batch',
   description:
-    'Check a directory or file for errors, warnings and hints in one call. Filter paths to focus on the affected area. Results distinguish current diagnostics from unverified files and say when the file limit leaves more to check.',
+    'Check one or more files/directories in one call. Pass path once or as an array; files are deduplicated, then reconciled once per language provider.',
   inputSchema: {
     type: 'object',
     properties: {
       path: {
-        type: 'string',
+        anyOf: [{ type: 'string' }, { type: 'array', minItems: 1, items: { type: 'string' } }],
         description:
-          'Directory path to scan for files, or a single file path. Respects .gitignore.',
+          'One file/directory or several scopes merged into one deduplicated provider-batched request. Respects .gitignore.',
       },
       pattern: {
         type: 'string',
@@ -167,7 +167,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
       max_files,
       preview,
     } = args as {
-      path: string;
+      path: string | string[];
       pattern?: string;
       severity_filter?: string;
       max_files?: number;
@@ -177,7 +177,10 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
     // hundred diagnostics inside one file cost one read, not a hundred.
     const source = createSourcePreview(preview);
 
-    const absolutePath = resolve(inputPath);
+    const requestedPaths = (Array.isArray(inputPath) ? inputPath : [inputPath])
+      .map((path) => path.trim())
+      .filter(Boolean)
+      .map((path) => resolve(path));
     // The per-call default (when max_files is omitted) and the upper bound are both
     // configurable for large repos. These live in cclsp core so the plain MCP server
     // and any wrapper (e.g. cclsp-hub) honor the same limits.
@@ -194,37 +197,60 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
     try {
       if (!Number.isInteger(maxFiles) || maxFiles < 1)
         throw new Error('max_files must be a positive integer');
-      // Check if path is a file or directory
-      const pathStat = await stat(absolutePath);
-
-      let filePaths: string[];
-      let truncated = false;
-
-      if (pathStat.isFile()) {
-        filePaths = [absolutePath];
-      } else if (pathStat.isDirectory()) {
-        // Compile regex if provided
-        let regex: RegExp | null = null;
-        if (pattern) {
-          try {
-            regex = new RegExp(pattern);
-          } catch {
-            throw new Error(`Invalid regex pattern: ${pattern}`);
-          }
+      if (requestedPaths.length === 0) throw new Error('path must contain at least one scope');
+      let regex: RegExp | null = null;
+      if (pattern) {
+        try {
+          regex = new RegExp(pattern);
+        } catch {
+          throw new Error(`Invalid regex pattern: ${pattern}`);
         }
-
-        // Scan directory for files
-        filePaths = await scanFilesRecursive(absolutePath, regex, maxFiles + 1);
-        truncated = filePaths.length > maxFiles;
-        filePaths = filePaths.slice(0, maxFiles);
-
-        if (filePaths.length === 0) {
-          const patternMsg = pattern ? ` matching pattern "${pattern}"` : '';
-          return textResult(`No files found in ${inputPath}${patternMsg}.`);
-        }
-      } else {
-        throw new Error(`Path is neither a file nor a directory: ${inputPath}`);
       }
+
+      const files = new Set<string>();
+      const directoryRoots: string[] = [];
+      let truncated = false;
+      for (const requestedPath of requestedPaths) {
+        const pathStat = await stat(requestedPath);
+        if (pathStat.isFile()) {
+          if (!regex || regex.test(requestedPath.split('/').at(-1) ?? requestedPath)) {
+            files.add(requestedPath);
+          }
+        } else if (pathStat.isDirectory()) {
+          directoryRoots.push(requestedPath);
+          const scanned = await scanFilesRecursive(requestedPath, regex, maxFiles + 1);
+          if (scanned.length > maxFiles) truncated = true;
+          for (const filePath of scanned) {
+            files.add(filePath);
+            if (files.size > maxFiles) {
+              truncated = true;
+              break;
+            }
+          }
+        } else {
+          throw new Error(`Path is neither a file nor a directory: ${requestedPath}`);
+        }
+        if (files.size > maxFiles) break;
+      }
+      const filePaths = [...files].sort().slice(0, maxFiles);
+      if (filePaths.length === 0) {
+        const patternMsg = pattern ? ` matching pattern "${pattern}"` : '';
+        return textResult(`No files found across ${requestedPaths.length} scope(s)${patternMsg}.`);
+      }
+
+      const displayPathFor = (filePath: string): string => {
+        const candidates = directoryRoots
+          .map((root) => relative(root, filePath))
+          .filter(
+            (value) =>
+              value !== '' &&
+              value !== '..' &&
+              !value.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) &&
+              !isAbsolute(value)
+          )
+          .sort((left, right) => left.length - right.length || left.localeCompare(right));
+        return candidates[0] ?? filePath;
+      };
 
       // Run batch diagnostics
       const severityThreshold = severity_filter
@@ -295,9 +321,7 @@ export const getDiagnosticsBatchTool: ToolDefinition = {
         totalDiags += filtered.length;
 
         // Format relative path for display
-        const displayPath = pathStat.isDirectory()
-          ? result.filePath.slice(absolutePath.length + 1)
-          : result.filePath;
+        const displayPath = displayPathFor(result.filePath);
 
         fileOutputs.push(formatDiagnosticsForFile(displayPath, filtered, result.filePath, source));
       }

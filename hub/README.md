@@ -123,7 +123,7 @@ Line/character are **1-indexed**.
 | `get_signature_help` | `signatures` | `--file --line --character` | `--trigger-character` |
 | `get_code_actions` | `code-actions` | `--file --start-line --start-character --end-line --end-character` | `--title --apply` |
 | `get_diagnostics` | `diagnostics` | `--file` | |
-| `get_diagnostics_batch` | `diagnostics-batch` | `--path` | `--pattern --max-files` |
+| `get_diagnostics_batch` | `diagnostics-batch` | `--path` (repeatable) | `--pattern --max-files` |
 | `rename_symbol` | `rename` | `--file --symbol-name --new-name` | `--symbol-kind --dry-run` |
 | `rename_symbol_strict` | `rename-strict` | `--file --line --character --new-name` | `--dry-run` |
 | `rename_file` | `rename-file` | `--old-path --new-path` | `--dry-run=false` to apply |
@@ -172,6 +172,7 @@ Apply requires an unchanged fresh candidate. It is limited to 100 changes, 512 K
 This is syntax-only transformation, not semantic rename. Identifier-only changes return `AST_REWRITE_SEMANTIC_RENAME`; use `rename_symbol_strict` so LSP `prepareRename` and semantic references own symbol changes. Preview-required, stale, capture, target, conflict, output, and scope failures are typed `AST_REWRITE_*` nonzero outcomes.
 
 Flag notes:
+- For two or more diagnostic files/directories, prefer one `diagnostics-batch` call with repeated `--path`; the parser collapses it to one array, cclsp deduplicates files, and runs one reconciliation/collection cycle per language provider. `--pattern` filters relative file names, not source text.
 - `--file` is sugar for `--file-path`; `--symbol` for `--symbol-name`.
 - Parameter flags accept kebab- or snake-case (`--new-name` == `--new_name`).
 - `--params-json '{...}'` merges raw JSON params (handy for arrays / new tools).

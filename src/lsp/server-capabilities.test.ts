@@ -31,6 +31,25 @@ describe('ServerManager initialize capabilities', () => {
     }
   });
 
+  it('advertises rename resource operations so providers can return file moves', async () => {
+    const manager = new ServerManager();
+    const initializeMarker = join(fixtureRoot, 'initialize.json');
+    try {
+      await manager.getServer({
+        extensions: ['supported'],
+        command: [process.execPath, fixtureServer, `--initialize-marker=${initializeMarker}`],
+        rootDir: fixtureRoot,
+      });
+      const initialize = JSON.parse(await Bun.file(initializeMarker).text());
+      expect(initialize.capabilities.workspace.workspaceEdit).toEqual({
+        documentChanges: true,
+        resourceOperations: ['rename'],
+      });
+    } finally {
+      await manager.dispose();
+    }
+  });
+
   it('records absence and rejects before sending an unsupported request', async () => {
     const manager = new ServerManager();
     try {

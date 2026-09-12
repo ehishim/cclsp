@@ -1,4 +1,4 @@
-import { applyWorkspaceEdit } from '../file-editor.js';
+import { applyPreparedWorkspaceEdit, prepareWorkspaceEdit } from '../file-editor.js';
 import type {
   CodeActionResult,
   CompletionItemResult,
@@ -548,6 +548,10 @@ export const getCodeActionsTool: ToolDefinition = {
       limit: { type: 'number', description: 'Maximum actions to list (default 20, max 50)' },
       title: { type: 'string', description: 'Exact action title to select' },
       apply: { type: 'boolean', description: 'Apply the selected WorkspaceEdit (default false)' },
+      candidate_id: {
+        type: 'string',
+        description: 'Opaque identity from the exact-title preview; required when apply=true',
+      },
     },
     required: ['file_path'],
   },
@@ -562,6 +566,7 @@ export const getCodeActionsTool: ToolDefinition = {
       limit,
       title,
       apply = false,
+      candidate_id,
     } = args as {
       file_path: string;
       query?: string;
@@ -572,6 +577,7 @@ export const getCodeActionsTool: ToolDefinition = {
       limit?: number;
       title?: string;
       apply?: boolean;
+      candidate_id?: string;
     };
     const absolutePath = resolvePath(file_path);
     try {
@@ -681,6 +687,14 @@ export const getCodeActionsTool: ToolDefinition = {
       if (!normalizedEdit?.changes || Object.keys(normalizedEdit.changes).length === 0) {
         return rejectedResult('textDocument/codeAction', 'the action did not provide text edits');
       }
+      const intent = JSON.stringify({
+        operation: 'code_action',
+        file: absolutePath,
+        position: resolution.position,
+        end,
+        title,
+      });
+      const preparedEdit = await prepareWorkspaceEdit(normalizedEdit, intent, [absolutePath]);
       if (!apply) {
         return {
           content: [
@@ -694,12 +708,25 @@ export const getCodeActionsTool: ToolDefinition = {
             ...(resolvedFrom ? { resolvedFrom } : {}),
             applied: false,
             title,
+            candidateId: preparedEdit.candidateId,
             edit: normalizedEdit,
             preview: previewWorkspaceEdit(selected.edit),
           },
         };
       }
-      const applied = await applyWorkspaceEdit(normalizedEdit, { lspClient: client });
+      if (!candidate_id) {
+        return rejectedResult(
+          'textDocument/codeAction',
+          'apply requires candidate_id from an inspected exact-title preview'
+        );
+      }
+      if (candidate_id !== preparedEdit.candidateId) {
+        return rejectedResult(
+          'textDocument/codeAction',
+          'code action edits or source bytes changed since preview'
+        );
+      }
+      const applied = await applyPreparedWorkspaceEdit(preparedEdit, client);
       if (!applied.success) {
         return rejectedResult('textDocument/codeAction', applied.error ?? 'failed to apply edit');
       }
@@ -715,6 +742,7 @@ export const getCodeActionsTool: ToolDefinition = {
           ...(resolvedFrom ? { resolvedFrom } : {}),
           applied: true,
           title,
+          candidateId: preparedEdit.candidateId,
           filesModified: applied.filesModified,
         },
       };

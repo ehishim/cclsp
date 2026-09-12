@@ -106,6 +106,8 @@ export interface ServerState {
   diagnosticsCache: {
     update(uri: string, items: Diagnostic[], version?: number): void;
     get(uri: string): Diagnostic[] | undefined;
+    revision(uri: string): number;
+    waitForUpdate(uri: string, afterRevision: number, maxWaitTime: number): Promise<boolean>;
     delete(uri: string): void;
     waitForIdle(
       uri: string,
@@ -175,6 +177,9 @@ export interface ServerAdapter {
    * Throw an error to indicate the request was not handled.
    */
   handleRequest?(method: string, params: unknown, state: ServerState): Promise<unknown>;
+
+  /** Values returned for standard workspace/configuration requests. */
+  workspaceConfiguration?(items: unknown[]): unknown[];
 
   /**
    * Get custom timeout for specific LSP methods.

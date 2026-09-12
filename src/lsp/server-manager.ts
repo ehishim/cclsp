@@ -169,7 +169,7 @@ export class ServerManager {
       (message: LSPMessage) => {
         this.handleMessage(message, serverState);
       },
-      serverConfig.command[0] ?? 'lsp',
+      serverConfig.command[0] ?? 'lsp'
     );
 
     const diagnosticsCache = new DiagnosticsCache();
@@ -286,6 +286,7 @@ export class ServerManager {
         workspace: {
           workspaceEdit: {
             documentChanges: true,
+            resourceOperations: ['rename'],
           },
           workspaceFolders: true,
           configuration: true,
@@ -417,14 +418,16 @@ export class ServerManager {
       if (message.id !== undefined) {
         if (message.method === 'workspace/configuration') {
           const params = message.params as { items?: unknown[] };
-          const itemCount = params?.items?.length || 1;
+          const items = params?.items ?? [{}];
           logger.debug(
-            `[DEBUG handleMessage] Responding to workspace/configuration with ${itemCount} empty config(s)\n`
+            `[DEBUG handleMessage] Responding to workspace/configuration with ${items.length} config(s)\n`
           );
           serverState.transport.sendMessage({
             jsonrpc: '2.0',
             id: message.id,
-            result: new Array(itemCount).fill({}),
+            result:
+              serverState.adapter?.workspaceConfiguration?.(items) ??
+              new Array(items.length).fill({}),
           });
           return;
         }
