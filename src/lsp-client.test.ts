@@ -1635,6 +1635,34 @@ describe('LSPClient', () => {
       }
     });
 
+    it('reserves a seed for each configured project before extra directories', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const first = join(TEST_DIR, 'a-first');
+      const second = join(TEST_DIR, 'z-second');
+      await mkdir(first, { recursive: true });
+      await mkdir(second, { recursive: true });
+      await writeFile(join(first, 'tsconfig.json'), '{}');
+      await writeFile(join(second, 'tsconfig.json'), '{}');
+      for (let index = 0; index < 30; index += 1) {
+        const dir = join(first, `src-${String(index).padStart(2, '0')}`);
+        await mkdir(dir, { recursive: true });
+        await writeFile(join(dir, 'a.ts'), `export const first${index} = true;`);
+      }
+      await writeFile(join(second, 'only.ts'), 'export const secondOnly = true;');
+      try {
+        const seeds = await (client as any).findWorkspaceSymbolSeedFiles({
+          extensions: ['ts'],
+          command: ['typescript-language-server'],
+          rootDir: TEST_DIR,
+        });
+        expect(seeds).toHaveLength(25);
+        expect(seeds.some((file: string) => file.startsWith(second))).toBe(true);
+      } finally {
+        await rm(first, { recursive: true, force: true });
+        await rm(second, { recursive: true, force: true });
+      }
+    });
+
     it('confirms a workspace-wide index through its adapter and answers once', async () => {
       // intelephense announces the end of its index; that adapter answer is the
       // readiness, and one request covers the workspace. No seed is touched per

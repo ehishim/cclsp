@@ -1088,32 +1088,33 @@ export class LSPClient {
     // Cap the opens so a huge monorepo can't blow up priming.
     const MAX_SEED_FILES = 25;
     const roots = projectRoots.length > 0 ? projectRoots : [rootDir];
-    const seedFiles: string[] = [];
-
+    const seedsByRoot = new Map<string, string[]>();
     for (const projectRoot of roots) {
-      if (seedFiles.length >= MAX_SEED_FILES) break;
       const projectFiles = await this.findWorkspaceSymbolProjectFiles(
         rootDir,
         projectRoot,
         extensions,
         ignoreFilter
       );
-      // One seed per top-level source directory, not one per marker file: a
-      // directory with its own nested tsconfig is its own project, and on a server
-      // that scopes workspace/symbol to one project per request every project
-      // needs a seed to be asked at all. Seeds that resolve to the same scope
-      // collapse to one request, so the cost is bounded by MAX_SEED_FILES opens.
       const perDirectory = new Map<string, string>();
       for (const file of projectFiles) {
         const directory = dirname(relative(projectRoot, file)).split(sep)[0] ?? '.';
         if (!perDirectory.has(directory)) perDirectory.set(directory, file);
       }
-      for (const seed of perDirectory.values()) {
-        if (seedFiles.length >= MAX_SEED_FILES) break;
-        if (!seedFiles.includes(seed)) seedFiles.push(seed);
-      }
+      seedsByRoot.set(projectRoot, [...perDirectory.values()]);
     }
 
+    // Reserve one slot for every configured project before spending remaining
+    // capacity on extra source directories. Otherwise one large first project
+    // can consume all 25 slots and make every later project look empty.
+    const seedFiles = [...seedsByRoot.values()].flatMap((seeds) => seeds.slice(0, 1));
+    if (seedFiles.length > MAX_SEED_FILES) return seedFiles.slice(0, MAX_SEED_FILES);
+    for (const seeds of seedsByRoot.values()) {
+      for (const seed of seeds.slice(1)) {
+        if (seedFiles.length >= MAX_SEED_FILES) return seedFiles;
+        seedFiles.push(seed);
+      }
+    }
     return seedFiles;
   }
 
