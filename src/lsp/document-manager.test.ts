@@ -303,11 +303,15 @@ describe('DocumentManager bounded lifecycle', () => {
 describe('getLanguageId', () => {
   it('maps TypeScript extensions', () => {
     expect(getLanguageId('file.ts')).toBe('typescript');
+    expect(getLanguageId('file.mts')).toBe('typescript');
+    expect(getLanguageId('file.cts')).toBe('typescript');
     expect(getLanguageId('file.tsx')).toBe('typescriptreact');
   });
 
   it('maps JavaScript extensions', () => {
     expect(getLanguageId('file.js')).toBe('javascript');
+    expect(getLanguageId('file.mjs')).toBe('javascript');
+    expect(getLanguageId('file.cjs')).toBe('javascript');
     expect(getLanguageId('file.jsx')).toBe('javascriptreact');
   });
 

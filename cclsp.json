@@ -3,8 +3,12 @@
     {
       "extensions": [
         "js",
-        "ts",
+        "mjs",
+        "cjs",
         "jsx",
+        "ts",
+        "mts",
+        "cts",
         "tsx"
       ],
       "command": [

@@ -771,7 +771,12 @@ export async function willRenameFilesBatch(
       serverState.adapter?.getTimeout?.(method) ?? 30000
     );
     if (!result || typeof result !== 'object') return {};
-    if ('changes' in result) return result as WorkspaceEditResult;
+    if ('changes' in result) {
+      const changes = (result as WorkspaceEditResult).changes ?? {};
+      return {
+        changes: serverState.adapter?.reconcileFileRenameEdits?.(changes, moves) ?? changes,
+      };
+    }
     if ('documentChanges' in result) {
       const changes: NonNullable<WorkspaceEditResult['changes']> = {};
       const documentChanges = (result as { documentChanges?: unknown[] }).documentChanges;
@@ -793,7 +798,9 @@ export async function willRenameFilesBatch(
           ...textChange.edits,
         ];
       }
-      return { changes };
+      return {
+        changes: serverState.adapter?.reconcileFileRenameEdits?.(changes, moves) ?? changes,
+      };
     }
     return {};
   } finally {

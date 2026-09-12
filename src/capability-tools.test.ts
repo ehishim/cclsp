@@ -381,7 +381,9 @@ describe('capability tool contracts', () => {
     const client = asClient({
       willRenameFiles: async () => edit,
       syncFileContent: async () => undefined,
-      didRenameFiles: async () => undefined,
+      didRenameFiles: async () => {
+        throw new Error('provider rename notification failed');
+      },
     });
     try {
       const newPath = join(root, 'missing', 'next.ts');
@@ -402,7 +404,7 @@ describe('capability tool contracts', () => {
       expect(result.structuredContent).toMatchObject({
         outcome: 'rejected',
         code: 'LSP_FILE_RENAME_APPLY_FAILED',
-        rollbackFailures: [],
+        rollbackFailures: ['providers'],
       });
       expect(readFileSync(importer, 'utf8')).toBe(original);
       expect(readFileSync(oldPath, 'utf8')).toBe('export const value = 1;');

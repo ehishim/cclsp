@@ -32,8 +32,7 @@ describe('LANGUAGE_SERVERS', () => {
     const tsServer = LANGUAGE_SERVERS.find((server) => server.name === 'typescript');
     expect(tsServer).toBeDefined();
     expect(tsServer?.displayName).toBe('TypeScript/JavaScript');
-    expect(tsServer?.extensions).toContain('ts');
-    expect(tsServer?.extensions).toContain('js');
+    expect(tsServer?.extensions).toEqual(['js', 'mjs', 'cjs', 'jsx', 'ts', 'mts', 'cts', 'tsx']);
 
     // Check that Python server exists
     const pyServer = LANGUAGE_SERVERS.find((server) => server.name === 'python');

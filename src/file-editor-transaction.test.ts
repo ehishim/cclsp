@@ -8,6 +8,7 @@ import {
   type AtomicRewriteStage,
   applyAtomicRewrite,
   applyPreparedWorkspaceEdit,
+  normalizeWorkspaceEdit,
   prepareWorkspaceEdit,
 } from './file-editor.js';
 import { pathToUri } from './utils.js';
@@ -97,6 +98,118 @@ describe('prepared WorkspaceEdit transaction', () => {
       await writeFile(selected, 'export const changed = 1;\n');
       const changed = await prepareWorkspaceEdit(edit, 'rename oldName to newName', [selected]);
       expect(changed.candidateId).not.toBe(first.candidateId);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates identical edits and refuses conflicting overlaps before preparation', async () => {
+    const uri = pathToUri('/workspace/example.ts');
+    const range = { start: { line: 0, character: 1 }, end: { line: 0, character: 4 } };
+    expect(
+      normalizeWorkspaceEdit({
+        changes: {
+          [uri]: [
+            { range, newText: 'next' },
+            { range, newText: 'next' },
+          ],
+        },
+      }).changes?.[uri]
+    ).toHaveLength(1);
+    expect(() =>
+      normalizeWorkspaceEdit({
+        changes: {
+          [uri]: [
+            { range, newText: 'one' },
+            { range, newText: 'two' },
+          ],
+        },
+      })
+    ).toThrow('overlapping WorkspaceEdit ranges');
+  });
+
+  it('creates missing move parents and leaves preview preparation side-effect free', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-nested-rename-'));
+    const owner = join(root, 'Owner.ts');
+    const destinationDirectory = join(root, 'nested', 'domain');
+    const destination = join(destinationDirectory, 'Owner.ts');
+    try {
+      await writeFile(owner, 'export const owner = 1;\n');
+      const prepared = await prepareWorkspaceEdit(
+        { changes: {} },
+        'move owner',
+        [owner],
+        [],
+        [{ oldPath: owner, newPath: destination }]
+      );
+      expect(await Bun.file(destinationDirectory).exists()).toBe(false);
+      const client = {
+        withDocumentWriteScopes: async (_paths: string[], action: () => Promise<unknown>) =>
+          action(),
+        synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+        invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+        didRenameFilesBatch: jest.fn().mockResolvedValue(undefined),
+      };
+      expect(await applyPreparedWorkspaceEdit(prepared, client as never)).toMatchObject({
+        success: true,
+      });
+      expect(await readFile(destination, 'utf8')).toContain('owner');
+      expect(await Bun.file(owner).exists()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('removes transaction-created directories when a nested move fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-nested-rollback-'));
+    const owner = join(root, 'Owner.ts');
+    const destinationDirectory = join(root, 'nested', 'domain');
+    const destination = join(destinationDirectory, 'Owner.ts');
+    try {
+      await writeFile(owner, 'export const owner = 1;\n');
+      const prepared = await prepareWorkspaceEdit(
+        { changes: {} },
+        'move owner',
+        [owner],
+        [],
+        [{ oldPath: owner, newPath: destination }]
+      );
+      const client = {
+        withDocumentWriteScopes: async (_paths: string[], action: () => Promise<unknown>) =>
+          action(),
+        synchronizeRewriteFilesStrict: jest.fn().mockResolvedValue(undefined),
+        invalidateSourceFiles: jest.fn().mockResolvedValue(undefined),
+        didRenameFilesBatch: jest.fn().mockRejectedValue(new Error('provider failed')),
+      };
+      expect(await applyPreparedWorkspaceEdit(prepared, client as never)).toMatchObject({
+        success: false,
+        rollbackFailures: ['providers'],
+      });
+      expect(await readFile(owner, 'utf8')).toContain('owner');
+      expect(await Bun.file(destination).exists()).toBe(false);
+      expect(await Bun.file(destinationDirectory).exists()).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a file as the nearest destination parent before mutation', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cclsp-workspace-file-parent-'));
+    const owner = join(root, 'Owner.ts');
+    const parent = join(root, 'not-a-directory');
+    try {
+      await writeFile(owner, 'export const owner = 1;\n');
+      await writeFile(parent, 'file');
+      await expect(
+        prepareWorkspaceEdit(
+          { changes: {} },
+          'move owner',
+          [owner],
+          [],
+          [{ oldPath: owner, newPath: join(parent, 'Owner.ts') }]
+        )
+      ).rejects.toThrow('parent is not a directory');
+      expect(await readFile(owner, 'utf8')).toContain('owner');
     } finally {
       await rm(root, { recursive: true, force: true });
     }

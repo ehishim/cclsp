@@ -1,10 +1,10 @@
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../../logger.js';
 import type { LSPServerConfig } from '../../types.js';
-import { pathToUri } from '../../utils.js';
+import { pathToUri, uriToPath } from '../../utils.js';
 import type { Diagnostic, InitializeParams, ServerAdapter, ServerState } from '../types.js';
 
 /**
@@ -69,6 +69,81 @@ export class TypeScriptAdapter implements ServerAdapter {
    */
   workspaceSymbolScope(state: ServerState, filePath: string): string {
     return this.projectKey(state, filePath);
+  }
+
+  reconcileFileRenameEdits(
+    changes: Record<
+      string,
+      Array<{
+        range: {
+          start: { line: number; character: number };
+          end: { line: number; character: number };
+        };
+        newText: string;
+      }>
+    >,
+    moves: Array<{ oldPath: string; newPath: string }>
+  ) {
+    const movedPath = (path: string): string =>
+      moves.find((move) => move.oldPath === path)?.newPath ?? path;
+    const moveTargets = new Map(moves.map((move) => [move.oldPath, move.newPath]));
+    const destinations = new Set(moves.map((move) => move.newPath));
+    const sourcePathForSpecifier = (path: string): string => {
+      const extensionCandidates: Record<string, string[]> = {
+        '.js': ['.ts', '.tsx', '.js'],
+        '.mjs': ['.mts', '.mjs'],
+        '.cjs': ['.cts', '.cjs'],
+        '.jsx': ['.tsx', '.jsx'],
+      };
+      const extension = extname(path);
+      for (const candidate of extensionCandidates[extension] ?? [extension]) {
+        const source = `${path.slice(0, -extension.length)}${candidate}`;
+        if (moveTargets.has(source) || destinations.has(source)) return source;
+      }
+      return path;
+    };
+    const reconciled: typeof changes = {};
+    for (const [uri, edits] of Object.entries(changes)) {
+      const groups = new Map<string, typeof edits>();
+      for (const edit of edits) {
+        const key = `${edit.range.start.line}:${edit.range.start.character}-${edit.range.end.line}:${edit.range.end.character}`;
+        const group = groups.get(key);
+        if (group) group.push(edit);
+        else groups.set(key, [edit]);
+      }
+      reconciled[uri] = [...groups.values()].flatMap((group) => {
+        const first = group[0];
+        if (!first) return [];
+        const unique = [...new Set(group.map((edit) => edit.newText))];
+        if (unique.length <= 1) return [first];
+        const source = uriToPath(uri);
+        const finalSource = movedPath(source);
+        const targetsByAlternative = unique.map((text) => {
+          if (!text.startsWith('.')) return [];
+          return [dirname(source), dirname(finalSource)]
+            .map((directory) => {
+              const absolute = resolve(directory, text);
+              const target = extname(absolute) ? absolute : `${absolute}${extname(source)}`;
+              const sourceTarget = sourcePathForSpecifier(target);
+              return moveTargets.get(sourceTarget) ?? sourceTarget;
+            })
+            .filter((path) => destinations.has(path));
+        });
+        if (targetsByAlternative.some((targets) => targets.length !== 1)) return group;
+        const finalTargets = [...new Set(targetsByAlternative.flat())];
+        const finalTarget = finalTargets[0];
+        if (finalTargets.length !== 1 || !finalTarget) return group;
+        let specifier = relative(dirname(finalSource), finalTarget).split(sep).join('/');
+        const runtimeExtensions = [...new Set(unique.map((text) => extname(text)))];
+        const runtimeExtension = runtimeExtensions.length === 1 ? runtimeExtensions[0] : '';
+        if (runtimeExtension && extname(specifier) !== runtimeExtension) {
+          specifier = `${specifier.slice(0, -extname(specifier).length)}${runtimeExtension}`;
+        }
+        if (!specifier.startsWith('.')) specifier = `./${specifier}`;
+        return [{ ...first, newText: specifier }];
+      });
+    }
+    return reconciled;
   }
 
   handleNotification(method: string, params: unknown, state: ServerState): boolean {

@@ -112,6 +112,42 @@ describe('TypeScriptAdapter', () => {
     });
   });
 
+  test('reconciles mutual NodeNext moves to one final runtime specifier', () => {
+    const adapter = new TypeScriptAdapter();
+    const root = '/workspace/project/src';
+    const range = { start: { line: 0, character: 20 }, end: { line: 0, character: 30 } };
+    const moves = [
+      { oldPath: `${root}/a.ts`, newPath: `${root}/core/a.ts` },
+      { oldPath: `${root}/b.ts`, newPath: `${root}/core/b.ts` },
+    ];
+    const changes = adapter.reconcileFileRenameEdits(
+      {
+        [`file://${root}/a.ts`]: [
+          { range, newText: '../b.js' },
+          { range, newText: './core/b.js' },
+        ],
+        [`file://${root}/b.ts`]: [
+          { range, newText: '../a.js' },
+          { range, newText: './core/a.js' },
+        ],
+      },
+      moves
+    );
+    expect(changes[`file://${root}/a.ts`]).toEqual([{ range, newText: './b.js' }]);
+    expect(changes[`file://${root}/b.ts`]).toEqual([{ range, newText: './a.js' }]);
+
+    const unresolved = adapter.reconcileFileRenameEdits(
+      {
+        [`file://${root}/a.ts`]: [
+          { range, newText: './core/b.js' },
+          { range, newText: './unrelated.js' },
+        ],
+      },
+      moves
+    );
+    expect(unresolved[`file://${root}/a.ts`]).toHaveLength(2);
+  });
+
   test('confirms independent configured subprojects separately', async () => {
     const root = mkdtempSync(join(tmpdir(), 'cclsp-readiness-'));
     const firstRoot = join(root, 'first');

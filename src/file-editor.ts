@@ -10,7 +10,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { lstat, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, rename, rmdir, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { RewriteRollback } from './ast/types.js';
 import { logger } from './logger.js';
@@ -57,7 +57,17 @@ export interface PreparedWorkspaceEdit {
   editCount: number;
   files: AtomicMutationFile[];
   identities: Array<{ path: string; sha256: string | null }>;
+  missingDirectories: string[];
   resourceMoves: WorkspaceResourceMove[];
+}
+
+export class WorkspaceEditConflictError extends Error {
+  readonly code = 'LSP_WORKSPACE_EDIT_CONFLICT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'WorkspaceEditConflictError';
+  }
 }
 
 export type AtomicRewriteStage =
@@ -115,6 +125,69 @@ async function writeOwnedTemp(path: string, content: Buffer, mode: number): Prom
 
 function rewriteTempPath(target: string): string {
   return `${target}.cclsp-rewrite-${process.pid}-${randomBytes(8).toString('hex')}.tmp`;
+}
+
+function comparePosition(
+  left: { line: number; character: number },
+  right: { line: number; character: number }
+): number {
+  return left.line - right.line || left.character - right.character;
+}
+
+export function normalizeWorkspaceEdit(workspaceEdit: WorkspaceEdit): WorkspaceEdit {
+  const changes: NonNullable<WorkspaceEdit['changes']> = {};
+  for (const [uri, edits] of Object.entries(workspaceEdit.changes ?? {}).sort(([left], [right]) =>
+    left.localeCompare(right)
+  )) {
+    const sorted = [...edits].sort(
+      (left, right) =>
+        comparePosition(left.range.start, right.range.start) ||
+        comparePosition(left.range.end, right.range.end) ||
+        left.newText.localeCompare(right.newText)
+    );
+    const normalized: TextEdit[] = [];
+    for (const edit of sorted) {
+      const previous = normalized.at(-1);
+      if (
+        previous &&
+        comparePosition(previous.range.start, edit.range.start) === 0 &&
+        comparePosition(previous.range.end, edit.range.end) === 0 &&
+        previous.newText === edit.newText
+      ) {
+        continue;
+      }
+      if (previous && comparePosition(previous.range.end, edit.range.start) > 0) {
+        throw new WorkspaceEditConflictError(`overlapping WorkspaceEdit ranges for ${uri}`);
+      }
+      normalized.push(edit);
+    }
+    if (normalized.length > 0) changes[uri] = normalized;
+  }
+  return { changes };
+}
+
+async function missingParentDirectories(path: string): Promise<string[]> {
+  const missing: string[] = [];
+  let current = dirname(path);
+  while (true) {
+    try {
+      const info = await lstat(current);
+      if (!info.isDirectory())
+        throw new Error(`WorkspaceEdit parent is not a directory: ${current}`);
+      const canonical = await realpath(current);
+      if (canonical !== current) {
+        throw new Error(`WorkspaceEdit parent changed canonical path: ${current}`);
+      }
+      return missing.reverse();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = dirname(current);
+      if (parent === current)
+        throw new Error(`WorkspaceEdit destination has no existing ancestor: ${path}`);
+      missing.push(current);
+      current = parent;
+    }
+  }
 }
 
 async function assertCanonicalRewriteTarget(path: string): Promise<void> {
@@ -276,8 +349,9 @@ export async function prepareWorkspaceEdit(
 ): Promise<PreparedWorkspaceEdit> {
   const files: AtomicMutationFile[] = [];
   let editCount = 0;
-  for (const [uri, edits] of Object.entries(workspaceEdit.changes ?? {}).sort(([left], [right]) =>
-    left.localeCompare(right)
+  const normalizedWorkspaceEdit = normalizeWorkspaceEdit(workspaceEdit);
+  for (const [uri, edits] of Object.entries(normalizedWorkspaceEdit.changes ?? {}).sort(
+    ([left], [right]) => left.localeCompare(right)
   )) {
     const absolutePath = uriToPath(uri);
     await assertCanonicalRewriteTarget(absolutePath);
@@ -331,6 +405,15 @@ export async function prepareWorkspaceEdit(
     throw new Error('WorkspaceEdit resource rename chains and cycles are not supported');
   }
   const editedPaths = new Set(files.map((file) => file.absolutePath));
+  const missingDirectories = [
+    ...new Set(
+      (
+        await Promise.all(
+          [...moveDestinations].sort().map((path) => missingParentDirectories(path))
+        )
+      ).flat()
+    ),
+  ].sort((left, right) => left.length - right.length || left.localeCompare(right));
   const identities = await Promise.all([
     ...[...new Set([...identityPaths, ...moveSources])]
       .filter((path) => !editedPaths.has(path))
@@ -364,6 +447,7 @@ export async function prepareWorkspaceEdit(
     addLengthDelimited(hash, identity.path);
     addLengthDelimited(hash, identity.sha256 ?? 'absent');
   }
+  for (const directory of missingDirectories) addLengthDelimited(hash, `missing-dir:${directory}`);
   for (const move of normalizedMoves) {
     addLengthDelimited(hash, move.oldPath);
     addLengthDelimited(hash, move.newPath);
@@ -374,6 +458,7 @@ export async function prepareWorkspaceEdit(
     editCount,
     files,
     identities,
+    missingDirectories,
     resourceMoves: normalizedMoves,
   };
 }
@@ -407,6 +492,20 @@ export async function applyPreparedWorkspaceEdit(
         }
       }
 
+      for (const directory of prepared.missingDirectories) {
+        try {
+          await lstat(directory);
+          return {
+            success: false,
+            filesModified: [],
+            backupFiles: [],
+            error: `WorkspaceEdit directory identity changed: ${directory}`,
+          };
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+      }
+
       const transaction = await applyAtomicRewrite(
         { files: prepared.files },
         {
@@ -427,7 +526,12 @@ export async function applyPreparedWorkspaceEdit(
       }
 
       const moved: WorkspaceResourceMove[] = [];
+      const createdDirectories: string[] = [];
       try {
+        for (const directory of prepared.missingDirectories) {
+          await mkdir(directory);
+          createdDirectories.push(directory);
+        }
         for (const move of prepared.resourceMoves) {
           await rename(move.oldPath, move.newPath);
           moved.push(move);
@@ -463,6 +567,15 @@ export async function applyPreparedWorkspaceEdit(
             }
           } catch {
             rollbackFailures.push(file.absolutePath);
+          }
+        }
+        for (const directory of [...createdDirectories].reverse()) {
+          try {
+            await rmdir(directory);
+          } catch (directoryError) {
+            if ((directoryError as NodeJS.ErrnoException).code !== 'ENOENT') {
+              rollbackFailures.push(`directory:${directory}`);
+            }
           }
         }
         try {

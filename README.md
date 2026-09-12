@@ -285,7 +285,7 @@ Alternatively, create an `cclsp.json` configuration file manually:
       }
     },
     {
-      "extensions": ["js", "ts", "jsx", "tsx"],
+      "extensions": ["js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx"],
       "command": ["npx", "--", "typescript-language-server", "--stdio"],
       "rootDir": ".",
       "maxOpenDocuments": 100
@@ -458,7 +458,7 @@ List language-server code actions for a query or range. Actions are ordered pref
 
 ### `rename_file`
 
-Preview or apply a file rename using the server's `workspace/willRenameFiles` import edits, followed by `workspace/didRenameFiles`. It defaults to `dry_run: true` and refuses when the server does not declare matching file-operation support.
+Preview or apply one or more file moves using the server's `workspace/willRenameFiles` import edits, followed by `workspace/didRenameFiles`. It defaults to `dry_run: true`; apply requires the unchanged preview candidate. Missing destination directories are created only during apply and removed on rollback when still empty. TypeScript/JavaScript setup includes `ts`, `tsx`, `mts`, `cts`, `js`, `jsx`, `mjs`, and `cjs`. Conflicting provider edits, unsafe parents, stale candidates, existing destinations, and unsupported representations refuse before mutation.
 
 ### `rename_symbol`
 

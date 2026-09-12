@@ -30,7 +30,7 @@ export {
 // --- LSP-internal types (single source of truth) ---
 
 import type { ChildProcess } from 'node:child_process';
-import type { Diagnostic, LSPError, LSPServerConfig } from '../types.js';
+import type { Diagnostic, LSPError, LSPServerConfig, Position } from '../types.js';
 
 /**
  * JSON-RPC message format used for LSP communication.
@@ -195,6 +195,12 @@ export interface ServerAdapter {
    * result covers the workspace it names. Absent for a workspace-wide index.
    */
   workspaceSymbolScope?(state: ServerState, filePath: string): string;
+
+  /** Reconcile provider-specific multi-file rename edits before generic conflict checks. */
+  reconcileFileRenameEdits?(
+    changes: Record<string, Array<{ range: { start: Position; end: Position }; newText: string }>>,
+    moves: Array<{ oldPath: string; newPath: string }>
+  ): Record<string, Array<{ range: { start: Position; end: Position }; newText: string }>>;
 }
 
 /**

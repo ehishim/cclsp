@@ -59,12 +59,20 @@ async function fixture<T>(action: (root: string, client: LSPClient) => Promise<T
       join(root, 'src/App.php'),
       "<?php\nnamespace Fixture;\nrequire_once __DIR__ . '/Math.php';\n$result = doubleValue(21);\n"
     );
+    await writeFile(
+      join(root, 'src/alpha.mjs'),
+      "import { beta } from './beta.mjs';\nexport const alpha = beta;\n"
+    );
+    await writeFile(
+      join(root, 'src/beta.mjs'),
+      "import { alpha } from './alpha.mjs';\nexport const beta = alpha;\n"
+    );
     const config = join(root, 'cclsp.json');
     await writeFile(
       config,
       JSON.stringify({
         servers: [
-          { extensions: ['ts'], command: [tsServer, '--stdio'], rootDir: root },
+          { extensions: ['ts', 'mjs'], command: [tsServer, '--stdio'], rootDir: root },
           { extensions: ['php'], command: [phpServer, '--stdio'], rootDir: root },
         ],
       })
@@ -270,6 +278,27 @@ suite('real TypeScript and PHP mutations', () => {
       );
       expect(await readFile(consumer, 'utf8')).toContain('new RenamedWidget()');
       expect((await client.getDiagnosticsReport(consumer)).freshness.status).toBe('current');
+    });
+  }, 60_000);
+
+  it('moves mutually importing mjs files once into new nested directories', async () => {
+    await fixture(async (root, client) => {
+      const moves = [
+        { old_path: join(root, 'src/alpha.mjs'), new_path: join(root, 'src/core/alpha.mjs') },
+        { old_path: join(root, 'src/beta.mjs'), new_path: join(root, 'src/core/beta.mjs') },
+      ];
+      const preview = await renameFileTool.handler({ moves }, client);
+      const candidate = preview.structuredContent?.candidateId as string;
+      expect(candidate).toMatch(/^sha256:[0-9a-f]{64}$/);
+      expect(await Bun.file(join(root, 'src/core')).exists()).toBe(false);
+      const applied = await renameFileTool.handler(
+        { moves, dry_run: false, candidate_id: candidate },
+        client
+      );
+      expect(applied.structuredContent).toMatchObject({ outcome: 'ok', applied: true });
+      expect(await readFile(join(root, 'src/core/alpha.mjs'), 'utf8')).toContain("'./beta.mjs'");
+      expect(await readFile(join(root, 'src/core/beta.mjs'), 'utf8')).toContain("'./alpha.mjs'");
+      expect(await readFile(join(root, 'src/core/alpha.mjs'), 'utf8')).not.toContain('.mjss');
     });
   }, 60_000);
 

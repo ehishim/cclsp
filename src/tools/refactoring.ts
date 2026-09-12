@@ -1,5 +1,9 @@
 import { existsSync } from 'node:fs';
-import { applyPreparedWorkspaceEdit, prepareWorkspaceEdit } from '../file-editor.js';
+import {
+  WorkspaceEditConflictError,
+  applyPreparedWorkspaceEdit,
+  prepareWorkspaceEdit,
+} from '../file-editor.js';
 import type { LSPClient } from '../lsp-client.js';
 import { uriToPath } from '../utils.js';
 import { resolvePath, rethrowToolOutcome, textResult, withWarning } from './helpers.js';
@@ -602,6 +606,17 @@ export const renameFileTool: ToolDefinition = {
       };
     } catch (error) {
       rethrowToolOutcome(error);
+      if (error instanceof WorkspaceEditConflictError) {
+        return {
+          content: [{ type: 'text', text: `LSP_FILE_RENAME_CONFLICT: ${error.message}` }],
+          structuredContent: {
+            outcome: 'rejected',
+            code: 'LSP_FILE_RENAME_CONFLICT',
+            applied: false,
+          },
+          isError: true,
+        };
+      }
       throw error;
     }
   },

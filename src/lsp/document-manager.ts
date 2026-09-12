@@ -534,8 +534,12 @@ export function getLanguageId(filePath: string): string {
   const extension = filePath.split('.').pop()?.toLowerCase();
   const languageMap: Record<string, string> = {
     ts: 'typescript',
+    mts: 'typescript',
+    cts: 'typescript',
     tsx: 'typescriptreact',
     js: 'javascript',
+    mjs: 'javascript',
+    cjs: 'javascript',
     jsx: 'javascriptreact',
     py: 'python',
     go: 'go',
