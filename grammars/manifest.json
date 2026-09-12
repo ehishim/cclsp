@@ -9,11 +9,11 @@
   "builder": "emscripten/emsdk@sha256:8847dad4171ebc8a53d9ae5cda86a2546ef5b2e68834c14dc1ba2b2962e125cc",
   "patches": {
     "tree-sitter-typescript-0.23.2-jsx-bare-ampersand.patch": "df8bae969c0851eb1f92401a3e6e1fe2df5732a3d42c8f7c7e2d24b21eff9bd5",
-    "tree-sitter-typescript-0.23.2-import-type-and-type-reexport.patch": "f95df58652493e68dd3239eec2946c65c9966795b4cd3f1d562e351182ae2995"
+    "tree-sitter-typescript-0.23.2-import-type-and-type-reexport.patch": "fee9e211b37625551314686f73ecbdc08db1939c0a341571181897214b1180bd"
   },
   "emccFlags": ["-Os", "-s", "WASM=1", "-s", "SIDE_MODULE=2", "-s", "TOTAL_MEMORY=33554432", "-s", "NODEJS_CATCH_EXIT=0", "-s", "NODEJS_CATCH_REJECTION=0", "-fno-exceptions"],
   "assets": {
-    "tree-sitter-typescript.wasm": "062ef92ff3f6b1d3d868af46a2445fd7057e6f604d07df0d9311e82323bf3fc4",
-    "tree-sitter-tsx.wasm": "caef4cf10f2a54ca50f9631f6d3d13e00ec43e0da8a8b91d95d0efc58409d856"
+    "tree-sitter-typescript.wasm": "7f363e9ef6f8ff94524930d614c1ae0923a3883fb0cf0edbd50360279d64c4f3",
+    "tree-sitter-tsx.wasm": "aadbf1470e48f399b1f9aafb20388a48111a6115f4752a67e8e5aa95ce841730"
   }
 }

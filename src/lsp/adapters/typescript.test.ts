@@ -222,18 +222,24 @@ describe('TypeScriptAdapter', () => {
     expect(capabilities.workspace).toEqual({ configuration: true });
   });
 
-  test('injects no initializationOptions of its own', () => {
-    // tsserver discovery is the server's job; supplying a path here would be a
-    // fix with no defect behind it.
-    expect(adapter.customizeInitializeParams(params()).initializationOptions).toBeUndefined();
+  test('supplies cclsp TypeScript only as a fallback', () => {
+    const options = adapter.customizeInitializeParams(params()).initializationOptions as {
+      tsserver: { fallbackPath?: string };
+    };
+    expect(options.tsserver.fallbackPath).toEndWith('/node_modules/typescript/lib/tsserver.js');
   });
 
-  test('preserves configured initializationOptions untouched', () => {
-    const result = adapter.customizeInitializeParams(
+  test('preserves explicit tsserver path and fallback choices', () => {
+    const explicit = adapter.customizeInitializeParams(
       params({ initializationOptions: { tsserver: { path: '/explicit/tsserver.js' } } })
     );
-
-    expect(result.initializationOptions).toEqual({ tsserver: { path: '/explicit/tsserver.js' } });
+    expect(explicit.initializationOptions).toEqual({ tsserver: { path: '/explicit/tsserver.js' } });
+    const fallback = adapter.customizeInitializeParams(
+      params({ initializationOptions: { tsserver: { fallbackPath: '/explicit/fallback.js' } } })
+    );
+    expect(fallback.initializationOptions).toEqual({
+      tsserver: { fallbackPath: '/explicit/fallback.js' },
+    });
   });
 
   test('tolerates absent or non-object capabilities', () => {

@@ -108,7 +108,7 @@ async function dispatchTool(pool: RootPool, args: Record<string, unknown>): Prom
   let route: RoutedRoot;
   if (explicitRoot) {
     const detectedRoot = normalizeRoot(explicitRoot);
-    const { entry, reused } = await pool.ensure(detectedRoot);
+    const { entry, reused } = await pool.ensure(detectedRoot, { isolate: true });
     route = { entry, detectedRoot, servingRoot: entry.root, reused };
   } else {
     route = await pool.routeTarget(pathArg);

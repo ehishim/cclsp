@@ -8,15 +8,19 @@
        [$.call_expression, $._type_query_call_expression_in_type_annotation],
        [$.new_expression, $.primary_expression],
        [$.meta_property, $.primary_expression],
-@@ -71,6 +70,7 @@
+@@ -71,6 +70,11 @@
      ]),
  
      conflicts: ($, previous) => previous.concat([
 +      [$.call_expression, $._type_query_call_expression],
++      [$._type_query_call_expression_in_type_annotation, $._import_type_call],
++      [$.call_expression, $._type_query_call_expression_in_type_annotation, $._import_type_call],
++      [$._import_type_member, $.primary_type],
++      [$._import_generic_type, $.primary_type],
        [$.call_expression, $.instantiation_expression, $.binary_expression],
        [$.call_expression, $.instantiation_expression, $.binary_expression, $.unary_expression],
        [$.call_expression, $.instantiation_expression, $.binary_expression, $.update_expression],
-@@ -322,8 +322,10 @@
+@@ -322,8 +326,10 @@
          seq(
            'export',
            'type',
@@ -29,12 +33,26 @@
            $._semicolon,
          ),
          seq('export', '=', $.expression, $._semicolon),
-@@ -720,14 +722,17 @@
+@@ -720,14 +726,31 @@
          seq(':', $.asserts),
        ),
  
++      _import_type_call: $ => seq(
++        $.import,
++        field('arguments', $.arguments),
++      ),
++
++      _import_type_member: $ => prec.right(seq(
++        field('object', choice(
++          alias($._import_type_call, $.call_expression),
++          alias($._import_type_member, $.member_expression),
++        )),
++        '.',
++        field('property', alias($.identifier, $.property_identifier)),
++      )),
++
 +      _import_generic_type: $ => prec(0, seq(
-+        field('name', alias($._type_query_member_expression_in_type_annotation, $.member_expression)),
++        field('name', alias($._import_type_member, $.member_expression)),
 +        field('type_arguments', $.type_arguments),
 +      )),
 +
@@ -49,10 +67,12 @@
        ),
  
        tuple_parameter: $ => seq(
-@@ -762,6 +767,9 @@
+@@ -762,6 +785,11 @@
        )),
  
        primary_type: $ => choice(
++        alias($._import_type_call, $.call_expression),
++        alias($._import_type_member, $.member_expression),
 +        alias($._import_generic_type, $.generic_type),
 +        prec(-1, alias($._type_query_member_expression_in_type_annotation, $.member_expression)),
 +        prec(-1, alias($._type_query_call_expression_in_type_annotation, $.call_expression)),

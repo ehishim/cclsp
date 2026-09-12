@@ -1,4 +1,5 @@
 import { existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../../logger.js';
@@ -13,6 +14,14 @@ import type { Diagnostic, InitializeParams, ServerAdapter, ServerState } from '.
  * the caller's budget rather than asserting it falsely.
  */
 const PROJECT_LOAD_TITLE = /initializing js\/ts language features/i;
+
+function bundledTsserverPath(): string | null {
+  try {
+    return createRequire(import.meta.url).resolve('typescript/lib/tsserver.js');
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Adapter for typescript-language-server.
@@ -31,10 +40,9 @@ const PROJECT_LOAD_TITLE = /initializing js\/ts language features/i;
  * `window/workDoneProgress/create` request that enables it — the notifications
  * simply had no consumer.
  *
- * Deliberately does NOT supply `tsserver.path`. The server's own discovery was
- * measured working through a symlinked `node_modules`, so no defect forces it;
- * the failure that looked like broken discovery came from Hub covering-root reuse
- * serving a nested request from a parent root that has no TypeScript.
+ * Workspace/user `tsserver.path` remains authoritative. A repository-container
+ * root without a local TypeScript receives cclsp's pinned SDK only as fallback;
+ * otherwise TypeScript initialization can fail while unrelated providers survive.
  */
 export class TypeScriptAdapter implements ServerAdapter {
   readonly name = 'typescript';
@@ -345,6 +353,11 @@ export class TypeScriptAdapter implements ServerAdapter {
       params.initializationOptions && typeof params.initializationOptions === 'object'
         ? (params.initializationOptions as Record<string, unknown>)
         : {};
+    const configuredTsserver =
+      initializationOptions.tsserver && typeof initializationOptions.tsserver === 'object'
+        ? (initializationOptions.tsserver as Record<string, unknown>)
+        : {};
+    const bundledTsserver = bundledTsserverPath();
     const pluginRoot = fileURLToPath(new URL('./plugins/', import.meta.url));
     const pluginPath = join(pluginRoot, 'node_modules/cclsp-full-display/index.js');
     const plugins = Array.isArray(initializationOptions.plugins)
@@ -352,10 +365,19 @@ export class TypeScriptAdapter implements ServerAdapter {
       : [];
     return {
       ...params,
-      ...(existsSync(pluginPath)
-        ? {
-            initializationOptions: {
-              ...initializationOptions,
+      initializationOptions: {
+        ...initializationOptions,
+        tsserver: {
+          ...configuredTsserver,
+          ...(configuredTsserver.path === undefined &&
+          configuredTsserver.fallbackPath === undefined &&
+          bundledTsserver &&
+          existsSync(bundledTsserver)
+            ? { fallbackPath: bundledTsserver }
+            : {}),
+        },
+        ...(existsSync(pluginPath)
+          ? {
               plugins: [
                 ...plugins,
                 {
@@ -364,9 +386,9 @@ export class TypeScriptAdapter implements ServerAdapter {
                   languages: ['typescript', 'javascript'],
                 },
               ],
-            },
-          }
-        : {}),
+            }
+          : {}),
+      },
       capabilities: {
         ...capabilities,
         textDocument: {

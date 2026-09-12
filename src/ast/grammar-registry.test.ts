@@ -47,6 +47,11 @@ describe('owned TypeScript grammars', () => {
           'export type * from "m";',
           'export type * as Types from "m";',
           'const x = fn<typeof import("m")>();',
+          'const member = fn<import("m").T>();',
+          'const indexed = fn<import("m").T["p"]>();',
+          'const nested = fn<import("m").T["p"]["q"]>();',
+          'const mixed = fn<string, import("m").T["p"]>();',
+          'const union = fn<import("m").T["p"] | null>();',
         ]) {
           const tree = await registry.parse(source, language);
           try {
@@ -59,6 +64,8 @@ describe('owned TypeScript grammars', () => {
           'export type *;',
           'export type * as X;',
           'type X = import("m").T<;',
+          'const x = fn<import("m").>();',
+          'const y = fn<import("m").T[>();',
         ]) {
           const tree = await registry.parse(source, language);
           try {

@@ -1565,6 +1565,76 @@ describe('LSPClient', () => {
       expect(result.readinessConfirmed).toBe(true);
     });
 
+    it('does not let a surviving unrelated server certify a failed provider', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      await writeFile(join(TEST_DIR, 'seed.ts'), 'export const seed = true;');
+      const failed = (client as any).config.servers[0];
+      const successful = {
+        serverCapabilities: { workspaceSymbolProvider: true },
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport(),
+        initialized: true,
+        documentManager: createMockDocumentManager(),
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: { extensions: ['json'], command: ['json-language-server'], rootDir: TEST_DIR },
+      };
+      const getServer = spyOn((client as any).serverManager, 'getServer').mockImplementation(
+        async (config: unknown) => {
+          if (config === failed) throw new Error('TypeScript initialization failed');
+          return successful;
+        }
+      );
+      try {
+        await client.preloadServers(false);
+        (client as any).serverManager.getRunningServers().set('json', successful);
+        expect(await client.workspaceSymbol('missingTypeScriptSymbol')).toEqual({
+          symbols: [],
+          readinessConfirmed: false,
+        });
+      } finally {
+        getServer.mockRestore();
+        await rm(join(TEST_DIR, 'seed.ts'), { force: true });
+      }
+    });
+
+    it('coalesces and scopes failed-provider recovery across a concurrent name batch', async () => {
+      const client = new LSPClient(TEST_CONFIG_PATH);
+      const failedKey = JSON.stringify((client as any).config.servers[0]);
+      (client as any).workspaceSymbolUnavailableServers.add(failedKey);
+      const serverState = {
+        serverCapabilities: MOCK_SERVER_CAPABILITIES,
+        initializationPromise: Promise.resolve(),
+        process: { stdin: { write: jest.fn() } },
+        transport: createMockTransport(),
+        initialized: true,
+        documentManager: createMockDocumentManager(),
+        diagnosticsCache: createMockDiagnosticsCache(),
+        config: { extensions: ['json'], command: ['json-language-server'], rootDir: TEST_DIR },
+      };
+      (client as any).serverManager.getRunningServers().set('json', serverState);
+      const getServer = spyOn((client as any).serverManager, 'getServer').mockImplementation(
+        async () => {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          throw new Error('still unavailable');
+        }
+      );
+      const preload = spyOn(client, 'preloadServers');
+      const workspaceSymbolSpy = spyOn(operations, 'workspaceSymbol').mockResolvedValue([]);
+      try {
+        const results = await Promise.all(
+          Array.from({ length: 7 }, (_, index) => client.workspaceSymbol(`name${index}`))
+        );
+        expect(preload).not.toHaveBeenCalled();
+        expect(getServer).toHaveBeenCalledTimes(1);
+        expect(results.every((result) => result.readinessConfirmed === false)).toBe(true);
+      } finally {
+        getServer.mockRestore();
+        preload.mockRestore();
+        workspaceSymbolSpy.mockRestore();
+      }
+    });
+
     it('confirms a workspace-wide index through its adapter and answers once', async () => {
       // intelephense announces the end of its index; that adapter answer is the
       // readiness, and one request covers the workspace. No seed is touched per

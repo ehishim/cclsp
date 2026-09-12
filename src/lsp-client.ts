@@ -127,6 +127,9 @@ export class LSPClient {
   private workspaceSymbolScopeTail = new WeakMap<ServerState, Promise<void>>();
   private workspaceSymbolConfirmedServers = new WeakSet<ServerState>();
   private workspaceSymbolConfirmInFlight = new WeakMap<ServerState, Promise<boolean>>();
+  /** Configured providers that matched source but failed to preload. */
+  private workspaceSymbolUnavailableServers = new Set<string>();
+  private workspaceSymbolRecovery: Promise<void> | null = null;
   private rewriteApplyTail: Promise<void> = Promise.resolve();
 
   constructor(configPath?: string, root = process.cwd()) {
@@ -847,6 +850,17 @@ export class LSPClient {
         logger.debug('[workspaceSymbol] No LSP servers available after preload\n');
         return { symbols: [], readinessConfirmed: false };
       }
+    } else if (this.workspaceSymbolUnavailableServers.size > 0) {
+      logger.debug('[workspaceSymbol] Retrying only failed workspace providers\n');
+      this.workspaceSymbolRecovery ??= this.retryUnavailableWorkspaceProviders().finally(() => {
+        this.workspaceSymbolRecovery = null;
+      });
+      await this.workspaceSymbolRecovery;
+      servers = Array.from(this.serverManager.getRunningServers().values());
+      if (servers.length === 0) {
+        logger.debug('[workspaceSymbol] No LSP servers available after preload\n');
+        return { symbols: [], readinessConfirmed: false };
+      }
     }
 
     // Every language server concurrently, so a multi-language workspace (TS + PHP)
@@ -879,8 +893,13 @@ export class LSPClient {
     if (results.length === 0 && errors.length > 0) {
       throw errors[0];
     }
-    // One unconfirmed server is enough to make the WORKSPACE answer incomplete.
-    return { symbols: results, readinessConfirmed: perServer.every((entry) => entry.confirmed) };
+    // A surviving unrelated provider cannot certify absence for one that failed.
+    return {
+      symbols: results,
+      readinessConfirmed:
+        this.workspaceSymbolUnavailableServers.size === 0 &&
+        perServer.every((entry) => entry.confirmed),
+    };
   }
 
   /**
@@ -1261,6 +1280,27 @@ export class LSPClient {
     return opsOutgoingCalls(serverState, item);
   }
 
+  private async retryUnavailableWorkspaceProviders(): Promise<void> {
+    const failedKeys = [...this.workspaceSymbolUnavailableServers];
+    await Promise.all(
+      failedKeys.map(async (key) => {
+        const config = this.config.servers.find((server) => JSON.stringify(server) === key);
+        if (!config) {
+          this.workspaceSymbolUnavailableServers.delete(key);
+          return;
+        }
+        try {
+          await this.serverManager.getServer(config);
+          this.workspaceSymbolUnavailableServers.delete(key);
+        } catch (error) {
+          logger.debug(
+            `[workspaceSymbol] Failed provider remains unavailable (${config.extensions.join(', ')}): ${error}\n`
+          );
+        }
+      })
+    );
+  }
+
   async preloadServers(debug = true): Promise<void> {
     if (debug) {
       logger.info('Scanning configured server directories for supported file types\n');
@@ -1311,12 +1351,14 @@ export class LSPClient {
           logger.info(`Preloading LSP server: ${serverConfig.command.join(' ')}\n`);
         }
         await this.serverManager.getServer(serverConfig);
+        this.workspaceSymbolUnavailableServers.delete(JSON.stringify(serverConfig));
         if (debug) {
           logger.info(
             `Successfully preloaded LSP server for extensions: ${serverConfig.extensions.join(', ')}\n`
           );
         }
       } catch (error) {
+        this.workspaceSymbolUnavailableServers.add(JSON.stringify(serverConfig));
         logger.error(
           `Failed to preload LSP server for ${serverConfig.extensions.join(', ')}: ${error}\n`
         );
